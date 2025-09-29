@@ -1,0 +1,19 @@
+# Requirements for Robust Memory System
+# Install with: pip install -r requirements_robust_memory.txt
+
+# Core dependencies
+chromadb>=0.4.15
+sentence-transformers>=2.2.2
+
+
+# Optional but recommended for better performance
+numpy>=1.24.0
+torch>=2.0.0  # For sentence-transformers (CPU version is fine)
+
+# Development/debugging (optional)
+pytest>=7.0.0
+black>=23.0.0
+
+# Note: If you're on a system with limited resources, you can use a smaller embedding model
+# by modifying the model_name in RobustMemory.py from "all-MiniLM-L6-v2" to "all-MiniLM-L12-v2"
+# or even "paraphrase-MiniLM-L3-v2" for faster but slightly less accurate embeddings.
