@@ -467,7 +467,7 @@ class RobustMemorySystem:
                 )
                 
                 result_dict = asdict(record)  
-                result_dict['timestamp'] = record.timestamp.isoformat()  # ← ADD THIS LINE  
+                result_dict['timestamp'] = record.timestamp.isoformat()  
                 result_dict['match_type'] = 'structured'  
                 results.append(result_dict)
             
@@ -482,8 +482,9 @@ class RobustMemorySystem:
         """Get most recent memories"""
         return self.search_structured(limit=limit)
 
-    def update_memory(self, memory_id: str, title: str = None, content: str = None,
-                     tags: List[str] = None, importance: int = None,
+    def update_memory(self, memory_id: str, title: str = None, content: str = None,  
+                     tags: List[str] = None, importance: int = None,  
+                     memory_type: str = None,   
                      metadata: Dict[str, Any] = None) -> Result:
         """
         Update an existing memory
@@ -520,6 +521,10 @@ class RobustMemorySystem:
                 importance = max(1, min(10, importance))
                 updates.append("importance = ?")
                 params.append(importance)
+                
+            if memory_type is not None:  
+                updates.append("memory_type = ?")  
+                params.append(memory_type)    
             
             if metadata is not None:
                 updates.append("metadata = ?")
