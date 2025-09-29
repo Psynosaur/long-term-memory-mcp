@@ -813,16 +813,53 @@ def _jsonify_result(res: Result) -> dict:
 def remember(title: str, content: str, tags: str = "", importance: int = 5,  
              memory_type: str = "conversation") -> dict:  
     """  
-    Store a new memory with semantic and structured indexing  
+    Store a new memory (fact, preference, event, or conversation snippet).  
+  
+    When to use:  
+    - The user shares something to keep or says “remember this.”  
+    - New personal details, preferences, events, instructions.  
+  
+    Args:  
+    - title (str): Short title for the memory.  
+    - content (str): Full text to store.  
+    - tags (str, optional): Comma-separated tags, e.g., "personal, preference".  
+    - importance (int, optional): 1–10 (default 5). Higher = more important.  
+    - memory_type (str, optional): e.g., "conversation", "fact", "preference", "event".  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str, "data"?: [ {id, title, content, timestamp, tags, importance, memory_type, ...} ] }  
+  
+    Example triggers:  
+    - “My birthday is July 4th.”  
+    - “Remember that I prefer tea over coffee.”  
+    - “Please save this: truck camping next weekend.”  
     """  
     tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []  
     res = memory_system.remember(title, content, tag_list, importance, memory_type)  
-    return _jsonify_result(res)  
+    return _jsonify_result(res) 
   
 @mcp.tool  
 def search_memories(query: str, search_type: str = "semantic", limit: int = 10) -> dict:  
     """  
-    Search memories using semantic similarity or structured queries  
+    Search memories using natural language queries for general recall.  
+  
+    When to use:  
+    - User asks about a specific fact, event, or detail from the past.  
+    - General "what did you tell me about..." or "when is my..." queries.  
+    - Default search when no specific category, tags, or dates are mentioned.  
+  
+    Args:  
+    - query (str): Natural language search query.  
+    - search_type (str, optional): "semantic" (default). Other types not fully implemented.  
+    - limit (int, optional): Max results to return (default 10).  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str, "data"?: [ {id, title, content, timestamp, tags, relevance_score, match_type, ...} ] }  
+  
+    Example triggers:  
+    - "When is my birthday?"  
+    - "What did I tell you about my favorite color?"  
+    - "Do you remember what I said about camping?"  
     """  
     if search_type == "semantic":  
         res = memory_system.search_semantic(query, limit)  
@@ -833,15 +870,49 @@ def search_memories(query: str, search_type: str = "semantic", limit: int = 10) 
 @mcp.tool  
 def search_by_type(memory_type: str, limit: int = 20) -> dict:  
     """  
-    Search memories by type (conversation, fact, preference, event, etc.)  
+    Retrieve memories by category/type for organized recall.  
+  
+    When to use:  
+    - User asks for a specific category of memories.  
+    - Requests like "show me all my preferences" or "list my facts."  
+    - When they want to see everything in a particular memory type.  
+  
+    Args:  
+    - memory_type (str): Category to search for, e.g., "conversation", "fact", "preference", "event".  
+    - limit (int, optional): Max results to return (default 20).  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str, "data"?: [ {id, title, content, timestamp, tags, memory_type, ...} ] }  
+  
+    Example triggers:  
+    - "Show me all my preferences so far."  
+    - "List the facts you know about me."  
+    - "What events have we discussed?"  
     """  
     res = memory_system.search_structured(memory_type=memory_type, limit=limit)  
-    return _jsonify_result(res)  
+    return _jsonify_result(res) 
   
 @mcp.tool  
 def search_by_tags(tags: str, limit: int = 20) -> dict:  
     """  
-    Search memories by tags  
+    Find memories associated with specific tags for thematic recall.  
+  
+    When to use:  
+    - User mentions specific tags or themes they want to find.  
+    - Requests like "find everything tagged X" or "show me camping memories."  
+    - When they want memories grouped by topic/theme rather than type.  
+  
+    Args:  
+    - tags (str): Comma-separated tags to search for, e.g., "camping, truck" or "music, guitar".  
+    - limit (int, optional): Max results to return (default 20).  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str, "data"?: [ {id, title, content, timestamp, tags, memory_type, ...} ] }  
+  
+    Example triggers:  
+    - "Find everything tagged camping and truck."  
+    - "Show me memories about music."  
+    - "What do you have tagged as personal?"  
     """  
     tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]  
     res = memory_system.search_structured(tags=tag_list, limit=limit)  
@@ -850,25 +921,86 @@ def search_by_tags(tags: str, limit: int = 20) -> dict:
 @mcp.tool  
 def get_recent_memories(limit: int = 20) -> dict:  
     """  
-    Get the most recent memories  
+    Retrieve the most recently stored memories for timeline-based recall.  
+  
+    When to use:  
+    - User asks about recent interactions or conversations.  
+    - Time-based queries like "today," "last night," "recently," "yesterday."  
+    - When they want to review what was discussed in the current or recent sessions.  
+    - Use this instead of date ranges when no specific dates are mentioned.  
+  
+    Args:  
+    - limit (int, optional): Max results to return (default 20).  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str, "data"?: [ {id, title, content, timestamp, tags, memory_type, ...} ] }  
+  
+    Example triggers:  
+    - "What did we talk about today?"  
+    - "What have we discussed recently?"  
+    - "Remind me what we covered last night."  
+    - "What's been happening lately?"  
     """  
     res = memory_system.get_recent(limit)  
     return _jsonify_result(res)  
   
 @mcp.tool  
 def update_memory(memory_id: str, title: str = None, content: str = None,  
-                  tags: str = None, importance: int = None) -> dict:  
+                  tags: str = None, importance: int = None, memory_type: str = None) -> dict:  
     """  
-    Update an existing memory  
+    Update or modify an existing memory by its unique ID.  
+  
+    When to use:  
+    - User wants to correct, change, or add details to a stored memory.  
+    - Requests like "update that memory" or "change my favorite color to blue."  
+    - Use this to change content, tags, importance, or type.  
+  
+    Args:  
+    - memory_id (str): Unique ID of the memory to update.  
+    - title (str, optional): New title.  
+    - content (str, optional): New content.  
+    - tags (str, optional): New comma-separated tags.  
+    - importance (int, optional): New importance 1–10.  
+    - memory_type (str, optional): New category, e.g., "fact", "preference", "event", "conversation".  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str, "data"?: [ {id, ...} ] }  
+  
+    Example triggers:  
+    - "Change that to type 'preference' and tag it 'personal'."  
+    - "Update the camping note to type 'event'."  
     """  
-    tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else None  
-    res = memory_system.update_memory(memory_id, title, content, tag_list, importance)  
-    return _jsonify_result(res)  
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None  
+    res = memory_system.update_memory(  
+        memory_id=memory_id,  
+        title=title,  
+        content=content,  
+        tags=tag_list,  
+        importance=importance,  
+        memory_type=memory_type,  
+    )  
+    return _jsonify_result(res)
   
 @mcp.tool  
 def delete_memory(memory_id: str) -> dict:  
     """  
-    Delete a memory permanently  
+    Permanently delete a memory by its unique ID.  
+  
+    When to use:  
+    - User explicitly asks you to forget or erase something.  
+    - Requests like "forget my old phone number" or "delete that memory."  
+    - Use for permanent removal rather than updating or downgrading importance.  
+  
+    Args:  
+    - memory_id (str): Unique ID of the memory to delete.  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str }  
+  
+    Example triggers:  
+    - "Please forget my old address."  
+    - "Delete that memory about my ex."  
+    - "Erase what I told you earlier about my school."  
     """  
     res = memory_system.delete_memory(memory_id)  
     return _jsonify_result(res)  
@@ -876,7 +1008,24 @@ def delete_memory(memory_id: str) -> dict:
 @mcp.tool  
 def get_memory_stats() -> dict:  
     """  
-    Get statistics about the memory system  
+    Retrieve statistics and information about the memory system.  
+  
+    When to use:  
+    - User asks about memory system capacity, totals, or status.  
+    - Questions about "how many memories" or system health.  
+    - When they want to know storage details or usage metrics.  
+  
+    Args:  
+    - None  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str, "data"?: { "total_memories": int, "by_type": {...}, "by_importance": {...}, "storage_info": {...}, ...} }  
+  
+    Example triggers:  
+    - "How many memories do you have?"  
+    - "What's your memory system status?"  
+    - "Show me your storage stats."  
+    - "How much have you remembered so far?"  
     """  
     res = memory_system.get_statistics()  
     return _jsonify_result(res)  
@@ -884,7 +1033,24 @@ def get_memory_stats() -> dict:
 @mcp.tool  
 def create_backup() -> dict:  
     """  
-    Create a complete backup of the memory system  
+    Create a complete backup of the memory system right now.  
+  
+    When to use:  
+    - User explicitly requests a backup or save operation.  
+    - Before major changes or when they want to preserve current state.  
+    - Only use when directly asked - automatic backups happen regularly.  
+  
+    Args:  
+    - None  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str, "data"?: { "backup_path": str, "timestamp": str, "files_backed_up": [...], ...} }  
+  
+    Example triggers:  
+    - "Make a backup now."  
+    - "Save everything to backup."  
+    - "Create a backup of my memories."  
+    - "Back up the system."  
     """  
     res = memory_system.create_backup()  
     return _jsonify_result(res)  
@@ -892,7 +1058,26 @@ def create_backup() -> dict:
 @mcp.tool  
 def search_by_date_range(date_from: str, date_to: str = None, limit: int = 50) -> dict:  
     """  
-    Search memories within a date range  
+    Find memories stored within a specific date or date range.  
+  
+    When to use:  
+    - User asks about discussions or events during a particular time window.  
+    - Queries mentioning explicit dates ("on Sept 10th") or ranges ("between Sept 1 and Sept 15").  
+    - Use this instead of recent-memory search when precise dates are provided.  
+  
+    Args:  
+    - date_from (str): Start date/time in ISO format (e.g., "2025-09-01" or "2025-09-01T10:30:00Z").  
+    - date_to (str, optional): End date/time in ISO format. Defaults to current UTC time if omitted.  
+    - limit (int, optional): Max results to return (default 50).  
+  
+    Returns:  
+    - dict: { "success": bool, "reason"?: str, "data"?: [ {id, title, content, timestamp, tags, memory_type, ...} ] }  
+  
+    Example triggers:  
+    - "What did we discuss on September 10th?"  
+    - "Show me everything between September 1 and 15."  
+    - "What memories are there from last week?"  
+    - "Pull up our conversations from August."  
     """  
     if date_to is None:  
         date_to = datetime.now(timezone.utc).isoformat()  
