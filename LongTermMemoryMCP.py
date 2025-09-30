@@ -48,6 +48,44 @@ except ImportError as e:
 # You can override the data folder by setting the AI_COMPANION_DATA_DIR environment variable.  
 # Example (PowerShell): $env:AI_COMPANION_DATA_DIR = "D:\a.i. apps\long_term_memory_mcp\data"  
 DATA_FOLDER = Path(os.environ.get("AI_COMPANION_DATA_DIR", str(Path.home() / ".ai_companion_memory")))  
+
+# -------- Lazy Decay Configuration --------
+DECAY_ENABLED = True
+
+# Half-life in days by memory_type (how fast each type fades)
+DECAY_HALF_LIFE_DAYS_BY_TYPE = {
+    "conversation": 45,
+    "fact": 120,
+    "preference": 90,
+    "task": 30,
+    "ephemeral": 10,
+}
+DECAY_HALF_LIFE_DAYS_DEFAULT = 60
+
+# Minimum floor per type (never decay below this)
+DECAY_MIN_IMPORTANCE_BY_TYPE = {
+    "conversation": 2,
+    "fact": 3,
+    "preference": 2,
+    "task": 1,
+    "ephemeral": 1,
+}
+DECAY_MIN_IMPORTANCE_DEFAULT = 1
+
+# Tags that prevent decay entirely
+DECAY_PROTECT_TAGS = {"core", "identity", "pinned"}
+
+# Writeback policy (to avoid churn)
+DECAY_WRITEBACK_STEP = 0.5          # only persist if change >= 0.5
+DECAY_MIN_INTERVAL_HOURS = 12       # don't write decay more often than this
+# -----------------------------------------
+
+# -------- Reinforcement Configuration --------  
+REINFORCEMENT_ENABLED = True  
+REINFORCEMENT_STEP = 0.1         # amount per retrieval  
+REINFORCEMENT_WRITEBACK_STEP = 0.5  # write to DB when accumulated ≥ 0.5  
+REINFORCEMENT_MAX = 10           # cap importance  
+# ---------------------------------------------
   
 @dataclass  
 class MemoryRecord:  
@@ -120,13 +158,13 @@ class RobustMemorySystem:
         """Initialize SQLite database for structured data"""  
         try:  
             self.sqlite_conn = sqlite3.connect(  
-                str(self.sqlite_path),   
+                str(self.sqlite_path),  
                 check_same_thread=False,  
                 timeout=30.0  
             )  
             self.sqlite_conn.row_factory = sqlite3.Row  
-              
-            # Create tables  
+      
+            # Create base tables (OK to have DEFAULT CURRENT_TIMESTAMP here for fresh DBs)  
             self.sqlite_conn.executescript("""  
                 CREATE TABLE IF NOT EXISTS memories (  
                     id TEXT PRIMARY KEY,  
@@ -139,35 +177,72 @@ class RobustMemorySystem:
                     metadata TEXT,  -- JSON object  
                     content_hash TEXT,  
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,  
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP  
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,  
+                    last_accessed TEXT DEFAULT CURRENT_TIMESTAMP  
                 );  
-                  
+      
                 CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp);  
                 CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type);  
                 CREATE INDEX IF NOT EXISTS idx_importance ON memories(importance);  
                 CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash);  
-                  
+      
                 CREATE TABLE IF NOT EXISTS memory_stats (  
                     key TEXT PRIMARY KEY,  
                     value TEXT,  
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP  
                 );  
-                  
-                -- Store system metadata  
-                INSERT OR REPLACE INTO memory_stats (key, value)   
-                VALUES ('schema_version', '1.0');  
             """)  
-              
-            # Normalize last_backup to an ISO UTC string (avoid sqlite datetime('now') naive value)  
+      
+            # Migration: ensure last_accessed exists in existing DBs (older SQLite can't add with non-constant defaults)  
+            cursor = self.sqlite_conn.execute("PRAGMA table_info(memories)")  
+            columns = [row[1] for row in cursor.fetchall()]  
+      
+            if 'last_accessed' not in columns:  
+                self.logger.info("Adding last_accessed column to existing memories table")  
+                # 1) Add column WITHOUT default (avoids 'non-constant default' error)  
+                self.sqlite_conn.execute("ALTER TABLE memories ADD COLUMN last_accessed TEXT")  
+      
+                # 2) Backfill existing rows  
+                now_iso = datetime.now(timezone.utc).isoformat()  
+                self.sqlite_conn.execute(  
+                    "UPDATE memories SET last_accessed = COALESCE(created_at, ?)",  
+                    (now_iso,)  
+                )  
+      
+                # 3) Optional: trigger to set last_accessed on future inserts when omitted  
+                #    This keeps behavior similar to DEFAULT CURRENT_TIMESTAMP for older DBs  
+                self.sqlite_conn.execute("""  
+                    CREATE TRIGGER IF NOT EXISTS trg_memories_last_accessed_default  
+                    BEFORE INSERT ON memories  
+                    FOR EACH ROW  
+                    WHEN NEW.last_accessed IS NULL  
+                    BEGIN  
+                        UPDATE memories SET last_accessed = CURRENT_TIMESTAMP WHERE id = NEW.id;  
+                    END;  
+                """)  
+      
+                self.sqlite_conn.commit()  
+      
+            # Now that the column exists, create its index  
+            self.sqlite_conn.execute(  
+                "CREATE INDEX IF NOT EXISTS idx_last_accessed ON memories(last_accessed)"  
+            )  
+      
+            # Schema version bookkeeping  
+            self.sqlite_conn.execute(  
+                "INSERT OR REPLACE INTO memory_stats (key, value, updated_at) VALUES ('schema_version', '1.1', CURRENT_TIMESTAMP)"  
+            )  
+      
+            # Normalize last_backup to an ISO UTC string  
             now_iso = datetime.now(timezone.utc).isoformat()  
             self.sqlite_conn.execute(  
                 "INSERT OR REPLACE INTO memory_stats (key, value, updated_at) VALUES ('last_backup', ?, ?)",  
                 (now_iso, now_iso)  
             )  
-              
+      
             self.sqlite_conn.commit()  
             self.logger.info("SQLite database initialized successfully")  
-              
+      
         except Exception as e:  
             self.logger.error(f"Failed to initialize SQLite: {e}")  
             raise
@@ -186,10 +261,14 @@ class RobustMemorySystem:
                 )
             )
             
-            # Get or create collection
-            self.chroma_collection = self.chroma_client.get_or_create_collection(
-                name="ai_companion_memories",
-                metadata={"description": "Long-term memory for AI companion"}
+            # Use a stable collection name and cosine space  
+            self.chroma_collection = self.chroma_client.get_or_create_collection(  
+                name="ai_companion_memories",  
+                metadata={  
+                    "description": "Long-term memory for AI companion",  
+                    "hnsw:space": "cosine"  # important for sentence embeddings  
+                },  
+                embedding_function=None  # we pass embeddings manually  
             )
             
             self.logger.info("ChromaDB initialized successfully")
@@ -284,8 +363,8 @@ class RobustMemorySystem:
             # Store in SQLite
             self.sqlite_conn.execute("""
                 INSERT INTO memories 
-                (id, title, content, timestamp, tags, importance, memory_type, metadata, content_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, title, content, timestamp, tags, importance, memory_type, metadata, content_hash, last_accessed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.id,
                 record.title,
@@ -295,7 +374,8 @@ class RobustMemorySystem:
                 record.importance,
                 record.memory_type,
                 json.dumps(record.metadata),
-                content_hash
+                content_hash,
+                record.timestamp.isoformat()  # Set last_accessed to creation time
             ))
             
             # Generate embedding and store in ChromaDB
@@ -316,6 +396,15 @@ class RobustMemorySystem:
                 }]
             )
             
+            try:  
+                if hasattr(self.chroma_client, "persist"):  
+                    self.chroma_client.persist()  
+            except Exception as pe:  
+                self.logger.warning(f"Chroma persist warning: {pe}")
+            
+            # Debug: check what Chroma actually contains after add  
+            self.logger.info(f"Chroma after add: {self._debug_vector_index()}")
+            
             self.sqlite_conn.commit()
             
             # Trigger backup if needed
@@ -332,13 +421,16 @@ class RobustMemorySystem:
             return Result(success=False, reason=f"Storage error: {str(e)}")
 
     def search_semantic(self, query: str, limit: int = 10, 
-                       min_relevance: float = 0.3) -> Result:
+                       min_relevance: float = 0.15) -> Result:
         """
-        Semantic search using vector similarity
+        Semantic search using vector similarity with adaptive thresholding + top-1 fallback.
         """
         try:
             if not query.strip():
                 return Result(success=False, reason="Query cannot be empty")
+            
+            # Debug: check what Chroma contains before query  
+            self.logger.info(f"Chroma before query: {self._debug_vector_index()}")
             
             # Generate query embedding
             query_embedding = self.embedding_model.encode(query).tolist()
@@ -353,38 +445,76 @@ class RobustMemorySystem:
             if not results['ids'][0]:
                 return Result(success=True, data=[])
             
-            # Convert to SearchResult objects
-            search_results = []
-            for i, memory_id in enumerate(results['ids'][0]):
-                distance = results['distances'][0][i]
-                relevance = 1.0 - distance  # Convert distance to similarity
-                
-                if relevance < min_relevance:
-                    continue
-                
-                # Get full record from SQLite
-                cursor = self.sqlite_conn.execute(
-                    "SELECT * FROM memories WHERE id = ?", (memory_id,)
-                )
+            ids = results['ids'][0]  
+            distances = results['distances'][0]  
+            similarities = [1.0 - d for d in distances]  
+              
+            # Adaptive threshold anchored on top match, with clamps  
+            if similarities:  
+                top_sim = similarities[0]  
+                adaptive = max(0.12, min(0.35, top_sim - 0.08))  
+                threshold = max(min_relevance, adaptive)  
+            else:  
+                threshold = min_relevance  
+      
+            self.logger.info(f"Adaptive threshold computed: {threshold:.3f}")  
+      
+            search_results = []  
+            now_iso = datetime.now(timezone.utc).isoformat()  
+      
+            # First pass: collect those meeting threshold  
+            selected = [(mid, sim) for mid, sim in zip(ids, similarities) if sim >= threshold]  
+      
+            # FALLBACK: if none pass threshold, keep the top-1 candidate anyway  
+            if not selected and ids:  
+                if similarities[0] >= 0.08:  # only fallback if it's not total garbage  
+                    self.logger.info("No candidates passed threshold; using top-1 semantic fallback")  
+                    selected = [(ids[0], similarities[0])]  
+                else:  
+                    self.logger.info(f"No candidates passed and top-1 sim {similarities[0]:.3f} < 0.08, skipping fallback")
+      
+            # Fetch selected rows and reinforce  
+            for i, (memory_id, relevance) in enumerate(selected):  
+                if i < 3:  
+                    self.logger.info(f"Candidate {i}: relevance={relevance:.3f}, threshold={threshold:.3f}")  
+      
+                cursor = self.sqlite_conn.execute(  
+                    "SELECT * FROM memories WHERE id = ?", (memory_id,)  
+                )  
                 row = cursor.fetchone()
-                
-                if row:
-                    record = MemoryRecord(
-                        id=row['id'],
-                        title=row['title'],
-                        content=row['content'],
-                        timestamp=datetime.fromisoformat(row['timestamp']),
-                        tags=json.loads(row['tags']),
-                        importance=row['importance'],
-                        memory_type=row['memory_type'],
-                        metadata=json.loads(row['metadata'])
-                    )
+
+                if not row:  
+                    continue 
                     
-                    search_results.append(SearchResult(
-                        record=record,
-                        relevance_score=relevance,
-                        match_type="semantic"
-                    ))
+                # Lazy decay before reinforcement
+                self._maybe_decay(row)
+                self._maybe_reinforce(row)
+                
+                # Reinforcement  
+                self.sqlite_conn.execute(  
+                    "UPDATE memories SET last_accessed = ? WHERE id = ?",  
+                    (now_iso, memory_id)  
+                )
+                
+                record = MemoryRecord(
+                    id=row['id'],
+                    title=row['title'],
+                    content=row['content'],
+                    timestamp=datetime.fromisoformat(row['timestamp']),
+                    tags=json.loads(row['tags']),
+                    importance=row['importance'],
+                    memory_type=row['memory_type'],
+                    metadata=json.loads(row['metadata'])
+                )
+                
+                search_results.append(SearchResult(
+                    record=record,
+                    relevance_score=relevance,
+                    match_type="semantic" if relevance >= threshold else "semantic_fallback"
+                ))
+            
+            # Commit the last_accessed updates  
+            self.sqlite_conn.commit()
             
             # Sort by relevance
             search_results.sort(key=lambda x: x.relevance_score, reverse=True)
@@ -398,7 +528,7 @@ class RobustMemorySystem:
                 result_dict['match_type'] = sr.match_type  
                 result_data.append(result_dict)
             
-            self.logger.info(f"Semantic search returned {len(result_data)} results")
+            self.logger.info(f"Semantic search returned {len(result_data)} results (threshold={threshold:.3f})")
             return Result(success=True, data=result_data)
             
         except Exception as e:
@@ -452,9 +582,23 @@ class RobustMemorySystem:
             cursor = self.sqlite_conn.execute(query, params)
             rows = cursor.fetchall()
             
+            # REINFORCEMENT: Update last_accessed for retrieved memories  
+            now_iso = datetime.now(timezone.utc).isoformat()  
+            memory_ids = [row['id'] for row in rows]  
+              
+            if memory_ids:  
+                placeholders = ','.join(['?' for _ in memory_ids])  
+                self.sqlite_conn.execute(  
+                    f"UPDATE memories SET last_accessed = ? WHERE id IN ({placeholders})",  
+                    [now_iso] + memory_ids  
+                )  
+                self.sqlite_conn.commit()
+                
             # Convert to MemoryRecord objects
             results = []
             for row in rows:
+                self._maybe_decay(row)
+                self._maybe_reinforce(row)
                 record = MemoryRecord(
                     id=row['id'],
                     title=row['title'],
@@ -484,10 +628,11 @@ class RobustMemorySystem:
 
     def update_memory(self, memory_id: str, title: str = None, content: str = None,  
                      tags: List[str] = None, importance: int = None,  
-                     memory_type: str = None,   
+                     memory_type: str = None,    
                      metadata: Dict[str, Any] = None) -> Result:
         """
-        Update an existing memory
+        Update or modify an existing memory by its unique ID.  
+        Also updates updated_at and last_accessed (treating edits as an access).
         """
         try:
             # Get existing record
@@ -530,8 +675,11 @@ class RobustMemorySystem:
                 updates.append("metadata = ?")
                 params.append(json.dumps(metadata))
             
+            now_iso = datetime.now(timezone.utc).isoformat()
             updates.append("updated_at = ?")
-            params.append(datetime.now(timezone.utc).isoformat())
+            params.append(now_iso)
+            updates.append("last_accessed = ?")  
+            params.append(now_iso)
             
             params.append(memory_id)
             
@@ -564,6 +712,12 @@ class RobustMemorySystem:
                         "tags": updated_row['tags']
                     }]
                 )
+                
+                try:    
+                    if hasattr(self.chroma_client, "persist"):    
+                        self.chroma_client.persist()    
+                except Exception as pe:    
+                    self.logger.warning(f"Chroma persist warning: {pe}")
             
             self.sqlite_conn.commit()
             
@@ -787,6 +941,234 @@ class RobustMemorySystem:
                 self.logger.info("Memory system closed successfully")  
         except Exception:  
             pass
+            
+    def _debug_vector_index(self, sample: int = 5):  
+        try:  
+            count = self.chroma_collection.count()  
+            data = self.chroma_collection.get(include=["documents", "metadatas"], limit=sample)  
+            return {"count": count, "ids": data.get("ids", []),  
+                    "have_documents": bool(data.get("documents")),  
+                    "have_metadatas": bool(data.get("metadatas"))}  
+        except Exception as e:  
+            return {"error": str(e)}
+            
+    def rebuild_vector_index(self, batch_size: int = 128) -> Result:  
+        try:  
+            # wipe collection to avoid duplicates  
+            try:  
+                self.chroma_collection.delete(where={})  
+            except Exception as e:  
+                self.logger.warning(f"Chroma wipe warning: {e}")  
+      
+            rows = self.sqlite_conn.execute(  
+                "SELECT id, title, content, timestamp, importance, memory_type, tags FROM memories ORDER BY timestamp ASC"  
+            ).fetchall()  
+      
+            ids, embs, docs, metas = [], [], [], []  
+            for row in rows:  
+                text = f"{row['title']}\n{row['content']}"  
+                emb = self.embedding_model.encode(text).tolist()  
+                ids.append(row["id"])  
+                embs.append(emb)  
+                docs.append(text)  
+                metas.append({  
+                    "title": row["title"],  
+                    "timestamp": row["timestamp"],  
+                    "importance": row["importance"],  
+                    "memory_type": row["memory_type"],  
+                    "tags": row["tags"],  
+                })  
+      
+                if len(ids) >= batch_size:  
+                    self.chroma_collection.add(ids=ids, embeddings=embs, documents=docs, metadatas=metas)  
+                    ids, embs, docs, metas = [], [], [], []  
+      
+            if ids:  
+                self.chroma_collection.add(ids=ids, embeddings=embs, documents=docs, metadatas=metas)  
+      
+            try:  
+                if hasattr(self.chroma_client, "persist"):  
+                    self.chroma_client.persist()  
+            except Exception as pe:  
+                self.logger.warning(f"Chroma persist warning: {pe}")  
+      
+            return Result(success=True, data=[{"reindexed": True, "count": self.chroma_collection.count()}])  
+        except Exception as e:  
+            self.logger.error(f"Reindex failed: {e}")  
+            return Result(success=False, reason=str(e))
+
+    def _parse_iso(self, iso_str: str) -> datetime:  
+        try:  
+            dt = datetime.fromisoformat(iso_str)  
+            if dt.tzinfo is None:  
+                dt = dt.replace(tzinfo=timezone.utc)  
+            return dt.astimezone(timezone.utc)  
+        except Exception:  
+            return datetime.now(timezone.utc)  
+      
+    def _days_since(self, iso_str: Optional[str]) -> float:  
+        if not iso_str:  
+            return 0.0  
+        try:  
+            then = self._parse_iso(iso_str)  
+            return max(0.0, (datetime.now(timezone.utc) - then).total_seconds() / 86400.0)  
+        except Exception:  
+            return 0.0  
+      
+    def _get_half_life_days(self, memory_type: Optional[str]) -> float:  
+        return DECAY_HALF_LIFE_DAYS_BY_TYPE.get(memory_type or "", DECAY_HALF_LIFE_DAYS_DEFAULT)  
+      
+    def _get_floor(self, memory_type: Optional[str]) -> int:  
+        return DECAY_MIN_IMPORTANCE_BY_TYPE.get(memory_type or "", DECAY_MIN_IMPORTANCE_DEFAULT)  
+      
+    def _should_protect(self, tags_field) -> bool:  
+        try:  
+            tags = json.loads(tags_field) if isinstance(tags_field, str) else tags_field  
+            tags = tags or []  
+            return any(t in DECAY_PROTECT_TAGS for t in tags)  
+        except Exception:  
+            return False  
+      
+    def _compute_decay_importance(self, importance: float, days_idle: float, half_life_days: float) -> float:  
+        if half_life_days <= 0:  
+            return importance  
+        factor = 0.5 ** (days_idle / half_life_days)  
+        return importance * factor  
+      
+    def _round_to_half(self, value: float) -> float:  
+        return round(value * 2.0) / 2.0  
+      
+    def _maybe_decay(self, row) -> Optional[float]:  
+        """  
+        Lazily decays importance for a single row if conditions are met.  
+        Returns the new importance if updated, else None.  
+        Safe: never drops below type floor; respects protected tags.  
+        """  
+        if not DECAY_ENABLED:  
+            return None  
+      
+        try:  
+            mem_id = row['id']  
+            mem_type = row['memory_type']  
+            importance = float(row['importance'])  
+            floor = self._get_floor(mem_type)  
+      
+            # Skip if protected or already at/below floor  
+            if self._should_protect(row['tags']) or importance <= floor:
+                self.logger.info(  
+                    f"Decay check: id={mem_id} type={mem_type} skipped (protected or floor reached)"  
+                )
+                return None  
+      
+            # Anchor idle time on last_accessed; fallback to timestamp  
+            last_accessed = row['last_accessed'] if 'last_accessed' in row.keys() else None  
+            if not last_accessed:  
+                last_accessed = row['timestamp']  
+      
+            days_idle = self._days_since(last_accessed)  
+            half_life = self._get_half_life_days(mem_type)  
+      
+            decayed = self._compute_decay_importance(importance, days_idle, half_life)  
+            decayed = max(floor, self._round_to_half(decayed))
+
+            # If no meaningful change, just log and bail  
+            change = importance - decayed  
+            if change < DECAY_WRITEBACK_STEP:  
+                self.logger.info(  
+                    f"Decay check: id={mem_id} type={mem_type} old={importance} -> new={decayed} "  
+                    f"(idle={days_idle:.1f}d, half_life={half_life}d) [no decay applied]"  
+                )  
+                return None
+      
+            # Rate limit writes  
+            try:  
+                meta = json.loads(row['metadata']) if row['metadata'] else {}  
+            except Exception:  
+                meta = {}  
+      
+            last_decay_at = meta.get('last_decay_at')  
+            hours_since_last = self._days_since(last_decay_at) * 24 if last_decay_at else 1e9  
+            if hours_since_last < DECAY_MIN_INTERVAL_HOURS:  
+                self.logger.info(  
+                    f"Decay check: id={mem_id} type={mem_type} old={importance} → would become {decayed} "  
+                    f"(idle={days_idle:.1f}d), but last decay {hours_since_last:.1f}h ago [rate‑limited]"  
+                )  
+                return None  
+      
+            # Persist decay to DB  
+            meta['last_decay_at'] = datetime.now(timezone.utc).isoformat()  
+            self.sqlite_conn.execute(  
+                "UPDATE memories SET importance = ?, metadata = ? WHERE id = ?",  
+                (decayed, json.dumps(meta), mem_id)  
+            )  
+            self.sqlite_conn.commit()  
+      
+            self.logger.info(  
+                f"Lazy decay: id={mem_id} type={mem_type} old={importance} new={decayed} "  
+                f"idle_days={days_idle:.1f} half_life={half_life}"  
+            )  
+            return decayed  
+      
+        except Exception as e:  
+            self.logger.warning(f"Lazy decay skipped for id={row['id'] if 'id' in row.keys() else 'UNKNOWN'}: {e}")  
+            return None
+            
+    def _maybe_reinforce(self, row) -> Optional[float]:  
+        """  
+        Apply reinforcement bump on access.  
+        Returns new importance if updated, else None.  
+        """  
+        if not REINFORCEMENT_ENABLED:  
+            return None  
+      
+        try:  
+            mem_id = row['id']  
+            mem_type = row['memory_type']  
+            importance = float(row['importance'])  
+      
+            # Load metadata safely  
+            try:  
+                meta = json.loads(row['metadata']) if row['metadata'] else {}  
+            except Exception:  
+                meta = {}  
+      
+            accum = meta.get("reinforcement_accum", 0.0)  
+            accum += REINFORCEMENT_STEP  
+      
+            # If accumulated boost reaches threshold, persist  
+            if accum >= REINFORCEMENT_WRITEBACK_STEP:  
+                new_importance = min(REINFORCEMENT_MAX, self._round_to_half(importance + accum))  
+                meta["reinforcement_accum"] = 0.0  # reset accumulator  
+      
+                self.sqlite_conn.execute(  
+                    "UPDATE memories SET importance = ?, metadata = ? WHERE id = ?",  
+                    (new_importance, json.dumps(meta), mem_id)  
+                )  
+                self.sqlite_conn.commit()  
+      
+                self.logger.info(  
+                    f"Reinforcement: id={mem_id} type={mem_type} old={importance} new={new_importance} "  
+                    f"(+{accum})"  
+                )  
+                return new_importance  
+      
+            else:  
+                # Just save accumulator back into metadata, without bumping  
+                meta["reinforcement_accum"] = accum  
+                self.sqlite_conn.execute(  
+                    "UPDATE memories SET metadata = ? WHERE id = ?",  
+                    (json.dumps(meta), mem_id)  
+                )  
+                self.sqlite_conn.commit()  
+      
+                self.logger.info(  
+                    f"Reinforcement accum: id={mem_id} +{REINFORCEMENT_STEP}, total={accum:.2f} (not written yet)"  
+                )  
+                return None  
+      
+        except Exception as e:  
+            self.logger.warning(f"Reinforcement skipped for id={row.get('id','UNKNOWN')}: {e}")  
+            return None
 
 
 # Initialize the memory system  
@@ -1087,7 +1469,16 @@ def search_by_date_range(date_from: str, date_to: str = None, limit: int = 50) -
     if date_to is None:  
         date_to = datetime.now(timezone.utc).isoformat()  
     res = memory_system.search_structured(date_from=date_from, date_to=date_to, limit=limit)  
-    return _jsonify_result(res)  
+    return _jsonify_result(res)
+
+@mcp.tool  
+def rebuild_vectors() -> dict:  
+    """  
+    One-time repair: rebuild vector index from SQLite memories.  
+    Use if semantic search isn't working but structured search is.  
+    """  
+    res = memory_system.rebuild_vector_index()  
+    return _jsonify_result(res)    
   
 # Cleanup on exit  
   
