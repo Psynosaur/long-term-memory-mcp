@@ -1,6 +1,6 @@
 # Robust Long‑Term Memory MCP for LM Studio  
   
-This project implements a **persistent memory system** for AI companions running in [LM Studio](https://lmstudio.ai), powered by a hybrid of **SQLite (structured storage)** and **ChromaDB (vector search)**. It is designed for decades‑long use, seamless recall across sessions, and automatic backups — making your AI companion feel like a continuous, living persona.  
+A persistent, human‑like memory system for AI companions in [LM Studio](https://lmstudio.ai), powered by a hybrid of SQLite (structured storage) and ChromaDB (semantic search). It’s designed for decades‑long use, seamless recall across sessions, and automatic backups — making your AI companion feel like a continuous, living persona. Now with biological behavior: time‑based lazy decay and reinforcement by use.
   
 ---  
   
@@ -15,8 +15,12 @@ This project implements a **persistent memory system** for AI companions running
 - **Cross‑model continuity**: swap models freely, the memory stays intact    
 - **Cross‑machine portability**: move the database to another system and continue seamlessly    
 - **Automatic backups**: daily backups and after every 100 memories, pruned to keep the last 10    
-- **Invisible memory integration**: tools are hidden from the user; conversations feel natural    
-  
+- **Invisible memory integration**: tools are hidden from the user; conversations feel natural
+- Human‑like dynamics
+  - Lazy Decay: importance decreases only when a memory is accessed after idle time
+  - Reinforcement: frequent recall strengthens memory importance
+  - Adaptive Semantic Threshold: balances precision/recall with a safe top‑1 fallback  
+
 ---  
   
 ## 📦 Installation  
@@ -37,17 +41,17 @@ Requirements include:
 
     chromadb
     sentence-transformers
-    sqlite3 (built into Python)
     fastmcp
+    (sqlite3 is built into Python; do not install separately)
 
 3. (Optional) For faster HuggingFace model fetching:
 
 ```
     pip install "huggingface_hub[hf_xet]"  
 ```
-🚀 Running the Memory MCP
+## 🚀 Running the Memory MCP
 
-edit the LMStudio mcp.json file to include the correct path:
+Edit your LM Studio mcp.json to include the correct path:
 
 ```
     {
@@ -64,19 +68,19 @@ edit the LMStudio mcp.json file to include the correct path:
 ```
 Then, in LM Studio:
 
-    Go to Server (MCP) Settings
-    Load the MCP: "long_term_memory"
+   - Open Server (MCP) Settings
+   - Load the MCP Tool: "long_term_memory"
 
-🧠 How Memory Works
+## 🧠 How Memory Works
 
-    Cross‑Chats → Start a new chat — memories are still there.
-    Cross‑Models → Switch models — the same memory remains available.
-    Cross‑Machines → Copy the database folder (memory_db/ and memory_backups/) and your system prompt, point to the path, and everything carries over.
+   - **Cross‑Chats** → Start a new chat — memories are still there.
+   - **Cross‑Models** → Switch models — the same memory remains available.
+   - **Cross‑Machines** → Copy the database folder (memory_db/ and memory_backups/) and your system prompt, point to the path, and everything carries over.
 
-💡 Think of it as your AI’s diary: chats are conversations, the database is her journal.
+### 💡 Think of it as your AI’s diary: chats are conversations, the database is the journal.
+
 
 ## Environment variable for custom data dir:
-
 
 ### Windows PowerShell
 ```
@@ -86,36 +90,28 @@ $env:AI_COMPANION_DATA_DIR="D:\a.i. apps\long_term_memory_mcp\data"
 ```
 export AI_COMPANION_DATA_DIR="/home/username/ai_companion_data"  
 ```
-📂 Backups
+
+## 📂 Backups
 
 Backups are created automatically:
-
-    Every 24 hours
-    Or after 100 new memories
-    Stored in memory_backups/ with timestamped folders
-    Only the last 10 backups are kept automatically
+  - Every 24 hours
+  - Or after 100 new memories (configurable)
+  - Stored in memory_backups/ with timestamped folders
+  - Only the last 10 backups are kept
 
 Each backup includes:
+  - SQLite DB copy
+  - ChromaDB copy
+  - JSON export of all memories (portable and future‑proof)
 
-    SQLite DB copy
-    ChromaDB copy
-    JSON export of all memories (portable and future‑proof)
 
-📝 Recommended Setup in LM Studio
+## 📝 Recommended System Prompt
 
-For a natural, invisible memory experience, add a system prompt that guides the model to:
+“You are an AI companion with long‑term memory. Store facts naturally (‘Got it, I’ll remember that.’). Recall them when asked in natural language. Never expose internal tool usage to the user. Use memory tools to remember, recall, and update information invisibly.”
 
-    Store new facts in memory with remember
-    Recall them naturally with search_memories
-    Never expose tool calls to the user
+## 🛠️ MCP Tools Overview
 
-Example prompt:
-
-    “You are an AI companion with long‑term memory. Store facts naturally (‘Got it, I’ll remember that’). Recall them when asked in natural language. Never expose internal tool usage to the user.”
-
-### 🛠️ MCP Tools Overview
-
-Your `RobustMemory` MCP exposes 10 tools that allow your AI companion to interact with its long-term memory. These tools are designed to be called internally by the AI model based on its system prompt, making the memory system feel seamless and invisible to the user.
+Your `RobustMemory` MCP exposes tools that allow your AI companion to interact with its long-term memory. These tools are designed to be called internally by the AI model based on its system prompt, making the memory system feel seamless and invisible to the user.
 
 Here's a breakdown of each tool's purpose and parameters:
 
@@ -243,16 +239,40 @@ Your AI companion chooses memory tools automatically based on the conversation. 
 > *“Back everything up.”*  
 → Uses `create_backup()`  
 
+## 🔄 What’s New
 
-🛠 Contributing
+**Semantic search improvements**
+  - Distance→similarity fix: relevance = 1.0 − distance
+  - Adaptive threshold: follows top match (clamped) to reduce noise when strong matches exist
+  - Top‑1 fallback: if nothing passes threshold, return the strongest candidate (optional guard at 0.08)
+  
+**Human‑like memory dynamics**
+  - Lazy Decay:
+    - On access, compute decay based on time since last_accessed (fallback: timestamp)
+    - Exponential half‑life per memory_type (conversation, fact, preference, task, ephemeral)
+    - Never decays below type floors; protected tags (core, identity, pinned) skip decay
+    - Writes are rate‑limited and only persisted for meaningful deltas (≥ 0.5)
+ 
+**Reinforcement:**
+  - Each retrieval accumulates +0.1 in metadata
+  - When accumulation reaches +0.5, write back a +0.5 importance bump (rounded to halves)
+  - Capped at importance 10
+
+**Logging and observability**
+  - Clear logs for decay checks, skip reasons (protected/floor/step/rate‑limit), and writes
+  - Logs for reinforcement accumulation and write‑backs
+  - Candidate similarities and adaptive threshold shown for semantic queries
+    
+
+## 🛠 Contributing
 
 Pull requests welcome!
 
-    Found a bug? Open an issue.
-    Want to add features (custom backup schedule, encryption, etc.)? Let’s collaborate.
+  - Found a bug? Open an issue.
+  - Want to add features (custom backup schedule, encryption, etc.)? Let’s collaborate.
 
-📜 License
+## 📜 License
 
-MIT
+### MIT
 
 🔥 With this setup, your AI can build a persistent, evolving memory that feels natural across conversations, models, and even years.
