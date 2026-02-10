@@ -49,27 +49,124 @@ Requirements include:
 ```
     pip install "huggingface_hub[hf_xet]"  
 ```
+## 🏗️ Project Structure
+
+The project has been refactored into a modular architecture for better maintainability:
+
+```
+long-term-memory-mcp/
+├── server.py                    # Main entry point (NEW!)
+├── memory_mcp/                  # Core package (NEW!)
+│   ├── __init__.py             # Package exports
+│   ├── config.py               # Configuration constants
+│   ├── models.py               # Data models (dataclasses)
+│   ├── memory_system.py        # Core RobustMemorySystem class
+│   └── mcp_tools.py            # MCP tool registration
+├── memory_manager_gui.py        # Desktop GUI for memory management
+├── long_term_memory_mcp.py     # Legacy monolithic file (still functional)
+└── requirements.txt            # Dependencies
+```
+
+**Benefits of the refactored structure:**
+- **Separation of Concerns**: Each module has a single responsibility
+- **Maintainability**: Easier to find and modify specific functionality
+- **Testability**: Individual modules can be tested in isolation
+- **Reusability**: Components can be imported and used independently
+
 ## 🚀 Running the Memory MCP
+
+### Option 1: Stdio Transport (for LM Studio and Desktop Clients)
+
+**Using the new modular server (recommended):**
 
 Edit your LM Studio mcp.json to include the correct path:
 
-```
-    {
+```json
+{
   "mcpServers": {
     "long_term_memory": {
       "command": "C:\\Python313\\python.exe",
       "args": [
-        "D:\\a.i. apps\\long_term_memory_mcp\\LongTermMemoryMCP.py"
+        "D:\\a.i. apps\\long_term_memory_mcp\\server.py"
       ],
       "env": {}
     }
   }
 }  
 ```
-Then, in LM Studio:
 
+Or on Unix-like systems:
+
+```json
+{
+  "mcpServers": {
+    "long_term_memory": {
+      "command": "python",
+      "args": [
+        "/path/to/server.py"
+      ],
+      "env": {}
+    }
+  }
+}  
+```
+
+**Using the legacy monolithic file:**
+
+Replace `server.py` with `long_term_memory_mcp.py` in the args above. Both entry points are fully functional and compatible.
+
+Then, in LM Studio:
    - Open Server (MCP) Settings
    - Load the MCP Tool: "long_term_memory"
+
+### Option 2: HTTP Transport (for Multiple Agents and Network Access)
+
+Start the server with HTTP transport to allow multiple agents to connect over the network:
+
+```bash
+# Start the server on localhost:8000 (using new modular entry point)
+python server.py --transport http
+
+# Or specify custom host and port
+python server.py --transport http --host 0.0.0.0 --port 3000
+
+# Custom path (default is /mcp/)
+python server.py --transport http --path /api/memory/
+
+# Using legacy monolithic file (also works)
+python long_term_memory_mcp.py --transport http
+```
+
+The server will be accessible at `http://localhost:8000/mcp/` by default.
+
+**Connect from clients:**
+
+Add this to your MCP client configuration (Claude Desktop, Cursor, OpenCode, etc.):
+
+```json
+{
+  "mcpServers": {
+    "long_term_memory": {
+      "url": "http://localhost:8000/mcp/"
+    }
+  }
+}
+```
+
+**See `mcp-config-examples.json` for more configuration examples including:**
+- Remote server connections
+- Custom paths
+- Multiple agents sharing one server
+- Claude Desktop, Cursor, and LM Studio configurations
+- Development vs production setups
+
+**Benefits of HTTP Transport:**
+- Multiple agents can connect to the same memory instance simultaneously
+- No need to spawn a new process for each agent
+- Network-accessible (can run on a server and connect remotely)
+- Better for production deployments and multi-user scenarios
+
+📖 **Full HTTP Transport Guide**: See [HTTP_TRANSPORT_GUIDE.md](HTTP_TRANSPORT_GUIDE.md) for detailed documentation.
 
 ## 🧠 How Memory Works
 
@@ -240,6 +337,19 @@ Your AI companion chooses memory tools automatically based on the conversation. 
 → Uses `create_backup()`  
 
 ## 🔄 What’s New
+
+**Modular Architecture Refactoring (Latest)**
+  - Refactored monolithic file (1977 lines) into clean modular structure
+  - New `memory_mcp/` package with separate concerns:
+    - `config.py`: Configuration constants (decay, reinforcement settings)
+    - `models.py`: Data models (MemoryRecord, SearchResult, Result)
+    - `memory_system.py`: Core RobustMemorySystem class (~1350 lines)
+    - `mcp_tools.py`: MCP tool registration and handlers
+  - New `server.py` entry point (97 lines) - clean and focused
+  - Legacy `long_term_memory_mcp.py` remains fully functional
+  - Better maintainability, testability, and code navigation
+  - No breaking changes - all existing configurations work with both entry points
+
 
 **Semantic search improvements**
   - Distance→similarity fix: relevance = 1.0 − distance

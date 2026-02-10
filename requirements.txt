@@ -1,10 +1,15 @@
 # Requirements for Robust Memory System
-# Install with: pip install -r requirements_robust_memory.txt
+# Install with: pip install -r requirements.txt
 
 # Core dependencies
 chromadb>=0.4.15
 sentence-transformers>=2.2.2
+fastmcp>=3.0.0b1
+tiktoken>=0.5.0
 
+# HTTP transport support
+uvicorn>=0.30.0
+sse-starlette>=1.6.0
 
 # Optional but recommended for better performance
 numpy>=1.24.0
@@ -15,5 +20,5 @@ pytest>=7.0.0
 black>=23.0.0
 
 # Note: If you're on a system with limited resources, you can use a smaller embedding model
-# by modifying the model_name in RobustMemory.py from "all-MiniLM-L6-v2" to "all-MiniLM-L12-v2"
+# by modifying the model_name in long_term_memory_mcp.py from "all-MiniLM-L6-v2" to "all-MiniLM-L12-v2"
 # or even "paraphrase-MiniLM-L3-v2" for faster but slightly less accurate embeddings.
