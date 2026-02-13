@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "long-term-memory-mcp"
+version = "1.0.0"
+description = "A persistent, human-like memory system for AI companions, powered by SQLite and ChromaDB"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "Rotoslider"}
+]
+keywords = ["mcp", "memory", "ai", "llm", "chromadb", "sqlite"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "chromadb>=0.4.15",
+    "sentence-transformers>=2.2.2",
+    "fastmcp>=3.0.0b1",
+    "tiktoken>=0.5.0",
+    "uvicorn>=0.30.0",
+    "sse-starlette>=1.6.0",
+    "numpy>=1.24.0",
+    "torch>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Rotoslider/long-term-memory-mcp"
+Repository = "https://github.com/Rotoslider/long-term-memory-mcp"
+
+[tool.setuptools]
+packages = ["memory_mcp"]
+
+[tool.black]
+line-length = 100
+target-version = ['py312']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

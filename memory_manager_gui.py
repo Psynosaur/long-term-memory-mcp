@@ -50,11 +50,19 @@ class MemoryManagerGUI:
         self.style = ttk.Style()
         self.style.theme_use("clam")
 
-        # Custom colors
-        self.bg_color = "#2b2b2b"
-        self.fg_color = "#ffffff"
-        self.accent_color = "#4a9eff"
-        self.secondary_bg = "#3a3a3a"
+        # Custom dark theme colors
+        self.bg_color = "#1e1e1e"  # Main background (darker)
+        self.fg_color = "#e0e0e0"  # Main text color
+        self.accent_color = "#4a9eff"  # Accent blue
+        self.secondary_bg = "#2d2d2d"  # Secondary backgrounds
+        self.input_bg = "#252525"  # Input fields background
+        self.hover_bg = "#3a3a3a"  # Hover state
+        self.border_color = "#3e3e3e"  # Border color
+        self.selected_bg = "#264f78"  # Selected item background
+        self.button_bg = "#0e639c"  # Button background
+
+        # Apply dark theme to root window
+        self.root.configure(bg=self.bg_color)
 
         # Configure styles
         self.configure_styles()
@@ -86,20 +94,139 @@ class MemoryManagerGUI:
         self.update_statistics()
 
     def configure_styles(self):
-        """Configure custom styles for widgets"""
+        """Configure comprehensive dark theme for all widgets"""
+        # Frame styles
+        self.style.configure("TFrame", background=self.bg_color)
         self.style.configure(
-            "Title.TLabel", font=("Segoe UI", 24, "bold"), foreground=self.accent_color
+            "TLabelframe",
+            background=self.bg_color,
+            bordercolor=self.border_color,
+            foreground=self.fg_color,
         )
         self.style.configure(
-            "Subtitle.TLabel", font=("Segoe UI", 12), foreground="#cccccc"
+            "TLabelframe.Label",
+            background=self.bg_color,
+            foreground=self.accent_color,
+            font=("Segoe UI", 10, "bold"),
+        )
+
+        # Label styles
+        self.style.configure(
+            "Title.TLabel",
+            font=("Segoe UI", 24, "bold"),
+            foreground=self.accent_color,
+            background=self.bg_color,
         )
         self.style.configure(
-            "Header.TLabel", font=("Segoe UI", 11, "bold"), foreground=self.fg_color
+            "Subtitle.TLabel",
+            font=("Segoe UI", 12),
+            foreground="#999999",
+            background=self.bg_color,
         )
         self.style.configure(
-            "Normal.TLabel", font=("Segoe UI", 10), foreground=self.fg_color
+            "Header.TLabel",
+            font=("Segoe UI", 11, "bold"),
+            foreground=self.fg_color,
+            background=self.bg_color,
         )
-        self.style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        self.style.configure(
+            "Normal.TLabel",
+            font=("Segoe UI", 10),
+            foreground=self.fg_color,
+            background=self.bg_color,
+        )
+
+        # Button styles
+        self.style.configure(
+            "TButton",
+            background=self.secondary_bg,
+            foreground=self.fg_color,
+            bordercolor=self.border_color,
+            darkcolor=self.secondary_bg,
+            lightcolor=self.hover_bg,
+            font=("Segoe UI", 10),
+        )
+        self.style.map(
+            "TButton",
+            background=[("active", self.hover_bg), ("pressed", self.button_bg)],
+            foreground=[("active", self.fg_color)],
+        )
+
+        self.style.configure(
+            "Accent.TButton",
+            font=("Segoe UI", 10, "bold"),
+            background=self.button_bg,
+            foreground="#ffffff",
+        )
+        self.style.map(
+            "Accent.TButton", background=[("active", "#1177bb"), ("pressed", "#0d5a8f")]
+        )
+
+        # Entry styles
+        self.style.configure(
+            "TEntry",
+            fieldbackground=self.input_bg,
+            background=self.input_bg,
+            foreground=self.fg_color,
+            bordercolor=self.border_color,
+            insertcolor=self.fg_color,
+        )
+
+        # Combobox styles
+        self.style.configure(
+            "TCombobox",
+            fieldbackground=self.input_bg,
+            background=self.secondary_bg,
+            foreground=self.fg_color,
+            bordercolor=self.border_color,
+            arrowcolor=self.fg_color,
+            selectbackground=self.selected_bg,
+            selectforeground=self.fg_color,
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", self.input_bg)],
+            selectbackground=[("readonly", self.selected_bg)],
+        )
+
+        # Treeview styles
+        self.style.configure(
+            "Treeview",
+            background=self.secondary_bg,
+            foreground=self.fg_color,
+            fieldbackground=self.secondary_bg,
+            bordercolor=self.border_color,
+            font=("Segoe UI", 10),
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background=self.input_bg,
+            foreground=self.fg_color,
+            bordercolor=self.border_color,
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.style.map(
+            "Treeview",
+            background=[("selected", self.selected_bg)],
+            foreground=[("selected", "#ffffff")],
+        )
+        self.style.map("Treeview.Heading", background=[("active", self.hover_bg)])
+
+        # Scrollbar styles
+        self.style.configure(
+            "Vertical.TScrollbar",
+            background=self.secondary_bg,
+            troughcolor=self.bg_color,
+            bordercolor=self.border_color,
+            arrowcolor=self.fg_color,
+        )
+        self.style.configure(
+            "Horizontal.TScrollbar",
+            background=self.secondary_bg,
+            troughcolor=self.bg_color,
+            bordercolor=self.border_color,
+            arrowcolor=self.fg_color,
+        )
 
     def connect_database(self):
         """Connect to the SQLite database with corruption protection"""
@@ -342,6 +469,11 @@ class MemoryManagerGUI:
         self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
 
+        # Configure Treeview row colors for dark theme
+        self.tree.tag_configure(
+            "row", background=self.secondary_bg, foreground=self.fg_color
+        )
+
         # Bind selection event
         self.tree.bind("<<TreeviewSelect>>", self.on_memory_selected)
 
@@ -376,6 +508,9 @@ class MemoryManagerGUI:
         ttk.Button(action_frame, text="Vectors", command=self.show_vector_window).grid(
             row=0, column=6, padx=2
         )
+        ttk.Button(
+            action_frame, text="Migrate", command=self.show_migration_window
+        ).grid(row=0, column=7, padx=2)
 
         # Details section
         details_frame = ttk.LabelFrame(right_panel, text="Memory Details", padding="10")
@@ -455,7 +590,17 @@ class MemoryManagerGUI:
             row=5, column=0, sticky=(tk.W, tk.N), pady=5
         )
         self.content_text = scrolledtext.ScrolledText(
-            details_frame, wrap=tk.WORD, font=("Segoe UI", 10), height=15
+            details_frame,
+            wrap=tk.WORD,
+            font=("Segoe UI", 10),
+            height=15,
+            bg=self.input_bg,
+            fg=self.fg_color,
+            insertbackground=self.fg_color,
+            selectbackground=self.selected_bg,
+            selectforeground="#ffffff",
+            borderwidth=1,
+            relief=tk.SOLID,
         )
         self.content_text.grid(
             row=5, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5, padx=(10, 0)
@@ -592,6 +737,7 @@ class MemoryManagerGUI:
                         row["importance"],
                         date_str,
                     ),
+                    tags=("row",),
                 )
 
             # Update status
@@ -957,6 +1103,7 @@ class MemoryManagerGUI:
 
         # Create new window
         vector_window = tk.Toplevel(self.root)
+        vector_window.configure(bg=self.bg_color)  # Dark background for window
         if selected_memory_title:
             vector_window.title(f"Vector Visualization - {selected_memory_title}")
         else:
@@ -1014,7 +1161,17 @@ class MemoryManagerGUI:
         results_frame.rowconfigure(0, weight=1)
 
         results_text = scrolledtext.ScrolledText(
-            results_frame, wrap=tk.WORD, font=("Courier New", 9), height=20
+            results_frame,
+            wrap=tk.WORD,
+            font=("Courier New", 9),
+            height=20,
+            bg=self.input_bg,
+            fg=self.fg_color,
+            insertbackground=self.fg_color,
+            selectbackground=self.selected_bg,
+            selectforeground="#ffffff",
+            borderwidth=1,
+            relief=tk.SOLID,
         )
         results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
@@ -1255,6 +1412,328 @@ class MemoryManagerGUI:
 
         except Exception as e:
             return f"Error loading statistics:\n{str(e)}"
+
+    def show_migration_window(self):
+        """Show database migration window"""
+        # Create migration window
+        migration_win = tk.Toplevel(self.root)
+        migration_win.title("Database Migration Tool")
+        migration_win.geometry("1000x700")
+        migration_win.configure(bg=self.bg_color)
+
+        # Make it modal
+        migration_win.transient(self.root)
+        migration_win.grab_set()
+
+        # Main container
+        main_frame = ttk.Frame(migration_win, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        migration_win.columnconfigure(0, weight=1)
+        migration_win.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(2, weight=1)
+
+        # Title
+        title_label = ttk.Label(
+            main_frame,
+            text="Migrate Memories from Another Database",
+            font=("Segoe UI", 14, "bold"),
+        )
+        title_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+
+        # Instructions
+        instructions = ttk.Label(
+            main_frame,
+            text="Import memories from a separate database (e.g., from default location when you ran with different settings).\n"
+            "This will transfer both SQLite records and ChromaDB vectors.",
+            font=("Segoe UI", 9),
+        )
+        instructions.grid(row=1, column=0, sticky=tk.W, pady=(0, 10))
+
+        # Source database selection
+        source_frame = ttk.LabelFrame(main_frame, text="Source Database", padding="10")
+        source_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        source_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(source_frame, text="SQLite DB:").grid(
+            row=0, column=0, sticky=tk.W, pady=5
+        )
+        source_db_var = tk.StringVar()
+        source_db_entry = ttk.Entry(source_frame, textvariable=source_db_var)
+        source_db_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+
+        def browse_source_db():
+            default_path = (
+                Path.home() / "Documents" / "ai_companion_memory" / "memory_db"
+            )
+            filename = filedialog.askopenfilename(
+                title="Select Source Database",
+                initialdir=default_path if default_path.exists() else Path.home(),
+                filetypes=[("SQLite Database", "*.db"), ("All Files", "*.*")],
+            )
+            if filename:
+                source_db_var.set(filename)
+                # Auto-detect ChromaDB path
+                source_path = Path(filename)
+                chroma_path = source_path.parent / "chroma_db"
+                if chroma_path.exists():
+                    source_chroma_var.set(str(chroma_path))
+
+        ttk.Button(source_frame, text="Browse", command=browse_source_db).grid(
+            row=0, column=2, padx=5, pady=5
+        )
+
+        # Quick access to default location
+        def use_default_location():
+            default_db = (
+                Path.home()
+                / "Documents"
+                / "ai_companion_memory"
+                / "memory_db"
+                / "memories.db"
+            )
+            if default_db.exists():
+                source_db_var.set(str(default_db))
+                chroma_path = default_db.parent / "chroma_db"
+                if chroma_path.exists():
+                    source_chroma_var.set(str(chroma_path))
+            else:
+                messagebox.showwarning(
+                    "Not Found", f"Default database not found at:\n{default_db}"
+                )
+
+        ttk.Button(
+            source_frame, text="Use Default Location", command=use_default_location
+        ).grid(row=0, column=3, padx=5, pady=5)
+
+        ttk.Label(source_frame, text="ChromaDB Path:").grid(
+            row=1, column=0, sticky=tk.W, pady=5
+        )
+        source_chroma_var = tk.StringVar()
+        source_chroma_entry = ttk.Entry(source_frame, textvariable=source_chroma_var)
+        source_chroma_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+
+        def browse_source_chroma():
+            dirname = filedialog.askdirectory(
+                title="Select ChromaDB Directory",
+                initialdir=Path.home()
+                / "Documents"
+                / "ai_companion_memory"
+                / "memory_db",
+            )
+            if dirname:
+                source_chroma_var.set(dirname)
+
+        ttk.Button(source_frame, text="Browse", command=browse_source_chroma).grid(
+            row=1, column=2, padx=5, pady=5
+        )
+
+        ttk.Label(
+            source_frame, text="(Auto-detected if left blank)", font=("Segoe UI", 8)
+        ).grid(row=1, column=3, sticky=tk.W, padx=5)
+
+        # Preview button and list
+        preview_frame = ttk.LabelFrame(
+            main_frame, text="Preview Source Memories", padding="10"
+        )
+        preview_frame.grid(
+            row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10)
+        )
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
+
+        preview_button_frame = ttk.Frame(preview_frame)
+        preview_button_frame.grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+
+        def preview_memories():
+            source_path = source_db_var.get()
+            if not source_path:
+                messagebox.showwarning(
+                    "Missing Input", "Please select a source database"
+                )
+                return
+
+            if not Path(source_path).exists():
+                messagebox.showerror("Error", f"Database not found: {source_path}")
+                return
+
+            try:
+                # Connect to source database
+                source_conn = sqlite3.connect(source_path)
+                source_conn.row_factory = sqlite3.Row
+
+                # Query memories
+                cursor = source_conn.execute(
+                    """
+                    SELECT id, title, content, timestamp, tags, importance, memory_type
+                    FROM memories 
+                    ORDER BY timestamp DESC 
+                    LIMIT 100
+                    """
+                )
+
+                rows = cursor.fetchall()
+                source_conn.close()
+
+                # Clear preview list
+                for item in preview_tree.get_children():
+                    preview_tree.delete(item)
+
+                # Populate preview
+                for row in rows:
+                    tags = json.loads(row["tags"]) if row["tags"] else []
+                    preview_tree.insert(
+                        "",
+                        "end",
+                        values=(
+                            row["id"][:12] + "...",
+                            row["title"][:50],
+                            row["memory_type"],
+                            row["importance"],
+                            ", ".join(tags)[:30],
+                        ),
+                    )
+
+                count_label.config(
+                    text=f"Found {len(rows)} memories (showing up to 100)"
+                )
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to preview database:\n{str(e)}")
+
+        ttk.Button(
+            preview_button_frame,
+            text="Preview Source Database",
+            command=preview_memories,
+        ).grid(row=0, column=0, padx=2)
+
+        count_label = ttk.Label(preview_button_frame, text="", font=("Segoe UI", 9))
+        count_label.grid(row=0, column=1, padx=10)
+
+        # Preview treeview
+        preview_tree = ttk.Treeview(
+            preview_frame,
+            columns=("ID", "Title", "Type", "Importance", "Tags"),
+            show="headings",
+            height=10,
+        )
+
+        preview_tree.heading("ID", text="ID")
+        preview_tree.heading("Title", text="Title")
+        preview_tree.heading("Type", text="Type")
+        preview_tree.heading("Importance", text="Importance")
+        preview_tree.heading("Tags", text="Tags")
+
+        preview_tree.column("ID", width=120)
+        preview_tree.column("Title", width=300)
+        preview_tree.column("Type", width=100)
+        preview_tree.column("Importance", width=80)
+        preview_tree.column("Tags", width=200)
+
+        preview_tree.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # Scrollbar for preview
+        preview_scroll = ttk.Scrollbar(
+            preview_frame, orient="vertical", command=preview_tree.yview
+        )
+        preview_scroll.grid(row=1, column=1, sticky=(tk.N, tk.S))
+        preview_tree.configure(yscrollcommand=preview_scroll.set)
+
+        # Migration options
+        options_frame = ttk.LabelFrame(
+            main_frame, text="Migration Options", padding="10"
+        )
+        options_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        skip_duplicates_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            options_frame,
+            text="Skip duplicate memories (recommended)",
+            variable=skip_duplicates_var,
+        ).grid(row=0, column=0, sticky=tk.W, pady=5)
+
+        ttk.Label(
+            options_frame,
+            text="Duplicates are detected using content hash. Enabling this prevents importing the same memory twice.",
+            font=("Segoe UI", 8),
+        ).grid(row=1, column=0, sticky=tk.W)
+
+        # Action buttons
+        action_frame = ttk.Frame(main_frame)
+        action_frame.grid(row=5, column=0, sticky=(tk.W, tk.E))
+
+        def perform_migration():
+            source_path = source_db_var.get()
+            if not source_path:
+                messagebox.showwarning(
+                    "Missing Input", "Please select a source database"
+                )
+                return
+
+            if not Path(source_path).exists():
+                messagebox.showerror("Error", f"Database not found: {source_path}")
+                return
+
+            # Confirmation
+            response = messagebox.askyesno(
+                "Confirm Migration",
+                "This will import memories from the source database into your active database.\n\n"
+                "Are you sure you want to continue?",
+            )
+
+            if not response:
+                return
+
+            try:
+                # Import the migration functionality
+                from memory_mcp.memory_system import RobustMemorySystem
+                from memory_mcp.config import DATA_FOLDER
+
+                # Initialize memory system (with active database)
+                memory_system = RobustMemorySystem(DATA_FOLDER)
+
+                # Prepare parameters
+                source_chroma_path = source_chroma_var.get() or None
+
+                # Perform migration
+                result = memory_system.migrate_memories(
+                    source_db_path=source_path,
+                    source_chroma_path=source_chroma_path,
+                    memory_ids=None,  # Migrate all
+                    skip_duplicates=skip_duplicates_var.get(),
+                )
+
+                if result.success:
+                    stats = result.data[0]
+                    messagebox.showinfo(
+                        "Migration Complete",
+                        f"Migration completed successfully!\n\n"
+                        f"Total found: {stats['total_found']}\n"
+                        f"Migrated: {stats['migrated']}\n"
+                        f"Skipped (duplicates): {stats['skipped_duplicates']}\n"
+                        f"Errors: {stats['errors']}\n"
+                        f"Vectors migrated: {stats['vectors_migrated']}",
+                    )
+
+                    # Refresh the main window
+                    self.refresh_memories()
+                    self.update_statistics()
+
+                    # Close migration window
+                    migration_win.destroy()
+                else:
+                    messagebox.showerror("Migration Failed", f"Error: {result.reason}")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Migration failed:\n{str(e)}")
+
+        ttk.Button(
+            action_frame, text="Start Migration", command=perform_migration
+        ).grid(row=0, column=0, padx=5)
+
+        ttk.Button(action_frame, text="Close", command=migration_win.destroy).grid(
+            row=0, column=1, padx=5
+        )
 
     def on_closing(self):
         """Handle window closing"""

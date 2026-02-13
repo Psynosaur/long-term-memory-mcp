@@ -422,3 +422,99 @@ def register_tools(mcp, memory_system):
         """
         res = memory_system.rebuild_vector_index()
         return jsonify_result(res)
+
+    @mcp.tool
+    def list_source_memories(source_db_path: str, limit: int = 100) -> dict:
+        """
+        List memories from a source database for migration preview.
+
+        Use this to view memories from another database before migrating them.
+        Helpful for verifying what will be transferred.
+
+        Args:
+            source_db_path (str): Full path to the source SQLite database file
+                (e.g., "/Users/name/Documents/ai_companion_memory/memory_db/memories.db")
+            limit (int, optional): Maximum number of memories to list (default 100)
+
+        Returns:
+            dict: Dictionary with the following keys:
+                - success (bool): Whether the operation succeeded
+                - reason (str, optional): Error message if failed
+                - data (list, optional): List of memory objects from source database, each with:
+                    - id
+                    - title
+                    - content (truncated to 200 chars)
+                    - timestamp
+                    - tags
+                    - importance
+                    - memory_type
+                    - token_count
+
+        Example triggers:
+        - "Show me what memories are in the old database"
+        - "List memories from the default database location"
+        - "Preview what will be migrated"
+        """
+        res = memory_system.list_source_memories(source_db_path, limit)
+        return jsonify_result(res)
+
+    @mcp.tool
+    def migrate_memories(
+        source_db_path: str,
+        source_chroma_path: str = None,
+        memory_ids: str = None,
+        skip_duplicates: bool = True,
+    ) -> dict:
+        """
+        Migrate memories from a source database to the active database.
+        Transfers both SQLite records and ChromaDB vectors.
+
+        Use this when you ran the memory system with default settings and memories
+        were stored in a separate database that you want to merge into your active database.
+
+        Args:
+            source_db_path (str): Full path to the source SQLite database file
+                (e.g., "/Users/name/Documents/ai_companion_memory/memory_db/memories.db")
+            source_chroma_path (str, optional): Full path to the source ChromaDB directory.
+                If not provided, will auto-detect by looking for chroma_db in the same
+                directory as the SQLite database.
+            memory_ids (str, optional): Comma-separated list of specific memory IDs to migrate.
+                If not provided, all memories will be migrated.
+                (e.g., "mem_abc123,mem_def456")
+            skip_duplicates (bool, optional): If True, skip memories with duplicate content
+                hashes (default: True). Set to False to import everything regardless of duplicates.
+
+        Returns:
+            dict: Dictionary with the following keys:
+                - success (bool): Whether the operation succeeded
+                - reason (str, optional): Error message if failed
+                - data (list, optional): Migration statistics including:
+                    - total_found: Total memories found in source
+                    - migrated: Number successfully migrated
+                    - skipped_duplicates: Number skipped due to duplicate content
+                    - errors: Number of errors encountered
+                    - vectors_migrated: Number of ChromaDB vectors transferred
+
+        Example triggers:
+        - "Migrate all memories from the default database"
+        - "Transfer memories from /path/to/old/memories.db"
+        - "Import specific memories: mem_123, mem_456"
+        - "Migrate including duplicates"
+
+        Warning:
+        - Always use list_source_memories first to preview what will be migrated
+        - Backup your active database before migrating (use create_backup)
+        - Migration is additive - it adds to your active database, doesn't replace it
+        """
+        # Parse memory_ids if provided
+        memory_id_list = None
+        if memory_ids:
+            memory_id_list = [mid.strip() for mid in memory_ids.split(",")]
+
+        res = memory_system.migrate_memories(
+            source_db_path=source_db_path,
+            source_chroma_path=source_chroma_path,
+            memory_ids=memory_id_list,
+            skip_duplicates=skip_duplicates,
+        )
+        return jsonify_result(res)

@@ -627,9 +627,7 @@ class RobustMemorySystem:
             if memory_ids:
                 placeholders = ",".join(["?" for _ in memory_ids])
                 self.sqlite_conn.execute(
-                    f"UPDATE memories SET last_accessed = ? WHERE id IN ({
-                        placeholders
-                    })",
+                    f"UPDATE memories SET last_accessed = ? WHERE id IN ({placeholders})",
                     [now_iso] + memory_ids,
                 )
                 self.sqlite_conn.commit()
@@ -1374,3 +1372,263 @@ class RobustMemorySystem:
                 "Reinforcement skipped for id=%s: %s", row.get("id", "UNKNOWN"), e
             )
             return None
+
+    def list_source_memories(self, source_db_path: str, limit: int = 100) -> Result:
+        """
+        List memories from a source database for migration preview.
+
+        Args:
+            source_db_path: Path to the source SQLite database file
+            limit: Maximum number of memories to list
+
+        Returns:
+            Result with list of memories from source database
+        """
+        try:
+            source_path = Path(source_db_path)
+            if not source_path.exists():
+                return Result(
+                    success=False, reason=f"Source database not found: {source_db_path}"
+                )
+
+            # Connect to source database
+            source_conn = sqlite3.connect(str(source_path), check_same_thread=False)
+            source_conn.row_factory = sqlite3.Row
+
+            # Query memories
+            cursor = source_conn.execute(
+                """
+                SELECT id, title, content, timestamp, tags, importance, 
+                       memory_type, metadata, token_count, created_at
+                FROM memories 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+                """,
+                (limit,),
+            )
+
+            memories = []
+            for row in cursor.fetchall():
+                memory_dict = {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "content": row["content"][:200] + "..."
+                    if len(row["content"]) > 200
+                    else row["content"],
+                    "timestamp": row["timestamp"],
+                    "tags": json.loads(row["tags"]) if row["tags"] else [],
+                    "importance": row["importance"],
+                    "memory_type": row["memory_type"],
+                    "token_count": row["token_count"] or 0,
+                }
+                memories.append(memory_dict)
+
+            source_conn.close()
+
+            self.logger.info(f"Listed {len(memories)} memories from source database")
+            return Result(success=True, data=memories)
+
+        except Exception as e:
+            self.logger.error(f"Failed to list source memories: {e}")
+            return Result(
+                success=False, reason=f"Error listing source memories: {str(e)}"
+            )
+
+    def migrate_memories(
+        self,
+        source_db_path: str,
+        source_chroma_path: str = None,
+        memory_ids: List[str] = None,
+        skip_duplicates: bool = True,
+    ) -> Result:
+        """
+        Migrate memories from a source database to the active database.
+        Includes both SQLite records and ChromaDB vectors.
+
+        Args:
+            source_db_path: Path to the source SQLite database file
+            source_chroma_path: Path to the source ChromaDB directory (optional, auto-detected if not provided)
+            memory_ids: List of specific memory IDs to migrate (None = migrate all)
+            skip_duplicates: If True, skip memories with duplicate content hashes
+
+        Returns:
+            Result with migration statistics
+        """
+        try:
+            source_db_path = Path(source_db_path)
+            if not source_db_path.exists():
+                return Result(
+                    success=False, reason=f"Source database not found: {source_db_path}"
+                )
+
+            # Auto-detect ChromaDB path if not provided
+            if source_chroma_path is None:
+                # Try to find chroma_db in the same directory as the SQLite DB
+                source_chroma_path = source_db_path.parent / "chroma_db"
+                if not source_chroma_path.exists():
+                    self.logger.warning(
+                        f"ChromaDB not found at {source_chroma_path}, vectors will not be migrated"
+                    )
+                    source_chroma_path = None
+            else:
+                source_chroma_path = Path(source_chroma_path)
+                if not source_chroma_path.exists():
+                    self.logger.warning(
+                        f"ChromaDB path does not exist: {source_chroma_path}"
+                    )
+                    source_chroma_path = None
+
+            # Connect to source database
+            source_conn = sqlite3.connect(str(source_db_path), check_same_thread=False)
+            source_conn.row_factory = sqlite3.Row
+
+            # Build query for memories
+            if memory_ids:
+                placeholders = ",".join("?" * len(memory_ids))
+                query = f"""
+                    SELECT * FROM memories 
+                    WHERE id IN ({placeholders})
+                    ORDER BY timestamp ASC
+                """
+                cursor = source_conn.execute(query, memory_ids)
+            else:
+                cursor = source_conn.execute(
+                    "SELECT * FROM memories ORDER BY timestamp ASC"
+                )
+
+            source_memories = cursor.fetchall()
+
+            # Connect to source ChromaDB if available
+            source_chroma_client = None
+            source_chroma_collection = None
+            if source_chroma_path:
+                try:
+                    source_chroma_client = chromadb.PersistentClient(
+                        path=str(source_chroma_path),
+                        settings=Settings(
+                            anonymized_telemetry=False, allow_reset=False
+                        ),
+                    )
+                    source_chroma_collection = source_chroma_client.get_collection(
+                        "ai_companion_memories"
+                    )
+                    self.logger.info(
+                        f"Connected to source ChromaDB at {source_chroma_path}"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Could not connect to source ChromaDB: {e}")
+                    source_chroma_collection = None
+
+            # Migration statistics
+            stats = {
+                "total_found": len(source_memories),
+                "migrated": 0,
+                "skipped_duplicates": 0,
+                "errors": 0,
+                "vectors_migrated": 0,
+            }
+
+            # Migrate each memory
+            for row in source_memories:
+                try:
+                    memory_id = row["id"]
+                    content_hash = row["content_hash"]
+
+                    # Check for duplicates if requested
+                    if skip_duplicates and content_hash:
+                        existing = self.sqlite_conn.execute(
+                            "SELECT id FROM memories WHERE content_hash = ?",
+                            (content_hash,),
+                        ).fetchone()
+
+                        if existing:
+                            self.logger.info(f"Skipping duplicate memory: {memory_id}")
+                            stats["skipped_duplicates"] += 1
+                            continue
+
+                    # Insert into SQLite
+                    self.sqlite_conn.execute(
+                        """
+                        INSERT INTO memories 
+                        (id, title, content, timestamp, tags, importance, memory_type, 
+                         metadata, content_hash, created_at, updated_at, last_accessed, token_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["id"],
+                            row["title"],
+                            row["content"],
+                            row["timestamp"],
+                            row["tags"],
+                            row["importance"],
+                            row["memory_type"],
+                            row["metadata"],
+                            row["content_hash"],
+                            row["created_at"]
+                            if "created_at" in row.keys()
+                            else row["timestamp"],
+                            row["updated_at"]
+                            if "updated_at" in row.keys()
+                            else row["timestamp"],
+                            row["last_accessed"]
+                            if "last_accessed" in row.keys()
+                            else row["timestamp"],
+                            row["token_count"] if "token_count" in row.keys() else 0,
+                        ),
+                    )
+
+                    # Migrate vector from ChromaDB if available
+                    if source_chroma_collection:
+                        try:
+                            # Get the vector from source ChromaDB
+                            result = source_chroma_collection.get(
+                                ids=[memory_id],
+                                include=["embeddings", "documents", "metadatas"],
+                            )
+
+                            if result["ids"] and len(result["ids"]) > 0:
+                                # Add to destination ChromaDB
+                                self.chroma_collection.add(
+                                    ids=result["ids"],
+                                    embeddings=result["embeddings"],
+                                    documents=result["documents"],
+                                    metadatas=result["metadatas"],
+                                )
+                                stats["vectors_migrated"] += 1
+                                self.logger.info(
+                                    f"Migrated vector for memory: {memory_id}"
+                                )
+                            else:
+                                self.logger.warning(
+                                    f"No vector found for memory: {memory_id}"
+                                )
+                        except Exception as ve:
+                            self.logger.warning(
+                                f"Failed to migrate vector for {memory_id}: {ve}"
+                            )
+
+                    stats["migrated"] += 1
+                    self.logger.info(f"Migrated memory: {memory_id} - {row['title']}")
+
+                except Exception as e:
+                    self.logger.error(f"Failed to migrate memory {row['id']}: {e}")
+                    stats["errors"] += 1
+                    continue
+
+            # Commit all changes
+            self.sqlite_conn.commit()
+
+            # Close source connection
+            source_conn.close()
+
+            self.logger.info(
+                f"Migration complete: {stats['migrated']} migrated, "
+                f"{stats['skipped_duplicates']} skipped, {stats['errors']} errors, "
+                f"{stats['vectors_migrated']} vectors migrated"
+            )
+
+            return Result(success=True, data=[stats])
+
+        except Exception as e:
+            self.logger.error(f"Migration failed: {e}")
+            return Result(success=False, reason=f"Migration error: {str(e)}")
