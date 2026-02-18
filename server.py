@@ -12,6 +12,7 @@ This is a refactored version that uses a modular architecture with separate conc
 import asyncio
 import atexit
 import argparse
+import signal
 import sys
 
 # Third-party imports
@@ -38,8 +39,33 @@ def main():
     # Register all MCP tools
     register_tools(mcp, memory_system)
 
-    # Cleanup on exit
-    atexit.register(memory_system.close)
+    # ── Shutdown helpers ────────────────────────────────────────
+    _shutting_down = False
+
+    def _graceful_shutdown(signum=None, frame=None):
+        """Handle SIGTERM / SIGHUP by closing the memory system cleanly.
+
+        This ensures the WAL is checkpointed and the SQLite connection is
+        closed before the process exits — critical on macOS where the OS
+        may send SIGTERM on sleep/logout.
+        """
+        nonlocal _shutting_down
+        if _shutting_down:
+            return  # Avoid re-entrancy
+        _shutting_down = True
+
+        sig_name = signal.Signals(signum).name if signum else "atexit"
+        print(f"\nReceived {sig_name}, shutting down memory system...")
+        memory_system.close()
+
+    # Register cleanup on normal exit (atexit) and OS signals
+    atexit.register(_graceful_shutdown)
+
+    # SIGTERM: sent by launchd / systemd / Docker on stop
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+
+    # SIGHUP:  sent when terminal is closed or SSH disconnects
+    signal.signal(signal.SIGHUP, _graceful_shutdown)
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Long-Term Memory MCP Server")

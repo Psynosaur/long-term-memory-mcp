@@ -118,6 +118,10 @@ class RobustMemorySystem:
             self.sqlite_conn.execute(
                 "PRAGMA wal_autocheckpoint=500;"
             )  # checkpoint every 500 pgs
+            # SAFETY: synchronous=FULL ensures WAL data reaches disk before
+            # returning.  Prevents corruption on macOS sleep / sudden power loss.
+            # (WAL mode defaults to NORMAL which can lose committed data.)
+            self.sqlite_conn.execute("PRAGMA synchronous=FULL;")
             self.sqlite_conn.commit()
 
             # Create base tables (OK to have DEFAULT CURRENT_TIMESTAMP here for fresh DBs)
@@ -245,8 +249,7 @@ class RobustMemorySystem:
         """Initialize sentence transformer for embeddings"""
         try:
             # Use a good general-purpose model that works offline
-            # model_name = "all-MiniLM-L6-v2"  # Fast, good quality, 384 dimensions !!!!LEGACY!!!!
-            model_name = "all-MiniLM-L12-v2"  # Fast, good quality, 384 dimensions
+            model_name = "all-MiniLM-L12-v2"  # Better quality, 384 dimensions
             self.embedding_model = SentenceTransformer(model_name)
             self.logger.info("Embedding model '%s' loaded successfully", model_name)
 
@@ -290,9 +293,20 @@ class RobustMemorySystem:
         return hashlib.sha256(content.encode()).hexdigest()
 
     def _integrity_check(self):
-        """Check data integrity between SQLite and ChromaDB"""
+        """Check data integrity of SQLite database and cross-check with ChromaDB"""
         try:
-            # Count records in both systems
+            # --- SQLite page-level integrity check ---
+            # This detects corruption in the B-tree structure, free-list, and
+            # WAL file.  Returns 'ok' on success or a list of problems.
+            ic_result = self.sqlite_conn.execute("PRAGMA integrity_check;").fetchone()
+            if ic_result and ic_result[0] != "ok":
+                self.logger.error("SQLite integrity_check FAILED: %s", ic_result[0])
+                # Surface the problem but don't raise — let the server start
+                # so the user can attempt a backup or repair.
+            else:
+                self.logger.info("SQLite integrity_check passed")
+
+            # --- Record-count cross-check ---
             cursor = self.sqlite_conn.execute("SELECT COUNT(*) FROM memories")
             sqlite_count = cursor.fetchone()[0]
 
@@ -305,8 +319,12 @@ class RobustMemorySystem:
             )
 
             if sqlite_count != chroma_count:
-                self.logger.warning("Record count mismatch between SQLite and ChromaDB")
-                # Could implement auto-repair here
+                self.logger.warning(
+                    "Record count mismatch between SQLite (%d) and ChromaDB (%d). "
+                    "Run rebuild_vector_index to resync.",
+                    sqlite_count,
+                    chroma_count,
+                )
 
         except Exception as e:
             self.logger.error("Integrity check failed: %s", e)
@@ -361,7 +379,11 @@ class RobustMemorySystem:
                 metadata=metadata,
             )
 
-            # Store in SQLite
+            # Store in SQLite FIRST, then ChromaDB.
+            # Order matters: if we crash between the two writes, it's better
+            # to have a SQLite row with no vector (detectable via count
+            # mismatch and fixable with rebuild_vector_index) than an orphan
+            # vector with no SQLite row (invisible and unfixable).
             self.sqlite_conn.execute(
                 """
                 INSERT INTO memories 
@@ -383,37 +405,53 @@ class RobustMemorySystem:
                     token_count,
                 ),
             )
+            self.sqlite_conn.commit()
 
             # Generate embedding and store in ChromaDB
             # Combine title and content for better semantic search
             text_for_embedding = f"{title}\n{content}"
             embedding = self.embedding_model.encode(text_for_embedding).tolist()
 
-            self.chroma_collection.add(
-                ids=[record.id],
-                embeddings=[embedding],
-                documents=[text_for_embedding],
-                metadatas=[
-                    {
-                        "title": title,
-                        "timestamp": record.timestamp.isoformat(),
-                        "importance": importance,
-                        "memory_type": memory_type,
-                        "tags": json.dumps(tags),
-                    }
-                ],
-            )
-
             try:
-                if hasattr(self.chroma_client, "persist"):
-                    self.chroma_client.persist()
-            except Exception as pe:
-                self.logger.warning("Chroma persist warning: %s", pe)
+                self.chroma_collection.add(
+                    ids=[record.id],
+                    embeddings=[embedding],
+                    documents=[text_for_embedding],
+                    metadatas=[
+                        {
+                            "title": title,
+                            "timestamp": record.timestamp.isoformat(),
+                            "importance": importance,
+                            "memory_type": memory_type,
+                            "tags": json.dumps(tags),
+                        }
+                    ],
+                )
 
-            # Debug: check what Chroma actually contains after add
-            self.logger.info("Chroma after add: %s", self._debug_vector_index())
+                try:
+                    if hasattr(self.chroma_client, "persist"):
+                        self.chroma_client.persist()
+                except Exception as pe:
+                    self.logger.warning("Chroma persist warning: %s", pe)
 
-            self.sqlite_conn.commit()
+                # Debug: check what Chroma actually contains after add
+                self.logger.info("Chroma after add: %s", self._debug_vector_index())
+            except Exception as chroma_err:
+                # ChromaDB write failed — roll back the SQLite insert so the
+                # two stores stay in sync. The next call will retry both.
+                self.logger.error(
+                    "ChromaDB add failed for %s, rolling back SQLite insert: %s",
+                    record.id,
+                    chroma_err,
+                )
+                self.sqlite_conn.execute(
+                    "DELETE FROM memories WHERE id = ?", (record.id,)
+                )
+                self.sqlite_conn.commit()
+                return Result(
+                    success=False,
+                    reason=f"ChromaDB storage failed: {chroma_err}",
+                )
 
             # Trigger backup if needed
             self._maybe_backup()
@@ -652,6 +690,10 @@ class RobustMemorySystem:
                 result_dict["timestamp"] = record.timestamp.isoformat()
                 result_dict["match_type"] = "structured"
                 results.append(result_dict)
+
+            # Batch-commit any decay/reinforcement writes from the loop above
+            if rows:
+                self.sqlite_conn.commit()
 
             self.logger.info(
                 "Structured search returned %d results",
@@ -1033,11 +1075,21 @@ class RobustMemorySystem:
     def close(self):
         """Clean shutdown of the memory system"""
         try:
-            if hasattr(self, "sqlite_conn"):
+            if hasattr(self, "sqlite_conn") and self.sqlite_conn:
                 try:
                     self.sqlite_conn.commit()
                 except Exception:
                     pass
+
+                # WAL checkpoint: merge WAL into main db file before closing.
+                # TRUNCATE mode resets the WAL to zero bytes so no stale WAL
+                # is left behind (avoids data-in-WAL-but-not-in-db on restart).
+                try:
+                    self.sqlite_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except Exception as e:
+                    if hasattr(self, "logger") and self.logger:
+                        self.logger.warning("WAL checkpoint on close failed: %s", e)
+
                 try:
                     self.sqlite_conn.close()
                 except Exception:
@@ -1277,13 +1329,12 @@ class RobustMemorySystem:
                 )
                 return None
 
-            # Persist decay to DB
+            # Persist decay to DB (caller is responsible for commit)
             meta["last_decay_at"] = datetime.now(timezone.utc).isoformat()
             self.sqlite_conn.execute(
                 "UPDATE memories SET importance = ?, metadata = ? WHERE id = ?",
                 (decayed, json.dumps(meta), mem_id),
             )
-            self.sqlite_conn.commit()
 
             self.logger.info(
                 "Lazy decay: id=%s type=%s old=%s new=%s idle_days=%.1f half_life=%s",
@@ -1339,7 +1390,7 @@ class RobustMemorySystem:
                     "UPDATE memories SET importance = ?, metadata = ? WHERE id = ?",
                     (new_importance, json.dumps(meta), mem_id),
                 )
-                self.sqlite_conn.commit()
+                # Caller is responsible for commit (batched)
 
                 self.logger.info(
                     "Reinforcement: id=%s type=%s old=%s new=%s (+%s)",
@@ -1351,13 +1402,12 @@ class RobustMemorySystem:
                 )
                 return new_importance
 
-            # No writeback yet: just save accumulator
+            # No writeback yet: just save accumulator (caller commits)
             meta["reinforcement_accum"] = accum
             self.sqlite_conn.execute(
                 "UPDATE memories SET metadata = ? WHERE id = ?",
                 (json.dumps(meta), mem_id),
             )
-            self.sqlite_conn.commit()
 
             self.logger.info(
                 "Reinforcement accum: id=%s +%s, total=%.2f (not written yet)",

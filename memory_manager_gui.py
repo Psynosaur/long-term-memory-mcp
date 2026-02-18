@@ -75,6 +75,10 @@ class MemoryManagerGUI:
         self.chroma_conn = None
         self.connect_chromadb()
 
+        # Initialize RobustMemorySystem for write operations (keeps SQLite + ChromaDB in sync)
+        self.memory_system = None
+        self.init_memory_system()
+
         # Initialize tokenizer
         self.tokenizer = None
         self.init_tokenizer()
@@ -299,6 +303,21 @@ class MemoryManagerGUI:
                 self.tokenizer = None
         else:
             self.tokenizer = None
+
+    def init_memory_system(self):
+        """Initialize RobustMemorySystem for write operations (keeps SQLite + ChromaDB in sync)"""
+        try:
+            from memory_mcp.memory_system import RobustMemorySystem
+            from memory_mcp.config import DATA_FOLDER as MCP_DATA_FOLDER
+
+            self.memory_system = RobustMemorySystem(MCP_DATA_FOLDER)
+            print("RobustMemorySystem initialized for GUI write operations")
+        except Exception as e:
+            print(f"Failed to initialize RobustMemorySystem: {e}")
+            print(
+                "Write operations will fall back to raw SQLite (ChromaDB may get out of sync)"
+            )
+            self.memory_system = None
 
     def count_tokens(self, text: str) -> int:
         """Count tokens in text using tiktoken"""
@@ -823,7 +842,7 @@ class MemoryManagerGUI:
         self.metadata_label.config(text="New memory - fill in details and click Save")
 
     def save_memory(self):
-        """Save the current memory (create or update)"""
+        """Save the current memory (create or update), keeping SQLite and ChromaDB in sync"""
         try:
             title = self.title_var.get().strip()
             content = self.content_text.get("1.0", tk.END).strip()
@@ -845,104 +864,159 @@ class MemoryManagerGUI:
                 else []
             )
 
-            # Calculate token count
-            token_count = self.count_tokens(content)
-
-            now_iso = datetime.now(timezone.utc).isoformat()
-
-            if self.selected_memory_id:
-                # Update existing memory
-                self.db_conn.execute(
-                    """
-                    UPDATE memories
-                    SET title = ?, content = ?, memory_type = ?, importance = ?, tags = ?, updated_at = ?, token_count = ?
-                    WHERE id = ?
-                """,
-                    (
-                        title,
-                        content,
-                        memory_type,
-                        importance,
-                        json.dumps(tags),
-                        now_iso,
-                        token_count,
-                        self.selected_memory_id,
-                    ),
-                )
-
-                messagebox.showinfo("Success", "Memory updated successfully!")
+            if self.memory_system:
+                # Use RobustMemorySystem to keep SQLite + ChromaDB in sync
+                if self.selected_memory_id:
+                    # Update existing memory
+                    result = self.memory_system.update_memory(
+                        memory_id=self.selected_memory_id,
+                        title=title,
+                        content=content,
+                        tags=tags,
+                        importance=importance,
+                        memory_type=memory_type,
+                    )
+                    if result.success:
+                        messagebox.showinfo("Success", "Memory updated successfully!")
+                    else:
+                        messagebox.showerror(
+                            "Error", f"Failed to update memory:\n{result.reason}"
+                        )
+                        return
+                else:
+                    # Create new memory
+                    result = self.memory_system.remember(
+                        title=title,
+                        content=content,
+                        tags=tags,
+                        importance=importance,
+                        memory_type=memory_type,
+                    )
+                    if result.success:
+                        self.selected_memory_id = result.data[0]["id"]
+                        messagebox.showinfo("Success", "Memory created successfully!")
+                    else:
+                        messagebox.showerror(
+                            "Error", f"Failed to create memory:\n{result.reason}"
+                        )
+                        return
             else:
-                # Create new memory
-                import hashlib
+                # Fallback: raw SQLite (no ChromaDB sync)
+                token_count = self.count_tokens(content)
+                now_iso = datetime.now(timezone.utc).isoformat()
 
-                content_hash = hashlib.sha256(content.encode()).hexdigest()
-                time_hash = hashlib.sha256(now_iso.encode()).hexdigest()[:8]
-                memory_id = f"mem_{time_hash}_{content_hash[:16]}"
+                if self.selected_memory_id:
+                    self.db_conn.execute(
+                        """
+                        UPDATE memories
+                        SET title = ?, content = ?, memory_type = ?, importance = ?, tags = ?, updated_at = ?, token_count = ?
+                        WHERE id = ?
+                    """,
+                        (
+                            title,
+                            content,
+                            memory_type,
+                            importance,
+                            json.dumps(tags),
+                            now_iso,
+                            token_count,
+                            self.selected_memory_id,
+                        ),
+                    )
+                    self.db_conn.commit()
+                    messagebox.showinfo(
+                        "Success",
+                        "Memory updated (SQLite only - RobustMemorySystem unavailable).",
+                    )
+                else:
+                    import hashlib
 
-                self.db_conn.execute(
-                    """
-                    INSERT INTO memories (id, title, content, timestamp, tags, importance, memory_type, metadata, content_hash, created_at, updated_at, last_accessed, token_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                    (
-                        memory_id,
-                        title,
-                        content,
-                        now_iso,
-                        json.dumps(tags),
-                        importance,
-                        memory_type,
-                        "{}",
-                        content_hash,
-                        now_iso,
-                        now_iso,
-                        now_iso,
-                        token_count,
-                    ),
-                )
+                    content_hash = hashlib.sha256(content.encode()).hexdigest()
+                    time_hash = hashlib.sha256(now_iso.encode()).hexdigest()[:8]
+                    memory_id = f"mem_{time_hash}_{content_hash[:16]}"
 
-                self.selected_memory_id = memory_id
-                messagebox.showinfo(
-                    "Success",
-                    "Memory created successfully!\n\nNote: Vector embeddings will be updated when the MCP server is restarted.",
-                )
+                    self.db_conn.execute(
+                        """
+                        INSERT INTO memories (id, title, content, timestamp, tags, importance, memory_type, metadata, content_hash, created_at, updated_at, last_accessed, token_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            memory_id,
+                            title,
+                            content,
+                            now_iso,
+                            json.dumps(tags),
+                            importance,
+                            memory_type,
+                            "{}",
+                            content_hash,
+                            now_iso,
+                            now_iso,
+                            now_iso,
+                            token_count,
+                        ),
+                    )
+                    self.db_conn.commit()
+                    self.selected_memory_id = memory_id
+                    messagebox.showinfo(
+                        "Success",
+                        "Memory created (SQLite only - run rebuild_vectors to sync ChromaDB).",
+                    )
 
-            self.db_conn.commit()
             self.refresh_memories()
 
         except Exception as e:
-            self.db_conn.rollback()
+            if self.db_conn:
+                try:
+                    self.db_conn.rollback()
+                except Exception:
+                    pass
             messagebox.showerror("Error", f"Failed to save memory:\n{str(e)}")
 
     def delete_memory(self):
-        """Delete the selected memory"""
+        """Delete the selected memory from both SQLite and ChromaDB"""
         if not self.selected_memory_id:
             messagebox.showwarning("No Selection", "Please select a memory to delete.")
             return
 
         # Confirm deletion
-        result = messagebox.askyesno(
+        confirm = messagebox.askyesno(
             "Confirm Deletion",
             f"Are you sure you want to delete this memory?\n\nTitle: {self.title_var.get()}\n\nThis action cannot be undone.",
         )
 
-        if result:
+        if confirm:
             try:
-                self.db_conn.execute(
-                    "DELETE FROM memories WHERE id = ?", (self.selected_memory_id,)
-                )
-                self.db_conn.commit()
-
-                messagebox.showinfo(
-                    "Success",
-                    "Memory deleted successfully!\n\nNote: Vector embeddings will be cleaned up when the MCP server is restarted.",
-                )
+                if self.memory_system:
+                    # Use RobustMemorySystem to delete from both SQLite and ChromaDB
+                    result = self.memory_system.delete_memory(self.selected_memory_id)
+                    if result.success:
+                        messagebox.showinfo("Success", "Memory deleted successfully!")
+                    else:
+                        messagebox.showerror(
+                            "Error", f"Failed to delete memory:\n{result.reason}"
+                        )
+                        return
+                else:
+                    # Fallback: raw SQLite only
+                    self.db_conn.execute(
+                        "DELETE FROM memories WHERE id = ?", (self.selected_memory_id,)
+                    )
+                    self.db_conn.commit()
+                    messagebox.showinfo(
+                        "Success",
+                        "Memory deleted (SQLite only - run rebuild_vectors to clean up ChromaDB).",
+                    )
 
                 self.new_memory()
                 self.refresh_memories()
 
             except Exception as e:
-                self.db_conn.rollback()
+                if self.db_conn:
+                    try:
+                        self.db_conn.rollback()
+                    except Exception:
+                        pass
                 messagebox.showerror("Error", f"Failed to delete memory:\n{str(e)}")
 
     def create_backup(self):
@@ -1685,12 +1759,14 @@ class MemoryManagerGUI:
                 return
 
             try:
-                # Import the migration functionality
-                from memory_mcp.memory_system import RobustMemorySystem
-                from memory_mcp.config import DATA_FOLDER
+                # Reuse the GUI's RobustMemorySystem if available
+                if self.memory_system:
+                    memory_system = self.memory_system
+                else:
+                    from memory_mcp.memory_system import RobustMemorySystem
+                    from memory_mcp.config import DATA_FOLDER
 
-                # Initialize memory system (with active database)
-                memory_system = RobustMemorySystem(DATA_FOLDER)
+                    memory_system = RobustMemorySystem(DATA_FOLDER)
 
                 # Prepare parameters
                 source_chroma_path = source_chroma_var.get() or None
@@ -1736,18 +1812,36 @@ class MemoryManagerGUI:
         )
 
     def on_closing(self):
-        """Handle window closing"""
+        """Handle window closing with WAL checkpoint for data safety"""
+        # Close RobustMemorySystem first (handles its own WAL checkpoint)
+        if self.memory_system:
+            try:
+                self.memory_system.close()
+            except Exception:
+                pass
+
+        # Close GUI's own SQLite connection with WAL checkpoint
         if self.db_conn:
             try:
                 self.db_conn.commit()
-                self.db_conn.close()
-            except:
+            except Exception:
                 pass
+            try:
+                self.db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            try:
+                self.db_conn.close()
+            except Exception:
+                pass
+
+        # Close ChromaDB read-only connection
         if self.chroma_conn:
             try:
                 self.chroma_conn.close()
-            except:
+            except Exception:
                 pass
+
         self.root.destroy()
 
 
