@@ -292,6 +292,31 @@ class RobustMemorySystem:
         """Generate content hash for deduplication"""
         return hashlib.sha256(content.encode()).hexdigest()
 
+    def _safe_parse_timestamp(
+        self, raw: str, fallback_id: str = ""
+    ) -> Optional[datetime]:
+        """
+        Parse an ISO timestamp string, returning None on failure.
+
+        Logs a warning for corrupt rows so they can be identified and repaired,
+        rather than crashing the entire search.
+        """
+        if not raw:
+            self.logger.warning(
+                "Empty timestamp for memory %s — skipping row", fallback_id
+            )
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except (ValueError, TypeError) as exc:
+            self.logger.warning(
+                "Invalid timestamp %r for memory %s: %s — skipping row",
+                raw,
+                fallback_id,
+                exc,
+            )
+            return None
+
     def _integrity_check(self):
         """Check data integrity of SQLite database and cross-check with ChromaDB"""
         try:
@@ -558,11 +583,15 @@ class RobustMemorySystem:
                     (now_iso, memory_id),
                 )
 
+                ts = self._safe_parse_timestamp(row["timestamp"], row["id"])
+                if ts is None:
+                    continue
+
                 record = MemoryRecord(
                     id=row["id"],
                     title=row["title"],
                     content=row["content"],
-                    timestamp=datetime.fromisoformat(row["timestamp"]),
+                    timestamp=ts,
                     tags=json.loads(row["tags"]),
                     importance=row["importance"],
                     memory_type=row["memory_type"],
@@ -675,11 +704,16 @@ class RobustMemorySystem:
             for row in rows:
                 self._maybe_decay(row)
                 self._maybe_reinforce(row)
+
+                ts = self._safe_parse_timestamp(row["timestamp"], row["id"])
+                if ts is None:
+                    continue
+
                 record = MemoryRecord(
                     id=row["id"],
                     title=row["title"],
                     content=row["content"],
-                    timestamp=datetime.fromisoformat(row["timestamp"]),
+                    timestamp=ts,
                     tags=json.loads(row["tags"]),
                     importance=row["importance"],
                     memory_type=row["memory_type"],
@@ -709,17 +743,57 @@ class RobustMemorySystem:
         """
         Get most recent memories, optionally filtered by project.
 
+        Memories with memory_type="preference" are treated as first-class
+        citizens: they are always fetched **on top of** the requested limit.
+        The caller asks for ``limit`` recent memories and gets all
+        preferences prepended for free.
+
         Args:
-            limit: Maximum number of memories to return
+            limit: Maximum number of *recent* memories to return
+                   (preferences are added on top of this).
             current_project: Optional project identifier to filter by.
                            If provided, only returns memories with this project tag.
         """
-        if current_project:
-            # Filter by project tag
-            return self.search_structured(tags=[current_project], limit=limit)
-        else:
-            # Return all recent memories regardless of project
-            return self.search_structured(limit=limit)
+        try:
+            # --- 1. Fetch ALL preference memories by memory_type (global, not project-scoped) ---
+            # Uses memory_type="preference" (not tags) for strict matching.
+            # This ensures preferences like "I prefer dark mode" are returned
+            # even when current_project is set and the preference isn't tagged
+            # with that project.
+            pref_result = self.search_structured(memory_type="preference", limit=100)
+            pref_items = (
+                pref_result.data if pref_result.success and pref_result.data else []
+            )
+
+            # Collect preference IDs for deduplication
+            pref_ids = {item["id"] for item in pref_items}
+
+            # --- 2. Fetch regular recent memories (full limit) ---
+            if current_project:
+                recent_result = self.search_structured(
+                    tags=[current_project], limit=limit
+                )
+            else:
+                recent_result = self.search_structured(limit=limit)
+            recent_items = (
+                recent_result.data
+                if recent_result.success and recent_result.data
+                else []
+            )
+
+            # --- 3. Deduplicate: remove any recent items already in preferences ---
+            deduped_recent = [
+                item for item in recent_items if item["id"] not in pref_ids
+            ]
+
+            # --- 4. Combine: all preferences first, then up to limit recent ---
+            combined = pref_items + deduped_recent[:limit]
+
+            return Result(success=True, data=combined)
+
+        except Exception as e:
+            self.logger.error("get_recent failed: %s", e)
+            return Result(success=False, reason=f"get_recent error: {str(e)}")
 
     def update_memory(
         self,

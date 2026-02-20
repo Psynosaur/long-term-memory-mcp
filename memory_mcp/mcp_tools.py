@@ -12,8 +12,16 @@ def jsonify_result(res: Result) -> dict:
     """
     Convert Result dataclass to JSON-serializable dict.
 
-    Normalizes datetime objects to ISO strings and ensures all fields are JSON-safe.
+    Normalizes datetime objects to ISO strings, strips internal bookkeeping
+    fields from the metadata dict, and ensures all fields are JSON-safe.
     """
+    # Internal metadata keys the LLM never needs — stripping these saves
+    # ~10-20 tokens per memory and avoids leaking implementation details.
+    _INTERNAL_METADATA_KEYS = {
+        "reinforcement_accum",
+        "last_decay_at",
+    }
+
     out = {"success": res.success}
     if res.reason is not None:
         out["reason"] = res.reason
@@ -26,8 +34,17 @@ def jsonify_result(res: Result) -> dict:
             ts = obj.get("timestamp")
             if isinstance(ts, datetime):
                 obj["timestamp"] = ts.isoformat()
-            # Normalize nested fields you might have added in searches
-            # (e.g., 'relevance_score', 'match_type' already JSON-safe)
+            # Strip internal bookkeeping from the metadata dict
+            meta = obj.get("metadata")
+            if isinstance(meta, dict):
+                stripped = {
+                    k: v for k, v in meta.items() if k not in _INTERNAL_METADATA_KEYS
+                }
+                if stripped:
+                    obj["metadata"] = stripped
+                else:
+                    # Nothing left — drop the key entirely to save tokens
+                    del obj["metadata"]
             data.append(obj)
         out["data"] = data
     return out
