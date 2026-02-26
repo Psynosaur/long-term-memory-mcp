@@ -29,12 +29,40 @@ try:
 except ImportError:
     TIKTOKEN_AVAILABLE = False
 
-# Configuration
-DATA_FOLDER = Path(
-    os.environ.get(
-        "AI_COMPANION_DATA_DIR", str(Path.home() / "Documents" / "ai_companion_memory")
+# Configuration — import from shared config to stay in sync with the MCP server
+try:
+    from memory_mcp.config import (
+        DATA_FOLDER,
+        EMBEDDING_MODEL,
+        EMBEDDING_MODEL_CONFIG,
+        EMBEDDING_MODEL_PRESETS,
     )
-)
+except ImportError as _cfg_import_err:
+    # Fallback if memory_mcp package isn't on the path
+    import warnings
+
+    warnings.warn(
+        f"Could not import memory_mcp.config: {_cfg_import_err} — GUI running "
+        "with degraded embedding info. Install the memory_mcp package or ensure "
+        "it is on sys.path for full functionality.",
+        stacklevel=2,
+    )
+    DATA_FOLDER = Path(
+        os.environ.get(
+            "AI_COMPANION_DATA_DIR",
+            str(Path.home() / "Documents" / "ai_companion_memory"),
+        )
+    )
+    EMBEDDING_MODEL = "unknown"
+    EMBEDDING_MODEL_CONFIG = {
+        "model_name": "unknown",
+        "dimensions": None,
+        "max_tokens": None,
+        "query_prefix": "",
+        "description": "Could not load memory_mcp.config",
+    }
+    EMBEDDING_MODEL_PRESETS = {}
+
 DB_PATH = DATA_FOLDER / "memory_db" / "memories.db"
 CHROMA_DB_PATH = DATA_FOLDER / "memory_db" / "chroma_db" / "chroma.sqlite3"
 BACKUP_FOLDER = DATA_FOLDER / "memory_backups"
@@ -1140,6 +1168,13 @@ class MemoryManagerGUI:
             stats_text += f"Total Tokens: {total_tokens:,}\n"
             stats_text += f"Avg Tokens: {avg_tokens:,.0f}\n\n"
 
+            # Embedding model info
+            stats_text += f"Embedding: {EMBEDDING_MODEL}\n"
+            dims = EMBEDDING_MODEL_CONFIG["dimensions"]
+            max_tok = EMBEDDING_MODEL_CONFIG["max_tokens"]
+            stats_text += f"  Dims: {dims if dims is not None else '?'}, "
+            stats_text += f"Max Tokens: {max_tok if max_tok is not None else '?'}\n\n"
+
             stats_text += "Breakdown:\n"
             for row in type_breakdown:
                 tokens = row["tokens"] or 0
@@ -1475,8 +1510,30 @@ class MemoryManagerGUI:
                 vector_blob = sample["vector"]
                 vector_dimensions = len(vector_blob) // 4
 
-            stats = f"Total Embeddings: {total_embeddings}\n"
+            stats = f"Embedding Model: {EMBEDDING_MODEL}\n"
+            stats += f"  HuggingFace: {EMBEDDING_MODEL_CONFIG['model_name']}\n"
+            cfg_dims = EMBEDDING_MODEL_CONFIG["dimensions"]
+            cfg_max = EMBEDDING_MODEL_CONFIG["max_tokens"]
+            stats += f"  Configured Dims: {cfg_dims if cfg_dims is not None else '?'}\n"
+            stats += f"  Max Tokens: {cfg_max if cfg_max is not None else '?'}\n"
+            if EMBEDDING_MODEL_CONFIG.get("query_prefix"):
+                stats += f"  Query Prefix: yes\n"
+            stats += f"\n"
+            stats += f"Total Embeddings: {total_embeddings}\n"
             stats += f"Vector Dimensions: {vector_dimensions}\n"
+
+            # Warn if stored dims don't match config
+            if (
+                vector_dimensions is not None
+                and cfg_dims is not None
+                and vector_dimensions != cfg_dims
+            ):
+                stats += (
+                    f"  WARNING: stored vectors ({vector_dimensions}d) don't match "
+                    f"configured model ({cfg_dims}d)\n"
+                    f"  Run rebuild_vectors to re-embed with current model\n"
+                )
+
             stats += f"Segments: {len(segments)}\n"
 
             for seg in segments:

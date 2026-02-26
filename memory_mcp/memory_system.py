@@ -26,6 +26,9 @@ import tiktoken
 from .models import MemoryRecord, SearchResult, Result
 from .config import (
     DATA_FOLDER,
+    CHROMA_COLLECTION_NAME,
+    EMBEDDING_MODEL,
+    EMBEDDING_MODEL_CONFIG,
     DECAY_ENABLED,
     DECAY_HALF_LIFE_DAYS_BY_TYPE,
     DECAY_HALF_LIFE_DAYS_DEFAULT,
@@ -65,6 +68,7 @@ class RobustMemorySystem:
         self.chroma_client: Optional[object] = None
         self.chroma_collection: Optional[object] = None
         self.embedding_model: Optional[object] = None
+        self._query_prefix: str = ""  # set by _init_embeddings (e.g. BGE needs prefix)
         self.tokenizer: Optional[object] = None
 
         # Setup logging
@@ -231,7 +235,7 @@ class RobustMemorySystem:
 
             # Use a stable collection name and cosine space
             self.chroma_collection = self.chroma_client.get_or_create_collection(
-                name="ai_companion_memories",
+                name=CHROMA_COLLECTION_NAME,
                 metadata={
                     "description": "Long-term memory for AI companion",
                     "hnsw:space": "cosine",  # important for sentence embeddings
@@ -246,12 +250,24 @@ class RobustMemorySystem:
             raise
 
     def _init_embeddings(self):
-        """Initialize sentence transformer for embeddings"""
+        """Initialize sentence transformer for embeddings.
+
+        Uses the model configured in config.py (EMBEDDING_MODEL_CONFIG).
+        Override with env var MEMORY_EMBEDDING_MODEL to switch models.
+        After switching, run rebuild_vector_index() to re-embed all memories.
+        """
         try:
-            # Use a good general-purpose model that works offline
-            model_name = "all-MiniLM-L12-v2"  # Better quality, 384 dimensions
+            model_name = EMBEDDING_MODEL_CONFIG["model_name"]
+            # Normalise the query prefix: strip whitespace so the separator
+            # between prefix and query is always explicit and consistent.
+            self._query_prefix = EMBEDDING_MODEL_CONFIG.get("query_prefix", "").strip()
             self.embedding_model = SentenceTransformer(model_name)
-            self.logger.info("Embedding model '%s' loaded successfully", model_name)
+            self.logger.info(
+                "Embedding model '%s' (preset: %s, dims: %d) loaded successfully",
+                model_name,
+                EMBEDDING_MODEL,
+                EMBEDDING_MODEL_CONFIG["dimensions"],
+            )
 
         except Exception as e:
             self.logger.error("Failed to load embedding model: %s", e)
@@ -507,8 +523,12 @@ class RobustMemorySystem:
                 self._debug_vector_index(),
             )
 
-            # Generate query embedding
-            query_embedding = self.embedding_model.encode(query).tolist()
+            # Generate query embedding (apply model-specific prefix if set,
+            # always separated by a single space so prefixes don't run into the query)
+            query_text = (
+                f"{self._query_prefix} {query}" if self._query_prefix else query
+            )
+            query_embedding = self.embedding_model.encode(query_text).tolist()
 
             # Search ChromaDB
             results = self.chroma_collection.query(
@@ -1226,11 +1246,27 @@ class RobustMemorySystem:
                   total count of memories indexed.
         """
         try:
-            # wipe collection to avoid duplicates
+            # Wipe collection by deleting and recreating it.
+            # Note: delete(where={}) is unreliable in some ChromaDB versions
+            # and can leave orphaned vectors, so we drop the whole collection.
             try:
-                self.chroma_collection.delete(where={})
+                self.chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
             except Exception as e:
-                self.logger.warning("Chroma wipe warning: %s", e)
+                self.logger.warning("Chroma drop collection warning: %s", e)
+
+            # Invalidate the stale reference so that a failure in
+            # get_or_create_collection leaves the system in a clearly
+            # broken state rather than pointing at a deleted collection.
+            self.chroma_collection = None
+
+            self.chroma_collection = self.chroma_client.get_or_create_collection(
+                name=CHROMA_COLLECTION_NAME,
+                metadata={
+                    "description": "Long-term memory for AI companion",
+                    "hnsw:space": "cosine",
+                },
+                embedding_function=None,
+            )
 
             rows = self.sqlite_conn.execute(
                 "SELECT id, title, content, timestamp, importance, memory_type, "
@@ -1634,7 +1670,7 @@ class RobustMemorySystem:
                         ),
                     )
                     source_chroma_collection = source_chroma_client.get_collection(
-                        "ai_companion_memories"
+                        CHROMA_COLLECTION_NAME
                     )
                     self.logger.info(
                         f"Connected to source ChromaDB at {source_chroma_path}"
