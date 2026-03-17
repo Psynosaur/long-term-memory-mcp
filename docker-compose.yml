@@ -1,0 +1,32 @@
+# Docker Compose for the pgvector backend.
+#
+# Start with:
+#   docker compose up -d
+#
+# Then run the MCP server with:
+#   python server.py --vector-backend pgvector
+#
+# The server defaults match this compose file — no extra args needed.
+# To override, use CLI flags or PG* environment variables.
+
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: memory-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: memories
+      POSTGRES_USER: memory_user
+      POSTGRES_PASSWORD: memory_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgvector-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memory_user -d memories"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgvector-data:

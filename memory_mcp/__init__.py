@@ -2,6 +2,8 @@
 Long-term memory MCP package.
 
 A robust, persistent memory system for AI companions.
+Supports pluggable vector backends (ChromaDB default, pgvector optional)
+and pluggable database backends (SQLite default, PostgreSQL optional).
 """
 
 from .config import (
@@ -14,6 +16,8 @@ from .config import (
 from .models import MemoryRecord, SearchResult, Result
 from .memory_system import RobustMemorySystem
 from .mcp_tools import register_tools, jsonify_result
+from .vector_backends.base import VectorBackend
+from .database_backends.base import DatabaseBackend
 
 __all__ = [
     "DATA_FOLDER",
@@ -27,4 +31,6 @@ __all__ = [
     "RobustMemorySystem",
     "register_tools",
     "jsonify_result",
+    "VectorBackend",
+    "DatabaseBackend",
 ]

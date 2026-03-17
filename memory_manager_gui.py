@@ -103,6 +103,17 @@ class MemoryManagerGUI:
         self.chroma_conn = None
         self.connect_chromadb()
 
+        # pgvector/Postgres connection (used when data source is "pgvector")
+        self.pg_conn = None
+        self.data_source = "sqlite"  # "sqlite" or "pgvector"
+
+        # Postgres connection settings (populated from env vars / GUI fields)
+        self._pg_host = os.environ.get("PGHOST", "localhost")
+        self._pg_port = os.environ.get("PGPORT", "5433")
+        self._pg_database = os.environ.get("PGDATABASE", "memories")
+        self._pg_user = os.environ.get("PGUSER", "memory_user")
+        self._pg_password = os.environ.get("PGPASSWORD", "")
+
         # Initialize RobustMemorySystem for write operations (keeps SQLite + ChromaDB in sync)
         self.memory_system = None
         self.init_memory_system()
@@ -357,6 +368,458 @@ class MemoryManagerGUI:
         # Fallback: rough estimate (1 token ≈ 4 characters)
         return len(text) // 4
 
+    # ── Data source abstraction ────────────────────────────────
+
+    def _get_pg_gui_connkw(self) -> dict:
+        """Build psycopg keyword-arg dict from the GUI's Postgres settings."""
+        port_str = self._pg_port
+        try:
+            port = int(port_str)
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Invalid port number: '{port_str}'. Enter a numeric port (e.g. 5433)."
+            )
+        return dict(
+            host=self._pg_host,
+            port=port,
+            dbname=self._pg_database,
+            user=self._pg_user,
+            password=self._pg_password,
+        )
+
+    def _connect_pgvector(self) -> bool:
+        """Establish a Postgres connection for GUI reads. Returns True on success."""
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+
+            if self.pg_conn is not None:
+                try:
+                    self.pg_conn.close()
+                except Exception:
+                    pass
+
+            self.pg_conn = psycopg.connect(
+                **self._get_pg_gui_connkw(),
+                autocommit=True,
+                row_factory=dict_row,
+            )
+            return True
+        except ImportError:
+            messagebox.showerror(
+                "Missing Dependency",
+                "psycopg not installed.\nRun: pip install 'psycopg[binary]'",
+            )
+            return False
+        except Exception as e:
+            messagebox.showerror(
+                "Connection Error", f"Failed to connect to Postgres:\n{e}"
+            )
+            return False
+
+    def _disconnect_pgvector(self):
+        """Close the Postgres GUI connection."""
+        if self.pg_conn is not None:
+            try:
+                self.pg_conn.close()
+            except Exception:
+                pass
+            self.pg_conn = None
+
+    def _execute_read(self, sql: str, params: tuple = ()):
+        """Execute a read query against the active data source.
+
+        Handles placeholder translation (? -> %s) for Postgres.
+        Returns a list of dict-like row objects.
+        """
+        if self.data_source == "pgvector" and self.pg_conn is not None:
+            pg_sql = sql.replace("?", "%s")
+            cur = self.pg_conn.execute(pg_sql, params)
+            return cur.fetchall()
+        else:
+            cursor = self.db_conn.execute(sql, params)
+            return cursor.fetchall()
+
+    def _execute_read_one(self, sql: str, params: tuple = ()):
+        """Execute a read query and return the first row, or None."""
+        if self.data_source == "pgvector" and self.pg_conn is not None:
+            pg_sql = sql.replace("?", "%s")
+            cur = self.pg_conn.execute(pg_sql, params)
+            return cur.fetchone()
+        else:
+            cursor = self.db_conn.execute(sql, params)
+            return cursor.fetchone()
+
+    def _switch_data_source(self, new_source: str):
+        """Switch the active data source and refresh all views."""
+        if new_source == self.data_source:
+            return
+
+        if new_source == "pgvector":
+            # Read Postgres settings from GUI fields if they exist
+            if hasattr(self, "_pg_host_var"):
+                self._pg_host = self._pg_host_var.get().strip()
+                self._pg_port = self._pg_port_var.get().strip()
+                self._pg_database = self._pg_db_var.get().strip()
+                self._pg_user = self._pg_user_var.get().strip()
+                self._pg_password = self._pg_pass_var.get()
+
+            if not self._connect_pgvector():
+                # Connection failed — revert dropdown
+                if hasattr(self, "_source_var"):
+                    self._source_var.set("SQLite / ChromaDB")
+                return
+
+            self.data_source = "pgvector"
+            if hasattr(self, "_pg_settings_frame"):
+                self._pg_settings_frame.grid()
+        else:
+            self._disconnect_pgvector()
+            self.data_source = "sqlite"
+            if hasattr(self, "_pg_settings_frame"):
+                self._pg_settings_frame.grid_remove()
+
+        # Refresh all views
+        self.refresh_memories()
+        self.update_statistics()
+
+    def _on_source_changed(self, event=None):
+        """Handle data source combobox selection change.
+
+        When 'pgvector / Postgres' is selected, shows the connection settings bar
+        but does NOT connect immediately — the user must click "Connect".
+        When 'SQLite / ChromaDB' is selected, disconnects pgvector and switches back.
+        """
+        selected = self._source_var.get()
+        if selected == "pgvector / Postgres":
+            # Show PG settings bar; user clicks "Connect" to actually switch
+            if hasattr(self, "_pg_settings_frame"):
+                self._pg_settings_frame.grid()
+        else:
+            # Switching back to SQLite
+            if hasattr(self, "_pg_settings_frame"):
+                self._pg_settings_frame.grid_remove()
+            if self.data_source != "sqlite":
+                self._switch_data_source("sqlite")
+
+    def show_compare_window(self):
+        """Show the database comparison/diff window between SQLite and Postgres."""
+        # Ensure we have settings from the GUI fields
+        if hasattr(self, "_pg_host_var"):
+            self._pg_host = self._pg_host_var.get().strip()
+            self._pg_port = self._pg_port_var.get().strip()
+            self._pg_database = self._pg_db_var.get().strip()
+            self._pg_user = self._pg_user_var.get().strip()
+            self._pg_password = self._pg_pass_var.get()
+
+        self._build_compare_window()
+
+    def _build_compare_window(self):
+        """Build and display the database comparison/diff window.
+
+        Shows a git-diff-style comparison between SQLite/ChromaDB (Side A)
+        and pgvector/Postgres (Side B):
+          - Only in A (green, left side)   — memories in SQLite but not Postgres
+          - Only in B (green, right side)  — memories in Postgres but not SQLite
+          - Modified (yellow)              — same ID but different content_hash
+          - Identical (grey, collapsible)  — same ID and same content_hash
+        """
+        # ── Connect to both databases ──────────────────────────
+        if not DB_PATH.exists():
+            messagebox.showerror(
+                "Error", f"Local SQLite database not found:\n{DB_PATH}"
+            )
+            return
+
+        pg_conn = None
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+
+            pg_conn = psycopg.connect(
+                **self._get_pg_gui_connkw(),
+                autocommit=True,
+                row_factory=dict_row,
+            )
+        except ImportError:
+            messagebox.showerror(
+                "Missing Dependency",
+                "psycopg not installed.\nRun: pip install 'psycopg[binary]'",
+            )
+            return
+        except Exception as e:
+            messagebox.showerror(
+                "Connection Error",
+                f"Cannot connect to Postgres:\n{e}\n\n"
+                "Configure connection settings in the header bar.",
+            )
+            return
+
+        # ── Read data from both sides ──────────────────────────
+        try:
+            # Side A: SQLite
+            src_a = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10)
+            src_a.row_factory = sqlite3.Row
+            a_rows = src_a.execute(
+                "SELECT id, title, memory_type, importance, content_hash FROM memories ORDER BY timestamp"
+            ).fetchall()
+            src_a.close()
+            a_map = {row["id"]: dict(row) for row in a_rows}
+
+            # Side B: Postgres
+            cur = pg_conn.execute(
+                "SELECT id, title, memory_type, importance, content_hash FROM memories ORDER BY timestamp"
+            )
+            b_rows = cur.fetchall()
+            b_map = {row["id"]: dict(row) for row in b_rows}
+
+            # Also get vector counts
+            a_vec_count = 0
+            b_vec_count = 0
+            try:
+                chroma_dir = DB_PATH.parent / "chroma_db"
+                if chroma_dir.exists():
+                    from memory_mcp.vector_backends.chroma import ChromaBackend
+
+                    chroma = ChromaBackend(db_folder=DB_PATH.parent)
+                    chroma.initialize()
+                    a_vec_count = chroma.count()
+                    chroma.close()
+            except Exception:
+                pass
+            try:
+                row = pg_conn.execute(
+                    "SELECT COUNT(*) as cnt FROM memory_vectors"
+                ).fetchone()
+                b_vec_count = row["cnt"] if row else 0
+            except Exception:
+                pass
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read databases:\n{e}")
+            return
+        finally:
+            if pg_conn:
+                try:
+                    pg_conn.close()
+                except Exception:
+                    pass
+
+        # ── Classify memories ──────────────────────────────────
+        all_ids = set(a_map.keys()) | set(b_map.keys())
+        only_a = []  # in SQLite only
+        only_b = []  # in Postgres only
+        modified = []  # same ID, different content_hash
+        identical = []  # same ID, same content_hash
+
+        for mid in sorted(all_ids):
+            in_a = mid in a_map
+            in_b = mid in b_map
+            if in_a and not in_b:
+                only_a.append(a_map[mid])
+            elif in_b and not in_a:
+                only_b.append(b_map[mid])
+            else:
+                # Both sides have it — compare content_hash
+                hash_a = a_map[mid].get("content_hash") or ""
+                hash_b = b_map[mid].get("content_hash") or ""
+                if hash_a and hash_b and hash_a == hash_b:
+                    identical.append(a_map[mid])
+                else:
+                    # Different hashes, or one/both missing — treat as modified
+                    modified.append((a_map[mid], b_map[mid]))
+
+        # ── Build the comparison window ────────────────────────
+        cmp_win = tk.Toplevel(self.root)
+        cmp_win.title("Database Comparison — SQLite vs Postgres")
+        cmp_win.geometry("1200x800")
+        cmp_win.configure(bg=self.bg_color)
+        cmp_win.transient(self.root)
+
+        main_frame = ttk.Frame(cmp_win, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        cmp_win.columnconfigure(0, weight=1)
+        cmp_win.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(2, weight=1)
+
+        # ── Summary bar ────────────────────────────────────────
+        summary_frame = ttk.Frame(main_frame)
+        summary_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        ttk.Label(
+            summary_frame,
+            text=f"SQLite: {len(a_map)} memories, {a_vec_count} vectors",
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 30))
+
+        ttk.Label(
+            summary_frame,
+            text=f"Postgres: {len(b_map)} memories, {b_vec_count} vectors",
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=1, sticky=tk.W, padx=(0, 30))
+
+        ttk.Label(
+            summary_frame,
+            text=(
+                f"Only in SQLite: {len(only_a)}  |  "
+                f"Only in Postgres: {len(only_b)}  |  "
+                f"Modified: {len(modified)}  |  "
+                f"Identical: {len(identical)}"
+            ),
+            font=("Segoe UI", 9),
+        ).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
+
+        # ── Filter checkboxes ──────────────────────────────────
+        filter_frame = ttk.Frame(main_frame)
+        filter_frame.grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
+
+        show_only_a = tk.BooleanVar(value=True)
+        show_only_b = tk.BooleanVar(value=True)
+        show_modified = tk.BooleanVar(value=True)
+        show_identical = tk.BooleanVar(value=False)
+
+        def _refresh_tree():
+            for item in tree.get_children():
+                tree.delete(item)
+            _populate_tree()
+
+        ttk.Checkbutton(
+            filter_frame,
+            text=f"Only in SQLite ({len(only_a)})",
+            variable=show_only_a,
+            command=_refresh_tree,
+        ).grid(row=0, column=0, padx=(0, 15))
+        ttk.Checkbutton(
+            filter_frame,
+            text=f"Only in Postgres ({len(only_b)})",
+            variable=show_only_b,
+            command=_refresh_tree,
+        ).grid(row=0, column=1, padx=(0, 15))
+        ttk.Checkbutton(
+            filter_frame,
+            text=f"Modified ({len(modified)})",
+            variable=show_modified,
+            command=_refresh_tree,
+        ).grid(row=0, column=2, padx=(0, 15))
+        ttk.Checkbutton(
+            filter_frame,
+            text=f"Identical ({len(identical)})",
+            variable=show_identical,
+            command=_refresh_tree,
+        ).grid(row=0, column=3, padx=(0, 15))
+
+        # ── Diff treeview ──────────────────────────────────────
+        tree_frame = ttk.Frame(main_frame)
+        tree_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        tree = ttk.Treeview(
+            tree_frame,
+            columns=("Status", "ID", "Title", "Type", "Importance", "Hash_A", "Hash_B"),
+            show="headings",
+            height=25,
+        )
+        for col, w in [
+            ("Status", 130),
+            ("ID", 120),
+            ("Title", 350),
+            ("Type", 100),
+            ("Importance", 80),
+            ("Hash_A", 120),
+            ("Hash_B", 120),
+        ]:
+            tree.heading(col, text=col)
+            tree.column(col, width=w)
+        tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        tree.configure(yscrollcommand=tree_scroll.set)
+
+        # Tag colors for diff categories
+        tree.tag_configure("only_a", foreground="#66bb6a")  # green
+        tree.tag_configure("only_b", foreground="#42a5f5")  # blue
+        tree.tag_configure("modified", foreground="#ffa726")  # yellow/orange
+        tree.tag_configure("identical", foreground="#9e9e9e")  # grey
+
+        def _populate_tree():
+            if show_only_a.get():
+                for r in only_a:
+                    tree.insert(
+                        "",
+                        tk.END,
+                        values=(
+                            "Only in SQLite",
+                            r["id"][:15],
+                            str(r.get("title", ""))[:50],
+                            r.get("memory_type", ""),
+                            r.get("importance", ""),
+                            str(r.get("content_hash", ""))[:12],
+                            "",
+                        ),
+                        tags=("only_a",),
+                    )
+
+            if show_only_b.get():
+                for r in only_b:
+                    tree.insert(
+                        "",
+                        tk.END,
+                        values=(
+                            "Only in Postgres",
+                            r["id"][:15],
+                            str(r.get("title", ""))[:50],
+                            r.get("memory_type", ""),
+                            r.get("importance", ""),
+                            "",
+                            str(r.get("content_hash", ""))[:12],
+                        ),
+                        tags=("only_b",),
+                    )
+
+            if show_modified.get():
+                for ra, rb in modified:
+                    tree.insert(
+                        "",
+                        tk.END,
+                        values=(
+                            "Modified",
+                            ra["id"][:15],
+                            str(ra.get("title", ""))[:50],
+                            ra.get("memory_type", ""),
+                            ra.get("importance", ""),
+                            str(ra.get("content_hash", ""))[:12],
+                            str(rb.get("content_hash", ""))[:12],
+                        ),
+                        tags=("modified",),
+                    )
+
+            if show_identical.get():
+                for r in identical:
+                    tree.insert(
+                        "",
+                        tk.END,
+                        values=(
+                            "Identical",
+                            r["id"][:15],
+                            str(r.get("title", ""))[:50],
+                            r.get("memory_type", ""),
+                            r.get("importance", ""),
+                            str(r.get("content_hash", ""))[:12],
+                            str(r.get("content_hash", ""))[:12],
+                        ),
+                        tags=("identical",),
+                    )
+
+        _populate_tree()
+
+        # ── Close button ───────────────────────────────────────
+        ttk.Button(main_frame, text="Close", command=cmp_win.destroy).grid(
+            row=3, column=0, sticky=tk.E, pady=(10, 0)
+        )
+
     def create_widgets(self):
         """Create all GUI widgets"""
         # Main container
@@ -372,8 +835,9 @@ class MemoryManagerGUI:
         # ===== HEADER =====
         header_frame = ttk.Frame(main_frame)
         header_frame.grid(
-            row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10)
+            row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5)
         )
+        header_frame.columnconfigure(1, weight=1)
 
         title_label = ttk.Label(
             header_frame, text="Memory Manager", style="Title.TLabel"
@@ -387,9 +851,94 @@ class MemoryManagerGUI:
         )
         subtitle_label.grid(row=1, column=0, sticky=tk.W)
 
+        # ── Data source selector (right side of header) ────────
+        source_frame = ttk.Frame(header_frame)
+        source_frame.grid(row=0, column=1, rowspan=2, sticky=tk.E, padx=(20, 0))
+
+        ttk.Label(source_frame, text="Data Source:", style="Normal.TLabel").grid(
+            row=0, column=0, sticky=tk.E, padx=(0, 5)
+        )
+
+        self._source_var = tk.StringVar(value="SQLite / ChromaDB")
+        source_combo = ttk.Combobox(
+            source_frame,
+            textvariable=self._source_var,
+            state="readonly",
+            values=["SQLite / ChromaDB", "pgvector / Postgres"],
+            width=22,
+            font=("Segoe UI", 10),
+        )
+        source_combo.grid(row=0, column=1, padx=(0, 5))
+        source_combo.bind("<<ComboboxSelected>>", self._on_source_changed)
+
+        # Compare button
+        ttk.Button(source_frame, text="Compare", command=self.show_compare_window).grid(
+            row=0, column=2, padx=(5, 0)
+        )
+
+        # ── Postgres connection settings bar (hidden by default) ──
+        self._pg_settings_frame = ttk.LabelFrame(
+            main_frame, text="PostgreSQL Connection", padding="5"
+        )
+        # Will be shown/hidden by _on_source_changed
+        self._pg_settings_frame.grid(
+            row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5)
+        )
+        self._pg_settings_frame.grid_remove()  # hidden initially
+
+        self._pg_host_var = tk.StringVar(value=self._pg_host)
+        self._pg_port_var = tk.StringVar(value=self._pg_port)
+        self._pg_db_var = tk.StringVar(value=self._pg_database)
+        self._pg_user_var = tk.StringVar(value=self._pg_user)
+        self._pg_pass_var = tk.StringVar(value=self._pg_password)
+
+        ttk.Label(self._pg_settings_frame, text="Host:").grid(row=0, column=0, padx=2)
+        ttk.Entry(
+            self._pg_settings_frame, textvariable=self._pg_host_var, width=15
+        ).grid(row=0, column=1, padx=2)
+
+        ttk.Label(self._pg_settings_frame, text="Port:").grid(row=0, column=2, padx=2)
+        ttk.Entry(
+            self._pg_settings_frame, textvariable=self._pg_port_var, width=6
+        ).grid(row=0, column=3, padx=2)
+
+        ttk.Label(self._pg_settings_frame, text="Database:").grid(
+            row=0, column=4, padx=2
+        )
+        ttk.Entry(self._pg_settings_frame, textvariable=self._pg_db_var, width=12).grid(
+            row=0, column=5, padx=2
+        )
+
+        ttk.Label(self._pg_settings_frame, text="User:").grid(row=0, column=6, padx=2)
+        ttk.Entry(
+            self._pg_settings_frame, textvariable=self._pg_user_var, width=12
+        ).grid(row=0, column=7, padx=2)
+
+        ttk.Label(self._pg_settings_frame, text="Password:").grid(
+            row=0, column=8, padx=2
+        )
+        ttk.Entry(
+            self._pg_settings_frame, textvariable=self._pg_pass_var, show="*", width=12
+        ).grid(row=0, column=9, padx=2)
+
+        self._pg_status_var = tk.StringVar(value="")
+        ttk.Button(
+            self._pg_settings_frame,
+            text="Connect",
+            command=lambda: self._switch_data_source("pgvector"),
+        ).grid(row=0, column=10, padx=(10, 2))
+        ttk.Label(
+            self._pg_settings_frame,
+            textvariable=self._pg_status_var,
+            font=("Segoe UI", 8),
+        ).grid(row=0, column=11, padx=5)
+
+        # Adjust main content to row=2 (was row=1) to make room for PG settings
+        main_frame.rowconfigure(2, weight=1)
+
         # ===== LEFT PANEL - Search and List =====
         left_panel = ttk.Frame(main_frame, padding="5")
-        left_panel.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
+        left_panel.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
         left_panel.columnconfigure(0, weight=1)
         left_panel.rowconfigure(2, weight=1)
 
@@ -526,7 +1075,7 @@ class MemoryManagerGUI:
 
         # ===== RIGHT PANEL - Details and Actions =====
         right_panel = ttk.Frame(main_frame, padding="5")
-        right_panel.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
+        right_panel.grid(row=2, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
         right_panel.columnconfigure(0, weight=1)
         right_panel.rowconfigure(1, weight=1)
 
@@ -762,8 +1311,7 @@ class MemoryManagerGUI:
                 LIMIT 1000
             """
 
-            cursor = self.db_conn.execute(query, params)
-            rows = cursor.fetchall()
+            rows = self._execute_read(query, tuple(params))
 
             # Populate tree
             for row in rows:
@@ -803,10 +1351,9 @@ class MemoryManagerGUI:
         memory_id = item["values"][0]
 
         try:
-            cursor = self.db_conn.execute(
+            row = self._execute_read_one(
                 "SELECT * FROM memories WHERE id = ?", (memory_id,)
             )
-            row = cursor.fetchone()
 
             if row:
                 self.selected_memory_id = row["id"]
@@ -1002,7 +1549,7 @@ class MemoryManagerGUI:
             messagebox.showerror("Error", f"Failed to save memory:\n{str(e)}")
 
     def delete_memory(self):
-        """Delete the selected memory from both SQLite and ChromaDB"""
+        """Delete the selected memory from the active data source."""
         if not self.selected_memory_id:
             messagebox.showwarning("No Selection", "Please select a memory to delete.")
             return
@@ -1015,7 +1562,23 @@ class MemoryManagerGUI:
 
         if confirm:
             try:
-                if self.memory_system:
+                if self.data_source == "pgvector" and self.pg_conn is not None:
+                    # Delete directly from Postgres (memories + vectors)
+                    self.pg_conn.execute(
+                        "DELETE FROM memory_vectors WHERE id = %s",
+                        (self.selected_memory_id,),
+                    )
+                    cur = self.pg_conn.execute(
+                        "DELETE FROM memories WHERE id = %s RETURNING id",
+                        (self.selected_memory_id,),
+                    )
+                    deleted = cur.fetchone()
+                    if deleted:
+                        messagebox.showinfo("Success", "Memory deleted from Postgres.")
+                    else:
+                        messagebox.showerror("Error", "Memory not found in Postgres.")
+                        return
+                elif self.memory_system:
                     # Use RobustMemorySystem to delete from both SQLite and ChromaDB
                     result = self.memory_system.delete_memory(self.selected_memory_id)
                     if result.success:
@@ -1040,7 +1603,7 @@ class MemoryManagerGUI:
                 self.refresh_memories()
 
             except Exception as e:
-                if self.db_conn:
+                if self.data_source != "pgvector" and self.db_conn:
                     try:
                         self.db_conn.rollback()
                     except Exception:
@@ -1060,9 +1623,9 @@ class MemoryManagerGUI:
             shutil.copy2(DB_PATH, sqlite_backup)
 
             # Export to JSON
-            cursor = self.db_conn.execute("SELECT * FROM memories ORDER BY timestamp")
+            rows = self._execute_read("SELECT * FROM memories ORDER BY timestamp")
             memories = []
-            for row in cursor.fetchall():
+            for row in rows:
                 memory_dict = dict(row)
                 memory_dict["tags"] = json.loads(memory_dict["tags"])
                 memory_dict["metadata"] = (
@@ -1105,9 +1668,9 @@ class MemoryManagerGUI:
             if not file_path:
                 return
 
-            cursor = self.db_conn.execute("SELECT * FROM memories ORDER BY timestamp")
+            rows = self._execute_read("SELECT * FROM memories ORDER BY timestamp")
             memories = []
-            for row in cursor.fetchall():
+            for row in rows:
                 memory_dict = dict(row)
                 memory_dict["tags"] = json.loads(memory_dict["tags"])
                 memory_dict["metadata"] = (
@@ -1139,7 +1702,7 @@ class MemoryManagerGUI:
     def update_statistics(self):
         """Update the statistics display"""
         try:
-            cursor = self.db_conn.execute("""
+            stats = self._execute_read_one("""
                 SELECT 
                     COUNT(*) as total,
                     COUNT(DISTINCT memory_type) as types,
@@ -1148,15 +1711,13 @@ class MemoryManagerGUI:
                     AVG(token_count) as avg_tokens
                 FROM memories
             """)
-            stats = cursor.fetchone()
 
-            cursor = self.db_conn.execute("""
+            type_breakdown = self._execute_read("""
                 SELECT memory_type, COUNT(*) as count, SUM(token_count) as tokens
                 FROM memories
                 GROUP BY memory_type
                 ORDER BY count DESC
             """)
-            type_breakdown = cursor.fetchall()
 
             stats_text = f"Total Memories: {stats['total']}\n"
             stats_text += f"Memory Types: {stats['types']}\n"
@@ -1187,12 +1748,165 @@ class MemoryManagerGUI:
         except Exception as e:
             self.stats_label.config(text=f"Error loading stats:\n{str(e)}")
 
+    def _query_vector_chromadb(self, memory_id: str, results_text):
+        """Query a vector from ChromaDB's internal SQLite tables."""
+        cursor = self.chroma_conn.execute(
+            """
+            SELECT eq.seq_id, eq.created_at, eq.id, eq.vector, eq.encoding,
+                   e.segment_id, e.id as embedding_row_id
+            FROM embeddings_queue eq
+            LEFT JOIN embeddings e ON eq.seq_id = e.seq_id
+            WHERE eq.id = ?
+            """,
+            (memory_id,),
+        )
+        embedding_row = cursor.fetchone()
+
+        if not embedding_row:
+            results_text.insert("1.0", f"No vector found for memory_id: {memory_id}")
+            return
+
+        # Get metadata
+        metadata_cursor = self.chroma_conn.execute(
+            """
+            SELECT key, string_value, int_value, float_value
+            FROM embedding_metadata
+            WHERE id = ?
+            ORDER BY key
+            """,
+            (embedding_row["embedding_row_id"],),
+        )
+        metadata_rows = metadata_cursor.fetchall()
+
+        metadata = {}
+        for row in metadata_rows:
+            key = row["key"]
+            if row["string_value"] is not None:
+                metadata[key] = row["string_value"]
+            elif row["int_value"] is not None:
+                metadata[key] = row["int_value"]
+            elif row["float_value"] is not None:
+                metadata[key] = row["float_value"]
+
+        output = "=" * 80 + "\n"
+        output += "VECTOR EMBEDDING FOUND (ChromaDB)\n"
+        output += "=" * 80 + "\n\n"
+        output += f"Memory ID: {embedding_row['id']}\n"
+        output += f"Seq ID: {embedding_row['seq_id']}\n"
+        output += f"Segment ID: {embedding_row['segment_id']}\n"
+        output += f"Created At: {embedding_row['created_at']}\n"
+        output += f"Encoding: {embedding_row['encoding']}\n\n"
+        output += "METADATA:\n"
+        output += "-" * 80 + "\n"
+        for key, value in metadata.items():
+            output += f"  {key}: {value}\n"
+
+        vector_blob = embedding_row["vector"]
+        if vector_blob is None:
+            results_text.insert(
+                "1.0", f"No vector data found for memory_id: {memory_id}"
+            )
+            return
+
+        import struct
+
+        vector_size = len(vector_blob) // 4
+        vector = struct.unpack(f"{vector_size}f", vector_blob)
+
+        output += self._format_vector_stats(vector)
+        results_text.insert("1.0", output)
+
+    def _query_vector_pgvector(self, memory_id: str, results_text):
+        """Query a vector from the Postgres memory_vectors table."""
+        if self.pg_conn is None:
+            results_text.insert("1.0", "Not connected to Postgres.")
+            return
+        row = self.pg_conn.execute(
+            "SELECT id, embedding, document, metadata FROM memory_vectors WHERE id = %s",
+            (memory_id,),
+        ).fetchone()
+
+        if not row:
+            results_text.insert("1.0", f"No vector found for memory_id: {memory_id}")
+            return
+
+        output = "=" * 80 + "\n"
+        output += "VECTOR EMBEDDING FOUND (pgvector/Postgres)\n"
+        output += "=" * 80 + "\n\n"
+        output += f"Memory ID: {row['id']}\n"
+        output += f"Document (preview): {str(row.get('document', ''))[:200]}\n\n"
+
+        meta = row.get("metadata", {})
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        output += "METADATA:\n"
+        output += "-" * 80 + "\n"
+        if isinstance(meta, dict):
+            for key, value in meta.items():
+                output += f"  {key}: {value}\n"
+        else:
+            output += f"  (raw): {meta}\n"
+
+        # Parse the embedding
+        emb = row.get("embedding")
+        if emb is not None:
+            # pgvector returns embedding as a list or numpy array
+            vector = (
+                emb.tolist() if hasattr(emb, "tolist") else list(emb) if emb else []
+            )
+            output += self._format_vector_stats(vector)
+        else:
+            output += "\n(No embedding data)\n"
+
+        results_text.insert("1.0", output)
+
+    @staticmethod
+    def _format_vector_stats(vector) -> str:
+        """Format vector dimensions and statistics for display."""
+        if not vector:
+            return "\n(Empty vector)\n"
+
+        output = "\n" + "=" * 80 + "\n"
+        output += f"VECTOR DATA ({len(vector)} dimensions)\n"
+        output += "=" * 80 + "\n\n"
+        output += "First 20 dimensions:\n"
+        output += "-" * 80 + "\n"
+        for i in range(min(20, len(vector))):
+            output += f"  [{i:3d}] = {vector[i]:10.6f}\n"
+        if len(vector) > 20:
+            output += f"\n... ({len(vector) - 20} more dimensions)\n"
+
+        output += "\n" + "=" * 80 + "\n"
+        output += "VECTOR STATISTICS\n"
+        output += "=" * 80 + "\n"
+        output += f"  Dimensions: {len(vector)}\n"
+        output += f"  Min value: {min(vector):.6f}\n"
+        output += f"  Max value: {max(vector):.6f}\n"
+        output += f"  Mean value: {sum(vector) / len(vector):.6f}\n"
+        l2_norm = sum(x * x for x in vector) ** 0.5
+        output += f"  L2 Norm: {l2_norm:.6f}\n"
+        return output
+
     def show_vector_window(self):
-        """Show the vector visualization window"""
-        if not self.chroma_conn:
+        """Show the vector visualization window.
+
+        When data source is 'sqlite', queries ChromaDB's internal SQLite tables.
+        When data source is 'pgvector', queries the Postgres memory_vectors table.
+        """
+        if self.data_source == "sqlite" and not self.chroma_conn:
             messagebox.showwarning(
                 "ChromaDB Not Available",
                 "ChromaDB connection is not available.\n\nVector visualization requires ChromaDB.",
+            )
+            return
+
+        if self.data_source == "pgvector" and not self.pg_conn:
+            messagebox.showwarning(
+                "Postgres Not Connected",
+                "Connect to Postgres first via the data source selector.",
             )
             return
 
@@ -1200,11 +1914,10 @@ class MemoryManagerGUI:
         selected_memory_title = None
         if self.selected_memory_id:
             try:
-                cursor = self.db_conn.execute(
+                row = self._execute_read_one(
                     "SELECT title FROM memories WHERE id = ?",
                     (self.selected_memory_id,),
                 )
-                row = cursor.fetchone()
                 if row:
                     selected_memory_title = row["title"]
             except:
@@ -1228,8 +1941,11 @@ class MemoryManagerGUI:
         main_frame.rowconfigure(3, weight=1)
 
         # Title
+        backend_label = (
+            "pgvector/Postgres" if self.data_source == "pgvector" else "ChromaDB"
+        )
         title_label = ttk.Label(
-            main_frame, text="ChromaDB Vector Database", style="Title.TLabel"
+            main_frame, text=f"{backend_label} Vector Database", style="Title.TLabel"
         )
         title_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
 
@@ -1285,7 +2001,7 @@ class MemoryManagerGUI:
         results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         def query_vector():
-            """Query vector by memory ID"""
+            """Query vector by memory ID — dispatches to ChromaDB or pgvector."""
             memory_id = memory_id_var.get().strip()
             if not memory_id:
                 messagebox.showwarning(
@@ -1294,112 +2010,12 @@ class MemoryManagerGUI:
                 return
 
             try:
-                # Clear previous results
                 results_text.delete("1.0", tk.END)
 
-                # Query embeddings_queue table for the actual vector data
-                # The vector BLOB is stored in embeddings_queue, not embeddings
-                cursor = self.chroma_conn.execute(
-                    """
-                    SELECT eq.seq_id, eq.created_at, eq.id, eq.vector, eq.encoding,
-                           e.segment_id, e.id as embedding_row_id
-                    FROM embeddings_queue eq
-                    LEFT JOIN embeddings e ON eq.seq_id = e.seq_id
-                    WHERE eq.id = ?
-                    """,
-                    (memory_id,),
-                )
-                embedding_row = cursor.fetchone()
-
-                if not embedding_row:
-                    results_text.insert(
-                        "1.0", f"No vector found for memory_id: {memory_id}"
-                    )
-                    return
-
-                # Get metadata
-                metadata_cursor = self.chroma_conn.execute(
-                    """
-                    SELECT key, string_value, int_value, float_value
-                    FROM embedding_metadata
-                    WHERE id = ?
-                    ORDER BY key
-                    """,
-                    (embedding_row["embedding_row_id"],),
-                )
-                metadata_rows = metadata_cursor.fetchall()
-
-                # Build metadata dict
-                metadata = {}
-                for row in metadata_rows:
-                    key = row["key"]
-                    if row["string_value"] is not None:
-                        metadata[key] = row["string_value"]
-                    elif row["int_value"] is not None:
-                        metadata[key] = row["int_value"]
-                    elif row["float_value"] is not None:
-                        metadata[key] = row["float_value"]
-
-                # Format output
-                output = "=" * 80 + "\n"
-                output += f"VECTOR EMBEDDING FOUND\n"
-                output += "=" * 80 + "\n\n"
-
-                output += f"Memory ID: {embedding_row['id']}\n"
-                output += f"Seq ID: {embedding_row['seq_id']}\n"
-                output += f"Segment ID: {embedding_row['segment_id']}\n"
-                output += f"Created At: {embedding_row['created_at']}\n"
-                output += f"Encoding: {embedding_row['encoding']}\n\n"
-
-                output += "METADATA:\n"
-                output += "-" * 80 + "\n"
-                for key, value in metadata.items():
-                    output += f"  {key}: {value}\n"
-
-                # Get vector from embeddings_queue
-                vector_blob = embedding_row["vector"]
-
-                # Check if vector_blob is None or not a BLOB
-                if vector_blob is None:
-                    results_text.insert(
-                        "1.0", f"No vector data found for memory_id: {memory_id}"
-                    )
-                    return
-
-                # ChromaDB stores vectors as float32 arrays
-                import struct
-
-                # The vector BLOB contains the vector as float32 values
-                vector_size = len(vector_blob) // 4  # 4 bytes per float32
-                vector = struct.unpack(f"{vector_size}f", vector_blob)
-
-                output += "\n" + "=" * 80 + "\n"
-                output += f"VECTOR DATA ({vector_size} dimensions)\n"
-                output += "=" * 80 + "\n\n"
-
-                # Show first 20 dimensions
-                output += "First 20 dimensions:\n"
-                output += "-" * 80 + "\n"
-                for i in range(min(20, len(vector))):
-                    output += f"  [{i:3d}] = {vector[i]:10.6f}\n"
-
-                if len(vector) > 20:
-                    output += f"\n... ({len(vector) - 20} more dimensions)\n"
-
-                # Vector statistics
-                output += "\n" + "=" * 80 + "\n"
-                output += "VECTOR STATISTICS\n"
-                output += "=" * 80 + "\n"
-                output += f"  Dimensions: {len(vector)}\n"
-                output += f"  Min value: {min(vector):.6f}\n"
-                output += f"  Max value: {max(vector):.6f}\n"
-                output += f"  Mean value: {sum(vector) / len(vector):.6f}\n"
-
-                # L2 norm
-                l2_norm = sum(x * x for x in vector) ** 0.5
-                output += f"  L2 Norm: {l2_norm:.6f}\n"
-
-                results_text.insert("1.0", output)
+                if self.data_source == "pgvector" and self.pg_conn is not None:
+                    self._query_vector_pgvector(memory_id, results_text)
+                else:
+                    self._query_vector_chromadb(memory_id, results_text)
 
             except Exception as e:
                 results_text.insert("1.0", f"Error querying vector:\n{str(e)}")
@@ -1478,38 +2094,8 @@ class MemoryManagerGUI:
             vector_window.after(100, query_vector)
 
     def get_vector_statistics(self) -> str:
-        """Get statistics about the vector database"""
+        """Get statistics about the vector database (ChromaDB or pgvector)."""
         try:
-            # Count total embeddings
-            cursor = self.chroma_conn.execute(
-                "SELECT COUNT(*) as count FROM embeddings_queue"
-            )
-            total_embeddings = cursor.fetchone()["count"]
-
-            # Get segment info (join with embeddings table)
-            cursor = self.chroma_conn.execute(
-                """
-                SELECT e.segment_id, COUNT(*) as count
-                FROM embeddings_queue eq
-                LEFT JOIN embeddings e ON eq.seq_id = e.seq_id
-                GROUP BY e.segment_id
-                """
-            )
-            segments = cursor.fetchall()
-
-            # Get a sample vector to determine dimensions
-            cursor = self.chroma_conn.execute(
-                "SELECT vector FROM embeddings_queue WHERE vector IS NOT NULL LIMIT 1"
-            )
-            sample = cursor.fetchone()
-
-            vector_dimensions = 0
-            if sample and sample["vector"]:
-                import struct
-
-                vector_blob = sample["vector"]
-                vector_dimensions = len(vector_blob) // 4
-
             stats = f"Embedding Model: {EMBEDDING_MODEL}\n"
             stats += f"  HuggingFace: {EMBEDDING_MODEL_CONFIG['model_name']}\n"
             cfg_dims = EMBEDDING_MODEL_CONFIG["dimensions"]
@@ -1518,80 +2104,278 @@ class MemoryManagerGUI:
             stats += f"  Max Tokens: {cfg_max if cfg_max is not None else '?'}\n"
             if EMBEDDING_MODEL_CONFIG.get("query_prefix"):
                 stats += f"  Query Prefix: yes\n"
-            stats += f"\n"
-            stats += f"Total Embeddings: {total_embeddings}\n"
-            stats += f"Vector Dimensions: {vector_dimensions}\n"
+            stats += "\n"
 
-            # Warn if stored dims don't match config
-            if (
-                vector_dimensions is not None
-                and cfg_dims is not None
-                and vector_dimensions != cfg_dims
-            ):
-                stats += (
-                    f"  WARNING: stored vectors ({vector_dimensions}d) don't match "
-                    f"configured model ({cfg_dims}d)\n"
-                    f"  Run rebuild_vectors to re-embed with current model\n"
-                )
-
-            stats += f"Segments: {len(segments)}\n"
-
-            for seg in segments:
-                stats += f"  - {seg['segment_id']}: {seg['count']} embeddings\n"
-
-            return stats
+            if self.data_source == "pgvector" and self.pg_conn is not None:
+                return stats + self._get_pgvector_stats()
+            else:
+                return stats + self._get_chromadb_stats()
 
         except Exception as e:
             return f"Error loading statistics:\n{str(e)}"
 
+    def _get_chromadb_stats(self) -> str:
+        """Get vector statistics from ChromaDB's internal SQLite tables."""
+        if not self.chroma_conn:
+            return "ChromaDB not connected."
+
+        cursor = self.chroma_conn.execute(
+            "SELECT COUNT(*) as count FROM embeddings_queue"
+        )
+        total_embeddings = cursor.fetchone()["count"]
+
+        cursor = self.chroma_conn.execute(
+            """
+            SELECT e.segment_id, COUNT(*) as count
+            FROM embeddings_queue eq
+            LEFT JOIN embeddings e ON eq.seq_id = e.seq_id
+            GROUP BY e.segment_id
+            """
+        )
+        segments = cursor.fetchall()
+
+        cursor = self.chroma_conn.execute(
+            "SELECT vector FROM embeddings_queue WHERE vector IS NOT NULL LIMIT 1"
+        )
+        sample = cursor.fetchone()
+
+        vector_dimensions = 0
+        if sample and sample["vector"]:
+            import struct
+
+            vector_blob = sample["vector"]
+            vector_dimensions = len(vector_blob) // 4
+
+        cfg_dims = EMBEDDING_MODEL_CONFIG["dimensions"]
+        result = f"Backend: ChromaDB\n"
+        result += f"Total Embeddings: {total_embeddings}\n"
+        result += f"Vector Dimensions: {vector_dimensions}\n"
+
+        if (
+            vector_dimensions is not None
+            and cfg_dims is not None
+            and vector_dimensions != cfg_dims
+        ):
+            result += (
+                f"  WARNING: stored vectors ({vector_dimensions}d) don't match "
+                f"configured model ({cfg_dims}d)\n"
+                f"  Run rebuild_vectors to re-embed with current model\n"
+            )
+
+        result += f"Segments: {len(segments)}\n"
+        for seg in segments:
+            result += f"  - {seg['segment_id']}: {seg['count']} embeddings\n"
+
+        return result
+
+    def _get_pgvector_stats(self) -> str:
+        """Get vector statistics from the Postgres memory_vectors table."""
+        if self.pg_conn is None:
+            return "Not connected to Postgres."
+        row = self.pg_conn.execute(
+            "SELECT COUNT(*) as cnt FROM memory_vectors"
+        ).fetchone()
+        total = row["cnt"] if row else 0
+
+        # Get dimension from a sample vector
+        vector_dimensions = 0
+        sample = self.pg_conn.execute(
+            "SELECT embedding FROM memory_vectors LIMIT 1"
+        ).fetchone()
+        if sample and sample.get("embedding") is not None:
+            emb = sample["embedding"]
+            vector_dimensions = (
+                len(emb.tolist()) if hasattr(emb, "tolist") else len(emb) if emb else 0
+            )
+
+        cfg_dims = EMBEDDING_MODEL_CONFIG["dimensions"]
+        result = f"Backend: pgvector/Postgres\n"
+        result += f"Total Embeddings: {total}\n"
+        result += f"Vector Dimensions: {vector_dimensions}\n"
+
+        if vector_dimensions and cfg_dims is not None and vector_dimensions != cfg_dims:
+            result += (
+                f"  WARNING: stored vectors ({vector_dimensions}d) don't match "
+                f"configured model ({cfg_dims}d)\n"
+            )
+
+        return result
+
     def show_migration_window(self):
-        """Show database migration window"""
-        # Create migration window
+        """Show bidirectional database migration window.
+
+        Supports:
+          - SQLite/ChromaDB -> pgvector/Postgres
+          - pgvector/Postgres -> SQLite/ChromaDB
+          - SQLite -> SQLite (legacy, from another DB file)
+
+        Migrates BOTH structured data (memories table) AND vectors.
+        """
         migration_win = tk.Toplevel(self.root)
         migration_win.title("Database Migration Tool")
-        migration_win.geometry("1000x700")
+        migration_win.geometry("1100x800")
         migration_win.configure(bg=self.bg_color)
-
-        # Make it modal
         migration_win.transient(self.root)
         migration_win.grab_set()
 
-        # Main container
         main_frame = ttk.Frame(migration_win, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         migration_win.columnconfigure(0, weight=1)
         migration_win.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(2, weight=1)
+        main_frame.rowconfigure(4, weight=1)  # preview gets the stretch
 
-        # Title
-        title_label = ttk.Label(
+        # ── Title ──────────────────────────────────────────────
+        ttk.Label(
             main_frame,
-            text="Migrate Memories from Another Database",
+            text="Migrate Memories Between Databases",
             font=("Segoe UI", 14, "bold"),
-        )
-        title_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
 
-        # Instructions
-        instructions = ttk.Label(
+        ttk.Label(
             main_frame,
-            text="Import memories from a separate database (e.g., from default location when you ran with different settings).\n"
-            "This will transfer both SQLite records and ChromaDB vectors.",
+            text="Transfer memories and vectors between SQLite/ChromaDB and pgvector/Postgres, or import from another SQLite file.",
             font=("Segoe UI", 9),
-        )
-        instructions.grid(row=1, column=0, sticky=tk.W, pady=(0, 10))
+        ).grid(row=1, column=0, sticky=tk.W, pady=(0, 10))
 
-        # Source database selection
-        source_frame = ttk.LabelFrame(main_frame, text="Source Database", padding="10")
-        source_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        source_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(source_frame, text="SQLite DB:").grid(
-            row=0, column=0, sticky=tk.W, pady=5
+        # ── Direction selector ─────────────────────────────────
+        direction_frame = ttk.LabelFrame(
+            main_frame, text="Migration Direction", padding="10"
         )
+        direction_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        direction_frame.columnconfigure(1, weight=1)
+
+        direction_var = tk.StringVar(value="sqlite_to_pg")
+
+        directions = [
+            ("sqlite_to_pg", "SQLite/ChromaDB  -->  pgvector/Postgres"),
+            ("pg_to_sqlite", "pgvector/Postgres  -->  SQLite/ChromaDB"),
+            ("sqlite_to_sqlite", "SQLite file  -->  Active SQLite (legacy import)"),
+        ]
+
+        for i, (val, label) in enumerate(directions):
+            ttk.Radiobutton(
+                direction_frame,
+                text=label,
+                variable=direction_var,
+                value=val,
+                command=lambda: _on_direction_changed(),
+            ).grid(row=0, column=i, sticky=tk.W, padx=(0, 20), pady=5)
+
+        # ── Connection settings ────────────────────────────────
+        conn_frame = ttk.LabelFrame(
+            main_frame, text="PostgreSQL Connection", padding="10"
+        )
+        conn_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        conn_frame.columnconfigure(1, weight=1)
+        conn_frame.columnconfigure(3, weight=1)
+
+        import os as _os
+
+        pg_host_var = tk.StringVar(value=_os.environ.get("PGHOST", "localhost"))
+        pg_port_var = tk.StringVar(value=_os.environ.get("PGPORT", "5433"))
+        pg_db_var = tk.StringVar(value=_os.environ.get("PGDATABASE", "memories"))
+        pg_user_var = tk.StringVar(value=_os.environ.get("PGUSER", "memory_user"))
+        pg_pass_var = tk.StringVar(value=_os.environ.get("PGPASSWORD", ""))
+
+        ttk.Label(conn_frame, text="Host:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(conn_frame, textvariable=pg_host_var, width=20).grid(
+            row=0, column=1, sticky=tk.W, padx=5, pady=3
+        )
+        ttk.Label(conn_frame, text="Port:").grid(
+            row=0, column=2, sticky=tk.W, padx=(15, 0), pady=3
+        )
+        ttk.Entry(conn_frame, textvariable=pg_port_var, width=8).grid(
+            row=0, column=3, sticky=tk.W, padx=5, pady=3
+        )
+
+        ttk.Label(conn_frame, text="Database:").grid(
+            row=1, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Entry(conn_frame, textvariable=pg_db_var, width=20).grid(
+            row=1, column=1, sticky=tk.W, padx=5, pady=3
+        )
+        ttk.Label(conn_frame, text="User:").grid(
+            row=1, column=2, sticky=tk.W, padx=(15, 0), pady=3
+        )
+        ttk.Entry(conn_frame, textvariable=pg_user_var, width=20).grid(
+            row=1, column=3, sticky=tk.W, padx=5, pady=3
+        )
+
+        ttk.Label(conn_frame, text="Password:").grid(
+            row=2, column=0, sticky=tk.W, pady=3
+        )
+        pw_entry = ttk.Entry(conn_frame, textvariable=pg_pass_var, show="*", width=20)
+        pw_entry.grid(row=2, column=1, sticky=tk.W, padx=5, pady=3)
+
+        # Test connection button
+        conn_status_var = tk.StringVar(value="")
+
+        def test_pg_connection():
+            conn = None
+            try:
+                import psycopg
+
+                conn = psycopg.connect(**_get_pg_connkw(), autocommit=True)
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_name IN ('memories', 'memory_vectors')"
+                )
+                tables = cur.fetchone()[0]
+                conn.execute("SELECT 1")  # basic health
+                # Count memories and vectors
+                mem_count = 0
+                vec_count = 0
+                if tables > 0:
+                    try:
+                        mem_count = conn.execute(
+                            "SELECT COUNT(*) FROM memories"
+                        ).fetchone()[0]
+                    except Exception:
+                        pass
+                    try:
+                        vec_count = conn.execute(
+                            "SELECT COUNT(*) FROM memory_vectors"
+                        ).fetchone()[0]
+                    except Exception:
+                        pass
+                conn_status_var.set(
+                    f"Connected OK  |  Tables: {tables}/2  |  "
+                    f"Memories: {mem_count}  |  Vectors: {vec_count}"
+                )
+            except ImportError:
+                conn_status_var.set(
+                    "psycopg not installed. Run: pip install 'psycopg[binary]' pgvector"
+                )
+            except Exception as e:
+                conn_status_var.set(f"Connection failed: {e}")
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        ttk.Button(conn_frame, text="Test Connection", command=test_pg_connection).grid(
+            row=2, column=2, padx=(15, 5), pady=3
+        )
+        conn_status_label = ttk.Label(
+            conn_frame, textvariable=conn_status_var, font=("Segoe UI", 8)
+        )
+        conn_status_label.grid(row=3, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+
+        # SQLite source file (for sqlite_to_sqlite mode)
+        sqlite_source_frame = ttk.LabelFrame(
+            main_frame, text="SQLite Source File (legacy import only)", padding="10"
+        )
+        sqlite_source_frame.columnconfigure(1, weight=1)
+
         source_db_var = tk.StringVar()
-        source_db_entry = ttk.Entry(source_frame, textvariable=source_db_var)
-        source_db_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        ttk.Label(sqlite_source_frame, text="SQLite DB:").grid(
+            row=0, column=0, sticky=tk.W, pady=3
+        )
+        ttk.Entry(sqlite_source_frame, textvariable=source_db_var).grid(
+            row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=3
+        )
 
         def browse_source_db():
             default_path = (
@@ -1604,17 +2388,11 @@ class MemoryManagerGUI:
             )
             if filename:
                 source_db_var.set(filename)
-                # Auto-detect ChromaDB path
-                source_path = Path(filename)
-                chroma_path = source_path.parent / "chroma_db"
-                if chroma_path.exists():
-                    source_chroma_var.set(str(chroma_path))
 
-        ttk.Button(source_frame, text="Browse", command=browse_source_db).grid(
-            row=0, column=2, padx=5, pady=5
+        ttk.Button(sqlite_source_frame, text="Browse", command=browse_source_db).grid(
+            row=0, column=2, padx=5, pady=3
         )
 
-        # Quick access to default location
         def use_default_location():
             default_db = (
                 Path.home()
@@ -1625,245 +2403,692 @@ class MemoryManagerGUI:
             )
             if default_db.exists():
                 source_db_var.set(str(default_db))
-                chroma_path = default_db.parent / "chroma_db"
-                if chroma_path.exists():
-                    source_chroma_var.set(str(chroma_path))
             else:
                 messagebox.showwarning(
                     "Not Found", f"Default database not found at:\n{default_db}"
                 )
 
         ttk.Button(
-            source_frame, text="Use Default Location", command=use_default_location
-        ).grid(row=0, column=3, padx=5, pady=5)
+            sqlite_source_frame, text="Use Default", command=use_default_location
+        ).grid(row=0, column=3, padx=5, pady=3)
 
-        ttk.Label(source_frame, text="ChromaDB Path:").grid(
-            row=1, column=0, sticky=tk.W, pady=5
-        )
-        source_chroma_var = tk.StringVar()
-        source_chroma_entry = ttk.Entry(source_frame, textvariable=source_chroma_var)
-        source_chroma_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        def _on_direction_changed():
+            d = direction_var.get()
+            if d == "sqlite_to_sqlite":
+                sqlite_source_frame.grid(
+                    row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10)
+                )
+                conn_frame.grid_remove()
+            else:
+                conn_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+                sqlite_source_frame.grid_remove()
 
-        def browse_source_chroma():
-            dirname = filedialog.askdirectory(
-                title="Select ChromaDB Directory",
-                initialdir=Path.home()
-                / "Documents"
-                / "ai_companion_memory"
-                / "memory_db",
-            )
-            if dirname:
-                source_chroma_var.set(dirname)
+        # Initial state: show postgres settings, hide sqlite source
+        sqlite_source_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        sqlite_source_frame.grid_remove()
 
-        ttk.Button(source_frame, text="Browse", command=browse_source_chroma).grid(
-            row=1, column=2, padx=5, pady=5
-        )
-
-        ttk.Label(
-            source_frame, text="(Auto-detected if left blank)", font=("Segoe UI", 8)
-        ).grid(row=1, column=3, sticky=tk.W, padx=5)
-
-        # Preview button and list
+        # ── Preview ────────────────────────────────────────────
         preview_frame = ttk.LabelFrame(
             main_frame, text="Preview Source Memories", padding="10"
         )
         preview_frame.grid(
-            row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10)
+            row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10)
         )
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(1, weight=1)
 
-        preview_button_frame = ttk.Frame(preview_frame)
-        preview_button_frame.grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        preview_btn_frame = ttk.Frame(preview_frame)
+        preview_btn_frame.grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
 
-        def preview_memories():
-            source_path = source_db_var.get()
-            if not source_path:
-                messagebox.showwarning(
-                    "Missing Input", "Please select a source database"
-                )
-                return
-
-            if not Path(source_path).exists():
-                messagebox.showerror("Error", f"Database not found: {source_path}")
-                return
-
-            try:
-                # Connect to source database
-                source_conn = sqlite3.connect(source_path)
-                source_conn.row_factory = sqlite3.Row
-
-                # Query memories
-                cursor = source_conn.execute(
-                    """
-                    SELECT id, title, content, timestamp, tags, importance, memory_type
-                    FROM memories 
-                    ORDER BY timestamp DESC 
-                    LIMIT 100
-                    """
-                )
-
-                rows = cursor.fetchall()
-                source_conn.close()
-
-                # Clear preview list
-                for item in preview_tree.get_children():
-                    preview_tree.delete(item)
-
-                # Populate preview
-                for row in rows:
-                    tags = json.loads(row["tags"]) if row["tags"] else []
-                    preview_tree.insert(
-                        "",
-                        "end",
-                        values=(
-                            row["id"][:12] + "...",
-                            row["title"][:50],
-                            row["memory_type"],
-                            row["importance"],
-                            ", ".join(tags)[:30],
-                        ),
-                    )
-
-                count_label.config(
-                    text=f"Found {len(rows)} memories (showing up to 100)"
-                )
-
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to preview database:\n{str(e)}")
-
-        ttk.Button(
-            preview_button_frame,
-            text="Preview Source Database",
-            command=preview_memories,
-        ).grid(row=0, column=0, padx=2)
-
-        count_label = ttk.Label(preview_button_frame, text="", font=("Segoe UI", 9))
+        count_label = ttk.Label(preview_btn_frame, text="", font=("Segoe UI", 9))
         count_label.grid(row=0, column=1, padx=10)
 
-        # Preview treeview
         preview_tree = ttk.Treeview(
             preview_frame,
             columns=("ID", "Title", "Type", "Importance", "Tags"),
             show="headings",
             height=10,
         )
-
-        preview_tree.heading("ID", text="ID")
-        preview_tree.heading("Title", text="Title")
-        preview_tree.heading("Type", text="Type")
-        preview_tree.heading("Importance", text="Importance")
-        preview_tree.heading("Tags", text="Tags")
-
-        preview_tree.column("ID", width=120)
-        preview_tree.column("Title", width=300)
-        preview_tree.column("Type", width=100)
-        preview_tree.column("Importance", width=80)
-        preview_tree.column("Tags", width=200)
-
+        for col, w in [
+            ("ID", 120),
+            ("Title", 350),
+            ("Type", 100),
+            ("Importance", 80),
+            ("Tags", 200),
+        ]:
+            preview_tree.heading(col, text=col)
+            preview_tree.column(col, width=w)
         preview_tree.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # Scrollbar for preview
         preview_scroll = ttk.Scrollbar(
             preview_frame, orient="vertical", command=preview_tree.yview
         )
         preview_scroll.grid(row=1, column=1, sticky=(tk.N, tk.S))
         preview_tree.configure(yscrollcommand=preview_scroll.set)
 
-        # Migration options
+        def _clear_preview():
+            for item in preview_tree.get_children():
+                preview_tree.delete(item)
+            count_label.config(text="")
+
+        def _populate_preview(rows_dicts):
+            """rows_dicts: list of dicts with id, title, memory_type, importance, tags"""
+            _clear_preview()
+            for r in rows_dicts:
+                tags_raw = r.get("tags", "")
+                if isinstance(tags_raw, str):
+                    try:
+                        tags_raw = json.loads(tags_raw) if tags_raw else []
+                    except (json.JSONDecodeError, TypeError):
+                        tags_raw = [tags_raw] if tags_raw else []
+                tags_str = ", ".join(str(t) for t in tags_raw)[:30] if tags_raw else ""
+                mid = str(r.get("id", ""))
+                preview_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        mid[:15] + ("..." if len(mid) > 15 else ""),
+                        str(r.get("title", ""))[:50],
+                        r.get("memory_type", ""),
+                        r.get("importance", ""),
+                        tags_str,
+                    ),
+                )
+            count_label.config(text=f"Found {len(rows_dicts)} memories (up to 200)")
+
+        def preview_source():
+            direction = direction_var.get()
+            try:
+                if direction == "sqlite_to_sqlite":
+                    spath = source_db_var.get()
+                    if not spath or not Path(spath).exists():
+                        messagebox.showwarning(
+                            "Missing Input", "Select a valid source SQLite file."
+                        )
+                        return
+                    src = sqlite3.connect(spath)
+                    src.row_factory = sqlite3.Row
+                    rows = src.execute(
+                        "SELECT id, title, memory_type, importance, tags FROM memories ORDER BY timestamp DESC LIMIT 200"
+                    ).fetchall()
+                    src.close()
+                    _populate_preview([dict(r) for r in rows])
+
+                elif direction == "sqlite_to_pg":
+                    # Source = local SQLite
+                    if not DB_PATH.exists():
+                        messagebox.showwarning(
+                            "Not Found", f"Local SQLite DB not found:\n{DB_PATH}"
+                        )
+                        return
+                    src = sqlite3.connect(str(DB_PATH))
+                    src.row_factory = sqlite3.Row
+                    rows = src.execute(
+                        "SELECT id, title, memory_type, importance, tags FROM memories ORDER BY timestamp DESC LIMIT 200"
+                    ).fetchall()
+                    src.close()
+                    _populate_preview([dict(r) for r in rows])
+
+                elif direction == "pg_to_sqlite":
+                    # Source = Postgres
+                    import psycopg
+
+                    conn = psycopg.connect(**_get_pg_connkw(), autocommit=True)
+                    try:
+                        cur = conn.execute(
+                            "SELECT id, title, memory_type, importance, tags FROM memories ORDER BY timestamp DESC LIMIT 200"
+                        )
+                        cols = [d[0] for d in cur.description]
+                        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+                    finally:
+                        conn.close()
+                    _populate_preview(rows)
+
+            except ImportError:
+                messagebox.showerror(
+                    "Missing Dependency",
+                    "psycopg not installed.\nRun: pip install 'psycopg[binary]'",
+                )
+            except Exception as e:
+                messagebox.showerror("Preview Error", f"Failed to preview:\n{e}")
+
+        ttk.Button(
+            preview_btn_frame, text="Preview Source", command=preview_source
+        ).grid(row=0, column=0, padx=2)
+
+        # ── Options ────────────────────────────────────────────
         options_frame = ttk.LabelFrame(
             main_frame, text="Migration Options", padding="10"
         )
-        options_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        options_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
 
-        skip_duplicates_var = tk.BooleanVar(value=True)
+        skip_dup_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             options_frame,
-            text="Skip duplicate memories (recommended)",
-            variable=skip_duplicates_var,
-        ).grid(row=0, column=0, sticky=tk.W, pady=5)
+            text="Skip duplicate memories (by content hash)",
+            variable=skip_dup_var,
+        ).grid(row=0, column=0, sticky=tk.W, pady=3)
 
-        ttk.Label(
+        migrate_vectors_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
             options_frame,
-            text="Duplicates are detected using content hash. Enabling this prevents importing the same memory twice.",
-            font=("Segoe UI", 8),
-        ).grid(row=1, column=0, sticky=tk.W)
+            text="Migrate vectors (embeddings) alongside structured data",
+            variable=migrate_vectors_var,
+        ).grid(row=1, column=0, sticky=tk.W, pady=3)
 
-        # Action buttons
+        # ── Status / progress ──────────────────────────────────
+        status_var = tk.StringVar(value="Ready")
+        status_label = ttk.Label(
+            main_frame, textvariable=status_var, font=("Segoe UI", 9)
+        )
+        status_label.grid(row=6, column=0, sticky=tk.W, pady=(0, 5))
+
+        # ── Action buttons ─────────────────────────────────────
         action_frame = ttk.Frame(main_frame)
-        action_frame.grid(row=5, column=0, sticky=(tk.W, tk.E))
+        action_frame.grid(row=7, column=0, sticky=(tk.W, tk.E))
 
-        def perform_migration():
-            source_path = source_db_var.get()
-            if not source_path:
-                messagebox.showwarning(
-                    "Missing Input", "Please select a source database"
+        def _get_pg_connkw():
+            """Build psycopg keyword-arg dict (no conninfo string — avoids injection)."""
+            port_str = pg_port_var.get().strip()
+            try:
+                port = int(port_str)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid port number: '{port_str}'. Enter a numeric port (e.g. 5433)."
                 )
-                return
-
-            if not Path(source_path).exists():
-                messagebox.showerror("Error", f"Database not found: {source_path}")
-                return
-
-            # Confirmation
-            response = messagebox.askyesno(
-                "Confirm Migration",
-                "This will import memories from the source database into your active database.\n\n"
-                "Are you sure you want to continue?",
+            return dict(
+                host=pg_host_var.get().strip(),
+                port=port,
+                dbname=pg_db_var.get().strip(),
+                user=pg_user_var.get().strip(),
+                password=pg_pass_var.get(),
             )
 
-            if not response:
-                return
+        def perform_migration():
+            direction = direction_var.get()
 
+            if direction == "sqlite_to_sqlite":
+                _migrate_sqlite_to_sqlite()
+            elif direction == "sqlite_to_pg":
+                _migrate_sqlite_to_pg()
+            elif direction == "pg_to_sqlite":
+                _migrate_pg_to_sqlite()
+
+        def _migrate_sqlite_to_sqlite():
+            """Legacy: import from another SQLite file into the active DB."""
+            spath = source_db_var.get()
+            if not spath or not Path(spath).exists():
+                messagebox.showwarning(
+                    "Missing Input", "Select a valid source SQLite file."
+                )
+                return
+            if not messagebox.askyesno(
+                "Confirm", "Import memories from the selected SQLite file?"
+            ):
+                return
             try:
-                # Reuse the GUI's RobustMemorySystem if available
                 if self.memory_system:
-                    memory_system = self.memory_system
+                    ms = self.memory_system
                 else:
                     from memory_mcp.memory_system import RobustMemorySystem
-                    from memory_mcp.config import DATA_FOLDER
 
-                    memory_system = RobustMemorySystem(DATA_FOLDER)
+                    ms = RobustMemorySystem(DATA_FOLDER)
 
-                # Prepare parameters
-                source_chroma_path = source_chroma_var.get() or None
-
-                # Perform migration
-                result = memory_system.migrate_memories(
-                    source_db_path=source_path,
-                    source_chroma_path=source_chroma_path,
-                    memory_ids=None,  # Migrate all
-                    skip_duplicates=skip_duplicates_var.get(),
+                chroma_path = Path(spath).parent / "chroma_db"
+                result = ms.migrate_memories(
+                    source_db_path=spath,
+                    source_chroma_path=str(chroma_path)
+                    if chroma_path.exists()
+                    else None,
+                    memory_ids=None,
+                    skip_duplicates=skip_dup_var.get(),
                 )
-
                 if result.success:
-                    stats = result.data[0]
+                    s = result.data[0]
                     messagebox.showinfo(
                         "Migration Complete",
-                        f"Migration completed successfully!\n\n"
-                        f"Total found: {stats['total_found']}\n"
-                        f"Migrated: {stats['migrated']}\n"
-                        f"Skipped (duplicates): {stats['skipped_duplicates']}\n"
-                        f"Errors: {stats['errors']}\n"
-                        f"Vectors migrated: {stats['vectors_migrated']}",
+                        f"Migrated: {s['migrated']}  |  Skipped: {s['skipped_duplicates']}  |  Errors: {s['errors']}",
                     )
-
-                    # Refresh the main window
                     self.refresh_memories()
                     self.update_statistics()
-
-                    # Close migration window
                     migration_win.destroy()
                 else:
-                    messagebox.showerror("Migration Failed", f"Error: {result.reason}")
-
+                    messagebox.showerror("Failed", result.reason)
             except Exception as e:
-                messagebox.showerror("Error", f"Migration failed:\n{str(e)}")
+                messagebox.showerror("Error", f"Migration failed:\n{e}")
+
+        def _migrate_sqlite_to_pg():
+            """Migrate structured data + vectors from SQLite/ChromaDB to pgvector/Postgres."""
+            if not DB_PATH.exists():
+                messagebox.showerror("Error", f"Local SQLite not found:\n{DB_PATH}")
+                return
+            if not messagebox.askyesno(
+                "Confirm",
+                "Migrate all memories from SQLite/ChromaDB to pgvector/Postgres?\n\n"
+                "This will INSERT into Postgres (existing records with same ID are updated).",
+            ):
+                return
+
+            status_var.set("Migrating SQLite -> Postgres ...")
+            migration_win.update_idletasks()
+
+            pg_conn = None
+            src = None
+            chroma = None
+            try:
+                import psycopg
+
+                pg_conn = psycopg.connect(**_get_pg_connkw(), autocommit=False)
+
+                # Ensure tables exist
+                pg_conn.execute("""
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id TEXT PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL,
+                        timestamp TEXT NOT NULL, tags TEXT, importance INTEGER DEFAULT 5,
+                        memory_type TEXT DEFAULT 'conversation', metadata TEXT,
+                        content_hash TEXT, created_at TEXT DEFAULT (NOW()::text),
+                        updated_at TEXT DEFAULT (NOW()::text),
+                        last_accessed TEXT DEFAULT (NOW()::text),
+                        token_count INTEGER DEFAULT 0
+                    )
+                """)
+                pg_conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                pg_conn.execute("""
+                    CREATE TABLE IF NOT EXISTS memory_vectors (
+                        id TEXT PRIMARY KEY, embedding vector(384),
+                        document TEXT, metadata JSONB DEFAULT '{}'::jsonb
+                    )
+                """)
+                pg_conn.commit()
+
+                # Read all SQLite memories
+                src = sqlite3.connect(str(DB_PATH))
+                src.row_factory = sqlite3.Row
+                rows = src.execute(
+                    "SELECT * FROM memories ORDER BY timestamp"
+                ).fetchall()
+
+                migrated = 0
+                skipped = 0
+                errors = 0
+
+                for row in rows:
+                    rd = dict(row)
+                    try:
+                        if skip_dup_var.get() and rd.get("content_hash"):
+                            dup = pg_conn.execute(
+                                "SELECT id FROM memories WHERE content_hash = %s",
+                                (rd["content_hash"],),
+                            ).fetchone()
+                            if dup:
+                                skipped += 1
+                                continue
+
+                        # Use savepoint so a single row failure doesn't abort
+                        # the entire transaction
+                        pg_conn.execute("SAVEPOINT row_sp")
+                        pg_conn.execute(
+                            """
+                            INSERT INTO memories
+                                (id, title, content, timestamp, tags, importance,
+                                 memory_type, metadata, content_hash, created_at,
+                                 updated_at, last_accessed, token_count)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (id) DO UPDATE SET
+                                title=EXCLUDED.title, content=EXCLUDED.content,
+                                timestamp=EXCLUDED.timestamp, tags=EXCLUDED.tags,
+                                importance=EXCLUDED.importance, memory_type=EXCLUDED.memory_type,
+                                metadata=EXCLUDED.metadata, content_hash=EXCLUDED.content_hash,
+                                updated_at=EXCLUDED.updated_at, last_accessed=EXCLUDED.last_accessed,
+                                token_count=EXCLUDED.token_count
+                            """,
+                            (
+                                rd["id"],
+                                rd["title"],
+                                rd["content"],
+                                rd["timestamp"],
+                                rd["tags"],
+                                rd["importance"],
+                                rd["memory_type"],
+                                rd["metadata"],
+                                rd.get("content_hash"),
+                                rd.get("created_at"),
+                                rd.get("updated_at"),
+                                rd.get("last_accessed"),
+                                rd.get("token_count", 0),
+                            ),
+                        )
+                        pg_conn.execute("RELEASE SAVEPOINT row_sp")
+                        migrated += 1
+                    except Exception as e:
+                        errors += 1
+                        print(f"Error migrating {rd.get('id')}: {e}")
+                        try:
+                            pg_conn.execute("ROLLBACK TO SAVEPOINT row_sp")
+                        except Exception:
+                            pass
+
+                pg_conn.commit()
+
+                # Migrate vectors from ChromaDB if requested
+                vec_migrated = 0
+                if migrate_vectors_var.get():
+                    status_var.set("Migrating vectors ...")
+                    migration_win.update_idletasks()
+                    try:
+                        from pgvector.psycopg import register_vector
+
+                        register_vector(pg_conn)
+
+                        from memory_mcp.vector_backends.chroma import ChromaBackend
+
+                        chroma = ChromaBackend(db_folder=DB_PATH.parent)
+                        chroma.initialize()
+
+                        # Get all vectors with embeddings
+                        all_vecs = chroma.get(include_embeddings=True)
+                        ids = all_vecs.get("ids", [])
+                        embeddings = all_vecs.get("embeddings", [])
+                        documents = all_vecs.get("documents", [])
+                        metadatas = all_vecs.get("metadatas", [])
+
+                        for i, vid in enumerate(ids):
+                            try:
+                                emb = embeddings[i] if i < len(embeddings) else None
+                                doc = documents[i] if i < len(documents) else ""
+                                meta = metadatas[i] if i < len(metadatas) else {}
+                                if emb is not None:
+                                    # Ensure embedding is a flat list of floats
+                                    emb_list = (
+                                        emb.tolist()
+                                        if hasattr(emb, "tolist")
+                                        else list(emb)
+                                    )
+                                    pg_conn.execute("SAVEPOINT vec_sp")
+                                    pg_conn.execute(
+                                        """
+                                        INSERT INTO memory_vectors (id, embedding, document, metadata)
+                                        VALUES (%s, %s::vector, %s, %s)
+                                        ON CONFLICT (id) DO UPDATE SET
+                                            embedding=EXCLUDED.embedding,
+                                            document=EXCLUDED.document,
+                                            metadata=EXCLUDED.metadata
+                                        """,
+                                        (
+                                            vid,
+                                            str(emb_list),
+                                            doc,
+                                            json.dumps(meta or {}),
+                                        ),
+                                    )
+                                    pg_conn.execute("RELEASE SAVEPOINT vec_sp")
+                                    vec_migrated += 1
+                            except Exception as ve:
+                                print(f"Vector migrate error {vid}: {ve}")
+                                try:
+                                    pg_conn.execute("ROLLBACK TO SAVEPOINT vec_sp")
+                                except Exception:
+                                    pass
+
+                        pg_conn.commit()
+                    except Exception as ve:
+                        vec_error = str(ve)
+                        print(f"Vector migration error: {ve}")
+                    finally:
+                        if chroma is not None:
+                            try:
+                                chroma.close()
+                            except Exception:
+                                pass
+                            chroma = None
+
+                status_var.set("Done!")
+                vec_note = ""
+                if migrate_vectors_var.get() and vec_migrated == 0:
+                    vec_note = "\n\nWARNING: No vectors were migrated."
+                    if "vec_error" in dir():
+                        vec_note += f"\nVector error: {vec_error}"
+                messagebox.showinfo(
+                    "Migration Complete",
+                    f"SQLite -> Postgres migration complete!\n\n"
+                    f"Memories migrated: {migrated}\n"
+                    f"Skipped (duplicates): {skipped}\n"
+                    f"Errors: {errors}\n"
+                    f"Vectors migrated: {vec_migrated}{vec_note}",
+                )
+                self.refresh_memories()
+                self.update_statistics()
+
+            except ImportError:
+                status_var.set("Failed")
+                messagebox.showerror(
+                    "Missing Dependency",
+                    "Install: pip install 'psycopg[binary]' pgvector",
+                )
+            except Exception as e:
+                status_var.set("Failed")
+                if pg_conn is not None:
+                    try:
+                        pg_conn.rollback()
+                    except Exception:
+                        pass
+                messagebox.showerror("Error", f"Migration failed:\n{e}")
+            finally:
+                if src is not None:
+                    try:
+                        src.close()
+                    except Exception:
+                        pass
+                if pg_conn is not None:
+                    try:
+                        pg_conn.close()
+                    except Exception:
+                        pass
+
+        def _migrate_pg_to_sqlite():
+            """Migrate structured data + vectors from pgvector/Postgres to SQLite/ChromaDB."""
+            if not messagebox.askyesno(
+                "Confirm",
+                "Migrate all memories from pgvector/Postgres to local SQLite/ChromaDB?\n\n"
+                "This will INSERT into SQLite (existing records with same ID are updated).",
+            ):
+                return
+
+            status_var.set("Migrating Postgres -> SQLite ...")
+            migration_win.update_idletasks()
+
+            pg_conn = None
+            dest = None
+            chroma = None
+            try:
+                import psycopg
+
+                pg_conn = psycopg.connect(**_get_pg_connkw(), autocommit=True)
+
+                # Read Postgres memories
+                cur = pg_conn.execute("SELECT * FROM memories ORDER BY timestamp")
+                cols = [d[0] for d in cur.description]
+                pg_rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+                # Write to SQLite
+                dest = sqlite3.connect(
+                    str(DB_PATH), check_same_thread=False, timeout=30.0
+                )
+                dest.row_factory = sqlite3.Row
+                dest.execute("PRAGMA journal_mode=WAL")
+                # Ensure schema exists (needed for fresh installs)
+                dest.execute("""
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id TEXT PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL,
+                        timestamp TEXT NOT NULL, tags TEXT, importance INTEGER DEFAULT 5,
+                        memory_type TEXT DEFAULT 'conversation', metadata TEXT,
+                        content_hash TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        last_accessed TEXT DEFAULT CURRENT_TIMESTAMP,
+                        token_count INTEGER DEFAULT 0
+                    )
+                """)
+
+                migrated = 0
+                skipped = 0
+                errors = 0
+
+                for rd in pg_rows:
+                    try:
+                        if skip_dup_var.get() and rd.get("content_hash"):
+                            dup = dest.execute(
+                                "SELECT id FROM memories WHERE content_hash = ?",
+                                (rd["content_hash"],),
+                            ).fetchone()
+                            if dup:
+                                skipped += 1
+                                continue
+
+                        dest.execute(
+                            """
+                            INSERT OR REPLACE INTO memories
+                                (id, title, content, timestamp, tags, importance,
+                                 memory_type, metadata, content_hash, created_at,
+                                 updated_at, last_accessed, token_count)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                rd["id"],
+                                rd["title"],
+                                rd["content"],
+                                rd["timestamp"],
+                                rd.get("tags"),
+                                rd.get("importance", 5),
+                                rd.get("memory_type", "conversation"),
+                                rd.get("metadata"),
+                                rd.get("content_hash"),
+                                rd.get("created_at"),
+                                rd.get("updated_at"),
+                                rd.get("last_accessed"),
+                                rd.get("token_count", 0),
+                            ),
+                        )
+                        migrated += 1
+                    except Exception as e:
+                        errors += 1
+                        print(f"Error migrating {rd.get('id')}: {e}")
+
+                dest.commit()
+
+                # Migrate vectors from Postgres to ChromaDB
+                vec_migrated = 0
+                if migrate_vectors_var.get():
+                    status_var.set("Migrating vectors ...")
+                    migration_win.update_idletasks()
+                    try:
+                        from pgvector.psycopg import register_vector
+
+                        register_vector(pg_conn)
+
+                        from memory_mcp.vector_backends.chroma import ChromaBackend
+
+                        chroma = ChromaBackend(db_folder=DB_PATH.parent)
+                        chroma.initialize()
+
+                        # Get all vectors from Postgres
+                        cur = pg_conn.execute(
+                            "SELECT id, embedding, document, metadata FROM memory_vectors"
+                        )
+                        batch_ids, batch_embs, batch_docs, batch_metas = [], [], [], []
+
+                        for row in cur.fetchall():
+                            vid, emb, doc, meta = row[0], row[1], row[2], row[3]
+                            if emb is not None:
+                                # Ensure embedding is a proper list of floats
+                                emb_list = (
+                                    emb.tolist()
+                                    if hasattr(emb, "tolist")
+                                    else list(emb)
+                                )
+                                if isinstance(meta, str):
+                                    meta = json.loads(meta)
+                                batch_ids.append(vid)
+                                batch_embs.append(emb_list)
+                                batch_docs.append(doc or "")
+                                batch_metas.append(meta or {})
+
+                                if len(batch_ids) >= 100:
+                                    chroma.add(
+                                        ids=batch_ids,
+                                        embeddings=batch_embs,
+                                        documents=batch_docs,
+                                        metadatas=batch_metas,
+                                    )
+                                    vec_migrated += len(batch_ids)
+                                    batch_ids, batch_embs, batch_docs, batch_metas = (
+                                        [],
+                                        [],
+                                        [],
+                                        [],
+                                    )
+
+                        if batch_ids:
+                            chroma.add(
+                                ids=batch_ids,
+                                embeddings=batch_embs,
+                                documents=batch_docs,
+                                metadatas=batch_metas,
+                            )
+                            vec_migrated += len(batch_ids)
+
+                    except Exception as ve:
+                        vec_error_pg = str(ve)
+                        print(f"Vector migration error: {ve}")
+                    finally:
+                        if chroma is not None:
+                            try:
+                                chroma.close()
+                            except Exception:
+                                pass
+                            chroma = None
+
+                status_var.set("Done!")
+                vec_note = ""
+                if migrate_vectors_var.get() and vec_migrated == 0:
+                    vec_note = "\n\nWARNING: No vectors were migrated."
+                    if "vec_error_pg" in dir():
+                        vec_note += f"\nVector error: {vec_error_pg}"
+                messagebox.showinfo(
+                    "Migration Complete",
+                    f"Postgres -> SQLite migration complete!\n\n"
+                    f"Memories migrated: {migrated}\n"
+                    f"Skipped (duplicates): {skipped}\n"
+                    f"Errors: {errors}\n"
+                    f"Vectors migrated: {vec_migrated}{vec_note}",
+                )
+                # Refresh main window (which reads from SQLite)
+                self.refresh_memories()
+                self.update_statistics()
+
+            except ImportError:
+                status_var.set("Failed")
+                messagebox.showerror(
+                    "Missing Dependency",
+                    "Install: pip install 'psycopg[binary]' pgvector",
+                )
+            except Exception as e:
+                status_var.set("Failed")
+                messagebox.showerror("Error", f"Migration failed:\n{e}")
+            finally:
+                if dest is not None:
+                    try:
+                        dest.close()
+                    except Exception:
+                        pass
+                if pg_conn is not None:
+                    try:
+                        pg_conn.close()
+                    except Exception:
+                        pass
 
         ttk.Button(
             action_frame, text="Start Migration", command=perform_migration
         ).grid(row=0, column=0, padx=5)
-
         ttk.Button(action_frame, text="Close", command=migration_win.destroy).grid(
             row=0, column=1, padx=5
         )
@@ -1898,6 +3123,9 @@ class MemoryManagerGUI:
                 self.chroma_conn.close()
             except Exception:
                 pass
+
+        # Close pgvector/Postgres GUI connection
+        self._disconnect_pgvector()
 
         self.root.destroy()
 

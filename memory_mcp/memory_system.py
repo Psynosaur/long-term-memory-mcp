@@ -2,7 +2,16 @@
 Core memory system module.
 
 Contains the RobustMemorySystem class that manages hybrid storage
-(SQLite + ChromaDB) and implements all memory operations.
+(pluggable database + pluggable vector backend) and implements all
+memory operations.
+
+Supported database backends:
+  - sqlite (default): Embedded SQLite with WAL mode
+  - postgres: PostgreSQL (shared with pgvector backend)
+
+Supported vector backends:
+  - chromadb (default): Embedded ChromaDB with on-disk persistence
+  - pgvector: PostgreSQL with the pgvector extension
 """
 
 from pathlib import Path
@@ -17,16 +26,17 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 
 # Third-party imports
-import chromadb
-from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 import tiktoken
 
 # Local imports
 from .models import MemoryRecord, SearchResult, Result
+from .database_backends.base import DatabaseBackend, DatabaseRow
+from .database_backends.sqlite import SQLiteDatabase
+from .vector_backends.base import VectorBackend
+from .vector_backends.chroma import ChromaBackend
 from .config import (
     DATA_FOLDER,
-    CHROMA_COLLECTION_NAME,
     EMBEDDING_MODEL,
     EMBEDDING_MODEL_CONFIG,
     DECAY_ENABLED,
@@ -47,12 +57,27 @@ from .config import (
 class RobustMemorySystem:
     """
     Hybrid memory system combining:
-    1. ChromaDB for semantic/vector search
-    2. SQLite for structured queries and metadata
+    1. Pluggable database backend (SQLite or PostgreSQL) for structured data
+    2. Pluggable vector backend (ChromaDB or pgvector) for semantic search
     3. JSON backup files for portability
+
+    Args:
+        data_folder: Root data directory for SQLite, backups, and ChromaDB
+                     (if using the ChromaDB/SQLite backends).
+        vector_backend: An already-constructed (but not yet initialized)
+                        VectorBackend instance.  If *None*, defaults to
+                        ChromaBackend pointed at ``data_folder/memory_db``.
+        database_backend: An already-constructed (but not yet initialized)
+                          DatabaseBackend instance.  If *None*, defaults to
+                          SQLiteDatabase at ``data_folder/memory_db/memories.db``.
     """
 
-    def __init__(self, data_folder: Path = DATA_FOLDER):
+    def __init__(
+        self,
+        data_folder: Path = DATA_FOLDER,
+        vector_backend: Optional[VectorBackend] = None,
+        database_backend: Optional[DatabaseBackend] = None,
+    ):
         self.data_folder = Path(data_folder)
         self.db_folder = self.data_folder / "memory_db"
         self.backup_folder = self.data_folder / "memory_backups"
@@ -64,9 +89,8 @@ class RobustMemorySystem:
 
         # Predeclare attributes for linters/type checkers
         self.logger = None  # will be set in _setup_logging
-        self.sqlite_conn = None  # will be set in _init_sqlite
-        self.chroma_client: Optional[object] = None
-        self.chroma_collection: Optional[object] = None
+        self.db: Optional[DatabaseBackend] = None  # will be set in _init_database
+        self.vector_backend: Optional[VectorBackend] = None
         self.embedding_model: Optional[object] = None
         self._query_prefix: str = ""  # set by _init_embeddings (e.g. BGE needs prefix)
         self.tokenizer: Optional[object] = None
@@ -75,8 +99,8 @@ class RobustMemorySystem:
         self._setup_logging()
 
         # Initialize components
-        self._init_sqlite()
-        self._init_chromadb()
+        self._init_database(database_backend)
+        self._init_vector_backend(vector_backend)
         self._init_embeddings()
         self._init_tokenizer()
 
@@ -110,143 +134,152 @@ class RobustMemorySystem:
 
         self.logger = logging.getLogger(__name__)
 
-    def _init_sqlite(self):
-        """Initialize SQLite database for structured data"""
+    def _init_database(self, backend: Optional[DatabaseBackend] = None):
+        """Initialize the pluggable structured-data backend.
+
+        If no backend is provided, defaults to SQLiteDatabase (the original
+        behaviour).  The backend's ``initialize()`` is called here, then
+        schema creation / migrations are run via the backend's execute methods.
+        """
+        if backend is None:
+            backend = SQLiteDatabase(db_path=self.sqlite_path)
+
         try:
-            self.sqlite_conn = sqlite3.connect(
-                str(self.sqlite_path), check_same_thread=False, timeout=30.0
-            )
-            self.sqlite_conn.row_factory = sqlite3.Row
-
-            self.sqlite_conn.execute("PRAGMA journal_mode=WAL;")
-            self.sqlite_conn.execute(
-                "PRAGMA wal_autocheckpoint=500;"
-            )  # checkpoint every 500 pgs
-            # SAFETY: synchronous=FULL ensures WAL data reaches disk before
-            # returning.  Prevents corruption on macOS sleep / sudden power loss.
-            # (WAL mode defaults to NORMAL which can lose committed data.)
-            self.sqlite_conn.execute("PRAGMA synchronous=FULL;")
-            self.sqlite_conn.commit()
-
-            # Create base tables (OK to have DEFAULT CURRENT_TIMESTAMP here for fresh DBs)
-            self.sqlite_conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS memories (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    content TEXT NOT NULL,  
-                    timestamp TEXT NOT NULL,  
-                    tags TEXT,  -- JSON array  
-                    importance INTEGER DEFAULT 5,  
-                    memory_type TEXT DEFAULT 'conversation',  
-                    metadata TEXT,  -- JSON object  
-                    content_hash TEXT,  
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,  
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,  
-                    last_accessed TEXT DEFAULT CURRENT_TIMESTAMP,
-                    token_count INTEGER DEFAULT 0
-                );  
-      
-                CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp);  
-                CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type);  
-                CREATE INDEX IF NOT EXISTS idx_importance ON memories(importance);  
-                CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash);  
-                CREATE TABLE IF NOT EXISTS memory_stats (  
-                    key TEXT PRIMARY KEY,  
-                    value TEXT,  
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP  
-                );  
-            """
-            )
-
-            # Migration: ensure last_accessed exists in existing DBs
-            cursor = self.sqlite_conn.execute("PRAGMA table_info(memories)")
-            columns = [row[1] for row in cursor.fetchall()]
-
-            if "last_accessed" not in columns:
-                self.logger.info(
-                    "Adding last_accessed column to existing memories table"
-                )
-                # 1) Add column WITHOUT default (avoids 'non-constant default' error)
-                self.sqlite_conn.execute(
-                    "ALTER TABLE memories ADD COLUMN last_accessed TEXT"
-                )
-
-                # 2) Backfill existing rows
-                now_iso = datetime.now(timezone.utc).isoformat()
-                self.sqlite_conn.execute(
-                    "UPDATE memories SET last_accessed = COALESCE(created_at, ?)",
-                    (now_iso,),
-                )
-
-                self.sqlite_conn.commit()
-
-            # Now that the column exists, create its index
-            self.sqlite_conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_last_accessed ON memories(last_accessed)"
-            )
-
-            # Migration: ensure token_count exists in existing DBs
-            if "token_count" not in columns:
-                self.logger.info("Adding token_count column to existing memories table")
-                # Add column without default
-                self.sqlite_conn.execute(
-                    "ALTER TABLE memories ADD COLUMN token_count INTEGER"
-                )
-
-                # Backfill existing rows with 0 (will be recalculated on next access)
-                self.sqlite_conn.execute(
-                    "UPDATE memories SET token_count = 0 WHERE token_count IS NULL"
-                )
-
-                self.sqlite_conn.commit()
-
-            # Schema version bookkeeping
-            self.sqlite_conn.execute(
-                "INSERT OR REPLACE INTO memory_stats (key, value, updated_at)"
-                "VALUES ('schema_version', '1.1', CURRENT_TIMESTAMP)"
-            )
-
-            # Normalize last_backup to an ISO UTC string
-            now_iso = datetime.now(timezone.utc).isoformat()
-            self.sqlite_conn.execute(
-                "INSERT OR REPLACE INTO memory_stats (key, value, updated_at)"
-                "VALUES ('last_backup', ?, ?)",
-                (now_iso, now_iso),
-            )
-
-            self.sqlite_conn.commit()
-            self.logger.info("SQLite database initialized successfully")
-
+            backend.initialize()
         except Exception as e:
-            self.logger.error("Failed to initialize SQLite: %s", e)
+            self.logger.error("Failed to initialize database backend: %s", e)
             raise
 
-    def _init_chromadb(self):
-        """Initialize ChromaDB for vector storage"""
+        # Only assign self.db after successful initialization AND schema
+        # creation.  If _create_schema() fails we close the backend so it
+        # doesn't leak connections.
         try:
-            # Use persistent storage
-            chroma_path = str(self.db_folder / "chroma_db")
-
-            self.chroma_client = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=Settings(anonymized_telemetry=False, allow_reset=True),
+            self.db = backend
+            self._create_schema()
+            self.logger.info(
+                "Database backend '%s' initialized successfully",
+                backend.backend_name,
             )
+        except Exception as e:
+            self.logger.error("Schema creation failed, closing backend: %s", e)
+            try:
+                backend.close()
+            except Exception:
+                pass
+            self.db = None
+            raise
 
-            # Use a stable collection name and cosine space
-            self.chroma_collection = self.chroma_client.get_or_create_collection(
-                name=CHROMA_COLLECTION_NAME,
-                metadata={
-                    "description": "Long-term memory for AI companion",
-                    "hnsw:space": "cosine",  # important for sentence embeddings
-                },
-                embedding_function=None,  # we pass embeddings manually
+    def _create_schema(self):
+        """Create base tables and run schema migrations.
+
+        Uses self.db (DatabaseBackend) so the same SQL works for both
+        SQLite and PostgreSQL (the backend handles dialect translation).
+        """
+        # Create base tables
+        self.db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                tags TEXT,
+                importance INTEGER DEFAULT 5,
+                memory_type TEXT DEFAULT 'conversation',
+                metadata TEXT,
+                content_hash TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_accessed TEXT DEFAULT CURRENT_TIMESTAMP,
+                token_count INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type);
+            CREATE INDEX IF NOT EXISTS idx_importance ON memories(importance);
+            CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash);
+            CREATE TABLE IF NOT EXISTS memory_stats (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+        """
+        )
+
+        # Migration: ensure last_accessed and token_count exist
+        # For Postgres, these columns exist from _create_schema above (fresh table).
+        # For SQLite, we need to check existing tables and ALTER if needed.
+        if self.db.backend_name == "sqlite":
+            self._run_sqlite_migrations()
+
+        # Create index on last_accessed (safe to re-run)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_last_accessed ON memories(last_accessed)"
+        )
+
+        # Schema version bookkeeping
+        self.db.execute(
+            "INSERT OR REPLACE INTO memory_stats (key, value, updated_at)"
+            "VALUES ('schema_version', '1.1', CURRENT_TIMESTAMP)",
+        )
+
+        # Normalize last_backup to an ISO UTC string
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self.db.execute(
+            "INSERT OR REPLACE INTO memory_stats (key, value, updated_at)"
+            "VALUES ('last_backup', ?, ?)",
+            (now_iso, now_iso),
+        )
+
+        self.db.commit()
+
+    def _run_sqlite_migrations(self):
+        """Run SQLite-specific column migrations for existing databases.
+
+        Only called when using the SQLite backend.  Adds columns that
+        may be missing from older schema versions.
+        """
+        # Check existing columns via PRAGMA (SQLite-only)
+        cursor = self.db.execute("PRAGMA table_info(memories)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if "last_accessed" not in columns:
+            self.logger.info("Adding last_accessed column to existing memories table")
+            self.db.execute("ALTER TABLE memories ADD COLUMN last_accessed TEXT")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            self.db.execute(
+                "UPDATE memories SET last_accessed = COALESCE(created_at, ?)",
+                (now_iso,),
             )
+            self.db.commit()
 
-            self.logger.info("ChromaDB initialized successfully")
+        if "token_count" not in columns:
+            self.logger.info("Adding token_count column to existing memories table")
+            self.db.execute("ALTER TABLE memories ADD COLUMN token_count INTEGER")
+            self.db.execute(
+                "UPDATE memories SET token_count = 0 WHERE token_count IS NULL"
+            )
+            self.db.commit()
+
+    def _init_vector_backend(self, backend: Optional[VectorBackend] = None):
+        """Initialize the pluggable vector storage backend.
+
+        If no backend is provided, defaults to ChromaDB (the original
+        behaviour).  The backend's ``initialize()`` is called here.
+        """
+        try:
+            if backend is None:
+                backend = ChromaBackend(db_folder=self.db_folder)
+
+            backend.initialize()
+            self.vector_backend = backend
+            self.logger.info(
+                "Vector backend '%s' initialized successfully",
+                backend.backend_name,
+            )
 
         except Exception as e:
-            self.logger.error("Failed to initialize ChromaDB: %s", e)
+            self.logger.error("Failed to initialize vector backend: %s", e)
             raise
 
     def _init_embeddings(self):
@@ -334,37 +367,37 @@ class RobustMemorySystem:
             return None
 
     def _integrity_check(self):
-        """Check data integrity of SQLite database and cross-check with ChromaDB"""
+        """Check data integrity of the database and cross-check with vector backend"""
         try:
-            # --- SQLite page-level integrity check ---
-            # This detects corruption in the B-tree structure, free-list, and
-            # WAL file.  Returns 'ok' on success or a list of problems.
-            ic_result = self.sqlite_conn.execute("PRAGMA integrity_check;").fetchone()
-            if ic_result and ic_result[0] != "ok":
-                self.logger.error("SQLite integrity_check FAILED: %s", ic_result[0])
-                # Surface the problem but don't raise — let the server start
-                # so the user can attempt a backup or repair.
+            # --- Database-level integrity check ---
+            problem = self.db.integrity_check()
+            if problem:
+                self.logger.error("Database integrity_check FAILED: %s", problem)
             else:
-                self.logger.info("SQLite integrity_check passed")
+                self.logger.info("Database integrity_check passed")
 
             # --- Record-count cross-check ---
-            cursor = self.sqlite_conn.execute("SELECT COUNT(*) FROM memories")
-            sqlite_count = cursor.fetchone()[0]
+            cursor = self.db.execute("SELECT COUNT(*) FROM memories")
+            db_count = cursor.fetchone()[0]
 
-            chroma_count = self.chroma_collection.count()
+            vector_count = self.vector_backend.count()
 
             self.logger.info(
-                "Integrity check: SQLite=%s, ChromaDB=%s",
-                sqlite_count,
-                chroma_count,
+                "Integrity check: %s=%s, %s=%s",
+                self.db.backend_name,
+                db_count,
+                self.vector_backend.backend_name,
+                vector_count,
             )
 
-            if sqlite_count != chroma_count:
+            if db_count != vector_count:
                 self.logger.warning(
-                    "Record count mismatch between SQLite (%d) and ChromaDB (%d). "
+                    "Record count mismatch between %s (%d) and %s (%d). "
                     "Run rebuild_vector_index to resync.",
-                    sqlite_count,
-                    chroma_count,
+                    self.db.backend_name,
+                    db_count,
+                    self.vector_backend.backend_name,
+                    vector_count,
                 )
 
         except Exception as e:
@@ -402,7 +435,7 @@ class RobustMemorySystem:
             token_count = self._count_tokens(content)
 
             # Check for duplicates
-            cursor = self.sqlite_conn.execute(
+            cursor = self.db.execute(
                 "SELECT id FROM memories WHERE content_hash = ?", (content_hash,)
             )
             if cursor.fetchone():
@@ -425,7 +458,7 @@ class RobustMemorySystem:
             # to have a SQLite row with no vector (detectable via count
             # mismatch and fixable with rebuild_vector_index) than an orphan
             # vector with no SQLite row (invisible and unfixable).
-            self.sqlite_conn.execute(
+            self.db.execute(
                 """
                 INSERT INTO memories 
                 (id, title, content, timestamp, tags, importance,
@@ -446,15 +479,15 @@ class RobustMemorySystem:
                     token_count,
                 ),
             )
-            self.sqlite_conn.commit()
+            self.db.commit()
 
-            # Generate embedding and store in ChromaDB
+            # Generate embedding and store in vector backend
             # Combine title and content for better semantic search
             text_for_embedding = f"{title}\n{content}"
             embedding = self.embedding_model.encode(text_for_embedding).tolist()
 
             try:
-                self.chroma_collection.add(
+                self.vector_backend.add(
                     ids=[record.id],
                     embeddings=[embedding],
                     documents=[text_for_embedding],
@@ -469,29 +502,23 @@ class RobustMemorySystem:
                     ],
                 )
 
-                try:
-                    if hasattr(self.chroma_client, "persist"):
-                        self.chroma_client.persist()
-                except Exception as pe:
-                    self.logger.warning("Chroma persist warning: %s", pe)
-
-                # Debug: check what Chroma actually contains after add
-                self.logger.info("Chroma after add: %s", self._debug_vector_index())
-            except Exception as chroma_err:
-                # ChromaDB write failed — roll back the SQLite insert so the
+                # Debug: check what the vector backend contains after add
+                self.logger.info(
+                    "Vector backend after add: %s", self._debug_vector_index()
+                )
+            except Exception as vec_err:
+                # Vector write failed — roll back the SQLite insert so the
                 # two stores stay in sync. The next call will retry both.
                 self.logger.error(
-                    "ChromaDB add failed for %s, rolling back SQLite insert: %s",
+                    "Vector backend add failed for %s, rolling back SQLite insert: %s",
                     record.id,
-                    chroma_err,
+                    vec_err,
                 )
-                self.sqlite_conn.execute(
-                    "DELETE FROM memories WHERE id = ?", (record.id,)
-                )
-                self.sqlite_conn.commit()
+                self.db.execute("DELETE FROM memories WHERE id = ?", (record.id,))
+                self.db.commit()
                 return Result(
                     success=False,
-                    reason=f"ChromaDB storage failed: {chroma_err}",
+                    reason=f"Vector storage failed: {vec_err}",
                 )
 
             # Trigger backup if needed
@@ -504,7 +531,7 @@ class RobustMemorySystem:
 
         except Exception as e:
             self.logger.error("Failed to store memory: %s", e)
-            self.sqlite_conn.rollback()
+            self.db.rollback()
             return Result(success=False, reason=f"Storage error: {str(e)}")
 
     def search_semantic(
@@ -517,9 +544,9 @@ class RobustMemorySystem:
             if not query.strip():
                 return Result(success=False, reason="Query cannot be empty")
 
-            # Debug: check what Chroma contains before query
+            # Debug: check what the vector backend contains before query
             self.logger.info(
-                "Chroma before query: %s",
+                "Vector backend before query: %s",
                 self._debug_vector_index(),
             )
 
@@ -530,18 +557,17 @@ class RobustMemorySystem:
             )
             query_embedding = self.embedding_model.encode(query_text).tolist()
 
-            # Search ChromaDB
-            results = self.chroma_collection.query(
-                query_embeddings=[query_embedding],
+            # Search vector backend
+            vec_results = self.vector_backend.query(
+                query_embedding=query_embedding,
                 n_results=limit,
-                include=["documents", "metadatas", "distances"],
             )
 
-            if not results["ids"][0]:
+            if not vec_results:
                 return Result(success=True, data=[])
 
-            ids = results["ids"][0]
-            distances = results["distances"][0]
+            ids = [r.id for r in vec_results]
+            distances = [r.distance for r in vec_results]
             similarities = [1.0 - d for d in distances]
 
             # Adaptive threshold anchored on top match, with clamps
@@ -585,7 +611,7 @@ class RobustMemorySystem:
                         threshold,
                     )
 
-                cursor = self.sqlite_conn.execute(
+                cursor = self.db.execute(
                     "SELECT * FROM memories WHERE id = ?", (memory_id,)
                 )
                 row = cursor.fetchone()
@@ -598,7 +624,7 @@ class RobustMemorySystem:
                 self._maybe_reinforce(row)
 
                 # Reinforcement
-                self.sqlite_conn.execute(
+                self.db.execute(
                     "UPDATE memories SET last_accessed = ? WHERE id = ?",
                     (now_iso, memory_id),
                 )
@@ -629,7 +655,7 @@ class RobustMemorySystem:
                 )
 
             # Commit the last_accessed updates
-            self.sqlite_conn.commit()
+            self.db.commit()
 
             # Sort by relevance
             search_results.sort(key=lambda x: x.relevance_score, reverse=True)
@@ -704,7 +730,7 @@ class RobustMemorySystem:
             """
             params.append(limit)
 
-            cursor = self.sqlite_conn.execute(query, params)
+            cursor = self.db.execute(query, params)
             rows = cursor.fetchall()
 
             # REINFORCEMENT: Update last_accessed for retrieved memories
@@ -713,11 +739,11 @@ class RobustMemorySystem:
 
             if memory_ids:
                 placeholders = ",".join(["?" for _ in memory_ids])
-                self.sqlite_conn.execute(
+                self.db.execute(
                     f"UPDATE memories SET last_accessed = ? WHERE id IN ({placeholders})",
                     [now_iso] + memory_ids,
                 )
-                self.sqlite_conn.commit()
+                self.db.commit()
 
             # Convert to MemoryRecord objects
             results = []
@@ -747,7 +773,7 @@ class RobustMemorySystem:
 
             # Batch-commit any decay/reinforcement writes from the loop above
             if rows:
-                self.sqlite_conn.commit()
+                self.db.commit()
 
             self.logger.info(
                 "Structured search returned %d results",
@@ -831,7 +857,7 @@ class RobustMemorySystem:
         """
         try:
             # Get existing record
-            cursor = self.sqlite_conn.execute(
+            cursor = self.db.execute(
                 "SELECT * FROM memories WHERE id = ?", (memory_id,)
             )
             row = cursor.fetchone()
@@ -883,12 +909,12 @@ class RobustMemorySystem:
 
             # Update SQLite
             update_query = f"UPDATE memories SET {', '.join(updates)} WHERE id = ?"
-            self.sqlite_conn.execute(update_query, params)
+            self.db.execute(update_query, params)
 
-            # Update ChromaDB if content changed
+            # Update vector backend if content changed
             if content is not None or title is not None:
                 # Get updated record
-                cursor = self.sqlite_conn.execute(
+                cursor = self.db.execute(
                     "SELECT * FROM memories WHERE id = ?", (memory_id,)
                 )
                 updated_row = cursor.fetchone()
@@ -897,8 +923,8 @@ class RobustMemorySystem:
                 text_for_embedding = f"{updated_row['title']}\n{updated_row['content']}"
                 embedding = self.embedding_model.encode(text_for_embedding).tolist()
 
-                # Update ChromaDB
-                self.chroma_collection.update(
+                # Update vector backend
+                self.vector_backend.update(
                     ids=[memory_id],
                     embeddings=[embedding],
                     documents=[text_for_embedding],
@@ -913,20 +939,14 @@ class RobustMemorySystem:
                     ],
                 )
 
-                try:
-                    if hasattr(self.chroma_client, "persist"):
-                        self.chroma_client.persist()
-                except Exception as pe:
-                    self.logger.warning("Chroma persist warning: %s", pe)
-
-            self.sqlite_conn.commit()
+            self.db.commit()
 
             self.logger.info("Memory updated successfully: %s", memory_id)
             return Result(success=True, data=[{"id": memory_id, "updated": True}])
 
         except Exception as e:
             self.logger.error("Failed to update memory: %s", e)
-            self.sqlite_conn.rollback()
+            self.db.rollback()
             return Result(success=False, reason=f"Update error: {str(e)}")
 
     def delete_memory(self, memory_id: str) -> Result:
@@ -935,7 +955,7 @@ class RobustMemorySystem:
         """
         try:
             # Check if exists
-            cursor = self.sqlite_conn.execute(
+            cursor = self.db.execute(
                 "SELECT title, content FROM memories WHERE id = ?", (memory_id,)
             )
             row = cursor.fetchone()
@@ -944,12 +964,12 @@ class RobustMemorySystem:
                 return Result(success=False, reason="Memory not found")
 
             # Delete from SQLite
-            self.sqlite_conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            self.db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
 
-            # Delete from ChromaDB
-            self.chroma_collection.delete(ids=[memory_id])
+            # Delete from vector backend
+            self.vector_backend.delete(ids=[memory_id])
 
-            self.sqlite_conn.commit()
+            self.db.commit()
 
             self.logger.info("Memory deleted successfully: %s", memory_id)
             return Result(
@@ -959,13 +979,13 @@ class RobustMemorySystem:
 
         except Exception as e:
             self.logger.error("Failed to delete memory: %s", e)
-            self.sqlite_conn.rollback()
+            self.db.rollback()
             return Result(success=False, reason=f"Delete error: {str(e)}")
 
     def get_statistics(self) -> Result:
         """Get memory system statistics"""
         try:
-            cursor = self.sqlite_conn.execute(
+            cursor = self.db.execute(
                 """
                 SELECT 
                     COUNT(*) as total_memories,
@@ -979,7 +999,7 @@ class RobustMemorySystem:
             stats = cursor.fetchone()
 
             # Get memory type breakdown
-            cursor = self.sqlite_conn.execute(
+            cursor = self.db.execute(
                 """
                 SELECT memory_type, COUNT(*) as count
                 FROM memories
@@ -992,14 +1012,8 @@ class RobustMemorySystem:
             }
 
             # Get database sizes
-            sqlite_size = (
-                self.sqlite_path.stat().st_size if self.sqlite_path.exists() else 0
-            )
-            chroma_size = sum(
-                f.stat().st_size
-                for f in (self.db_folder / "chroma_db").rglob("*")
-                if f.is_file()
-            )
+            db_size = self.db.storage_size_bytes()
+            vector_size = self.vector_backend.storage_size_bytes()
 
             result_data = {
                 "total_memories": stats["total_memories"],
@@ -1008,9 +1022,11 @@ class RobustMemorySystem:
                 "oldest_memory": stats["oldest_memory"],
                 "newest_memory": stats["newest_memory"],
                 "type_breakdown": type_breakdown,
-                "storage_size_mb": round((sqlite_size + chroma_size) / 1024 / 1024, 2),
-                "sqlite_size_mb": round(sqlite_size / 1024 / 1024, 2),
-                "chroma_size_mb": round(chroma_size / 1024 / 1024, 2),
+                "database_backend": self.db.backend_name,
+                "vector_backend": self.vector_backend.backend_name,
+                "storage_size_mb": round((db_size + vector_size) / 1024 / 1024, 2),
+                "db_size_mb": round(db_size / 1024 / 1024, 2),
+                "vector_size_mb": round(vector_size / 1024 / 1024, 2),
             }
 
             return Result(success=True, data=[result_data])
@@ -1023,7 +1039,7 @@ class RobustMemorySystem:
         """Trigger backup if conditions are met"""
         try:
             # Get last backup time (string)
-            cursor = self.sqlite_conn.execute(
+            cursor = self.db.execute(
                 "SELECT value FROM memory_stats WHERE key = 'last_backup'"
             )
             row = cursor.fetchone()
@@ -1053,7 +1069,7 @@ class RobustMemorySystem:
             ).total_seconds() / 3600.0
 
             # Backup every 24 hours or every 100 new memories
-            cursor = self.sqlite_conn.execute("SELECT COUNT(*) FROM memories")
+            cursor = self.db.execute("SELECT COUNT(*) FROM memories")
             total_memories = cursor.fetchone()[0]
 
             if hours_since_backup > 24 or (
@@ -1065,55 +1081,71 @@ class RobustMemorySystem:
             self.logger.error("Backup check failed: %s", e)
 
     def create_backup(self) -> Result:
-        """Create a complete backup of the memory system"""
+        """Create a complete backup of the memory system.
+
+        For SQLite: copies .db, WAL, SHM files and ChromaDB directory.
+        For Postgres: exports to JSON only (no file-level copies).
+        Both backends always produce a portable ``memories_export.json``.
+        """
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_name = f"memory_backup_{timestamp}"
             backup_path = self.backup_folder / backup_name
             backup_path.mkdir(exist_ok=True)
 
-            # ===== CHECKPOINT BEFORE BACKUP =====
-            # This merges the WAL into the main .db file and truncates the WAL
-            self.logger.warning("Starting backup: checkpointing WAL...")
-            try:
-                self.sqlite_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                self.sqlite_conn.commit()
-                self.logger.warning("WAL checkpoint completed")
-            except Exception as e:
-                self.logger.error("Checkpoint failed: %s", e)
-                # Continue anyway; we'll copy all files as fallback
+            # ===== SQLite-specific file backup =====
+            if not self.db.is_postgres:
+                # Checkpoint WAL before copying files
+                self.logger.warning("Starting backup: checkpointing WAL...")
+                try:
+                    self.db.checkpoint()
+                    self.logger.warning("WAL checkpoint completed")
+                except Exception as e:
+                    self.logger.error("Checkpoint failed: %s", e)
 
-            # Backup SQLite database + WAL files
-            # Copy main .db
-            sqlite_backup = backup_path / "memories.db"
-            shutil.copy2(self.sqlite_path, sqlite_backup)
+                # Copy main .db
+                sqlite_backup = backup_path / "memories.db"
+                shutil.copy2(self.sqlite_path, sqlite_backup)
 
-            # Copy WAL and SHM if they exist (belt-and-suspenders)
-            wal_path = Path(str(self.sqlite_path) + "-wal")
-            shm_path = Path(str(self.sqlite_path) + "-shm")
+                # Copy WAL and SHM if they exist (belt-and-suspenders)
+                wal_path = Path(str(self.sqlite_path) + "-wal")
+                shm_path = Path(str(self.sqlite_path) + "-shm")
 
-            if wal_path.exists():
-                shutil.copy2(wal_path, backup_path / "memories.db-wal")
-                self.logger.info("Copied WAL file to backup")
+                if wal_path.exists():
+                    shutil.copy2(wal_path, backup_path / "memories.db-wal")
+                    self.logger.info("Copied WAL file to backup")
 
-            if shm_path.exists():
-                shutil.copy2(shm_path, backup_path / "memories.db-shm")
-                self.logger.info("Copied SHM file to backup")
+                if shm_path.exists():
+                    shutil.copy2(shm_path, backup_path / "memories.db-shm")
+                    self.logger.info("Copied SHM file to backup")
 
-            # Backup ChromaDB
-            chroma_backup = backup_path / "chroma_db"
-            if (self.db_folder / "chroma_db").exists():
-                shutil.copytree(self.db_folder / "chroma_db", chroma_backup)
+            # Backup ChromaDB directory (only if using chromadb backend)
+            if self.vector_backend.backend_name == "chromadb":
+                chroma_backup = backup_path / "chroma_db"
+                if (self.db_folder / "chroma_db").exists():
+                    shutil.copytree(self.db_folder / "chroma_db", chroma_backup)
 
-            # Export to JSON for portability
-            cursor = self.sqlite_conn.execute(
-                "SELECT * FROM memories ORDER BY timestamp"
-            )
+            # Export to JSON for portability (works for all backends)
+            cursor = self.db.execute("SELECT * FROM memories ORDER BY timestamp")
             memories = []
             for row in cursor.fetchall():
-                memory_dict = dict(row)
-                memory_dict["tags"] = json.loads(memory_dict["tags"])
-                memory_dict["metadata"] = json.loads(memory_dict["metadata"])
+                memory_dict = dict(row.items()) if hasattr(row, "items") else dict(row)
+                try:
+                    memory_dict["tags"] = (
+                        json.loads(memory_dict["tags"])
+                        if memory_dict.get("tags")
+                        else []
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    memory_dict["tags"] = []
+                try:
+                    memory_dict["metadata"] = (
+                        json.loads(memory_dict["metadata"])
+                        if memory_dict.get("metadata")
+                        else {}
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    memory_dict["metadata"] = {}
                 memories.append(memory_dict)
 
             json_backup = backup_path / "memories_export.json"
@@ -1131,11 +1163,11 @@ class RobustMemorySystem:
 
             # Update backup timestamp
             now_iso = datetime.now(timezone.utc).isoformat()
-            self.sqlite_conn.execute(
+            self.db.execute(
                 "UPDATE memory_stats SET value = ?, updated_at = ? WHERE key = 'last_backup'",
                 (now_iso, now_iso),
             )
-            self.sqlite_conn.commit()
+            self.db.commit()
 
             # Clean old backups (keep last 10)
             backups = sorted(
@@ -1168,35 +1200,25 @@ class RobustMemorySystem:
 
     def close(self):
         """Clean shutdown of the memory system"""
+        # Close database backend
         try:
-            if hasattr(self, "sqlite_conn") and self.sqlite_conn:
-                try:
-                    self.sqlite_conn.commit()
-                except Exception:
-                    pass
+            if hasattr(self, "db") and self.db:
+                self.db.close()
+                self.db = None
+        except Exception as e:
+            if hasattr(self, "logger") and self.logger:
+                self.logger.warning("Error closing database backend: %s", e)
+            self.db = None
 
-                # WAL checkpoint: merge WAL into main db file before closing.
-                # TRUNCATE mode resets the WAL to zero bytes so no stale WAL
-                # is left behind (avoids data-in-WAL-but-not-in-db on restart).
-                try:
-                    self.sqlite_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                except Exception as e:
-                    if hasattr(self, "logger") and self.logger:
-                        self.logger.warning("WAL checkpoint on close failed: %s", e)
-
-                try:
-                    self.sqlite_conn.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # ChromaDB client doesn't need explicit close; make GC-friendly
+        # Close vector backend
         try:
-            if hasattr(self, "chroma_client"):
-                self.chroma_client = None
-        except Exception:
-            pass
+            if hasattr(self, "vector_backend") and self.vector_backend:
+                self.vector_backend.close()
+                self.vector_backend = None
+        except Exception as e:
+            if hasattr(self, "logger") and self.logger:
+                self.logger.warning("Error closing vector backend: %s", e)
+            self.vector_backend = None
 
         # Optional: free embedding model reference
         try:
@@ -1214,11 +1236,10 @@ class RobustMemorySystem:
     def _debug_vector_index(self, sample: int = 5):
         """Debug helper to inspect vector index contents"""
         try:
-            count = self.chroma_collection.count()
-            data = self.chroma_collection.get(
-                include=["documents", "metadatas"], limit=sample
-            )
+            count = self.vector_backend.count()
+            data = self.vector_backend.get(limit=sample)
             return {
+                "backend": self.vector_backend.backend_name,
                 "count": count,
                 "ids": data.get("ids", []),
                 "have_documents": bool(data.get("documents")),
@@ -1229,9 +1250,9 @@ class RobustMemorySystem:
 
     def rebuild_vector_index(self, batch_size: int = 128) -> Result:
         """
-        Rebuilds the ChromaDB vector index from all SQLite memories.
+        Rebuilds the vector index from all SQLite memories.
 
-        Clears the existing vector collection and re-embeds all memories
+        Clears the existing vector collection/table and re-embeds all memories
         from the SQLite database in batches to avoid memory issues.
 
         Args:
@@ -1246,29 +1267,10 @@ class RobustMemorySystem:
                   total count of memories indexed.
         """
         try:
-            # Wipe collection by deleting and recreating it.
-            # Note: delete(where={}) is unreliable in some ChromaDB versions
-            # and can leave orphaned vectors, so we drop the whole collection.
-            try:
-                self.chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
-            except Exception as e:
-                self.logger.warning("Chroma drop collection warning: %s", e)
+            # Wipe the collection / table via the backend abstraction
+            self.vector_backend.reset_collection()
 
-            # Invalidate the stale reference so that a failure in
-            # get_or_create_collection leaves the system in a clearly
-            # broken state rather than pointing at a deleted collection.
-            self.chroma_collection = None
-
-            self.chroma_collection = self.chroma_client.get_or_create_collection(
-                name=CHROMA_COLLECTION_NAME,
-                metadata={
-                    "description": "Long-term memory for AI companion",
-                    "hnsw:space": "cosine",
-                },
-                embedding_function=None,
-            )
-
-            rows = self.sqlite_conn.execute(
+            rows = self.db.execute(
                 "SELECT id, title, content, timestamp, importance, memory_type, "
                 "tags FROM memories ORDER BY timestamp ASC"
             ).fetchall()
@@ -1291,25 +1293,21 @@ class RobustMemorySystem:
                 )
 
                 if len(ids) >= batch_size:
-                    self.chroma_collection.add(
+                    self.vector_backend.add(
                         ids=ids, embeddings=embs, documents=docs, metadatas=metas
                     )
                     ids, embs, docs, metas = [], [], [], []
 
             if ids:
-                self.chroma_collection.add(
+                self.vector_backend.add(
                     ids=ids, embeddings=embs, documents=docs, metadatas=metas
                 )
 
-            try:
-                if hasattr(self.chroma_client, "persist"):
-                    self.chroma_client.persist()
-            except Exception as pe:
-                self.logger.warning("Chroma persist warning: %s", pe)
+            self.vector_backend.persist()
 
             return Result(
                 success=True,
-                data=[{"reindexed": True, "count": self.chroma_collection.count()}],
+                data=[{"reindexed": True, "count": self.vector_backend.count()}],
             )
         except Exception as e:
             self.logger.error("Reindex failed: %s", e)
@@ -1441,7 +1439,7 @@ class RobustMemorySystem:
 
             # Persist decay to DB (caller is responsible for commit)
             meta["last_decay_at"] = datetime.now(timezone.utc).isoformat()
-            self.sqlite_conn.execute(
+            self.db.execute(
                 "UPDATE memories SET importance = ?, metadata = ? WHERE id = ?",
                 (decayed, json.dumps(meta), mem_id),
             )
@@ -1496,7 +1494,7 @@ class RobustMemorySystem:
                 )
                 meta["reinforcement_accum"] = 0.0  # reset accumulator
 
-                self.sqlite_conn.execute(
+                self.db.execute(
                     "UPDATE memories SET importance = ?, metadata = ? WHERE id = ?",
                     (new_importance, json.dumps(meta), mem_id),
                 )
@@ -1514,7 +1512,7 @@ class RobustMemorySystem:
 
             # No writeback yet: just save accumulator (caller commits)
             meta["reinforcement_accum"] = accum
-            self.sqlite_conn.execute(
+            self.db.execute(
                 "UPDATE memories SET metadata = ? WHERE id = ?",
                 (json.dumps(meta), mem_id),
             )
@@ -1658,26 +1656,20 @@ class RobustMemorySystem:
 
             source_memories = cursor.fetchall()
 
-            # Connect to source ChromaDB if available
-            source_chroma_client = None
-            source_chroma_collection = None
+            # Connect to source ChromaDB if available (for reading vectors)
+            source_chroma_backend = None
             if source_chroma_path:
                 try:
-                    source_chroma_client = chromadb.PersistentClient(
-                        path=str(source_chroma_path),
-                        settings=Settings(
-                            anonymized_telemetry=False, allow_reset=False
-                        ),
+                    source_chroma_backend = ChromaBackend(
+                        db_folder=source_chroma_path.parent
                     )
-                    source_chroma_collection = source_chroma_client.get_collection(
-                        CHROMA_COLLECTION_NAME
-                    )
+                    source_chroma_backend.initialize()
                     self.logger.info(
                         f"Connected to source ChromaDB at {source_chroma_path}"
                     )
                 except Exception as e:
                     self.logger.warning(f"Could not connect to source ChromaDB: {e}")
-                    source_chroma_collection = None
+                    source_chroma_backend = None
 
             # Migration statistics
             stats = {
@@ -1696,7 +1688,7 @@ class RobustMemorySystem:
 
                     # Check for duplicates if requested
                     if skip_duplicates and content_hash:
-                        existing = self.sqlite_conn.execute(
+                        existing = self.db.execute(
                             "SELECT id FROM memories WHERE content_hash = ?",
                             (content_hash,),
                         ).fetchone()
@@ -1707,7 +1699,7 @@ class RobustMemorySystem:
                             continue
 
                     # Insert into SQLite
-                    self.sqlite_conn.execute(
+                    self.db.execute(
                         """
                         INSERT INTO memories 
                         (id, title, content, timestamp, tags, importance, memory_type, 
@@ -1737,18 +1729,18 @@ class RobustMemorySystem:
                         ),
                     )
 
-                    # Migrate vector from ChromaDB if available
-                    if source_chroma_collection:
+                    # Migrate vector if source backend is available
+                    if source_chroma_backend:
                         try:
                             # Get the vector from source ChromaDB
-                            result = source_chroma_collection.get(
+                            result = source_chroma_backend.get(
                                 ids=[memory_id],
-                                include=["embeddings", "documents", "metadatas"],
+                                include_embeddings=True,
                             )
 
                             if result["ids"] and len(result["ids"]) > 0:
-                                # Add to destination ChromaDB
-                                self.chroma_collection.add(
+                                # Add to destination vector backend
+                                self.vector_backend.add(
                                     ids=result["ids"],
                                     embeddings=result["embeddings"],
                                     documents=result["documents"],
@@ -1776,7 +1768,7 @@ class RobustMemorySystem:
                     continue
 
             # Commit all changes
-            self.sqlite_conn.commit()
+            self.db.commit()
 
             # Close source connection
             source_conn.close()
