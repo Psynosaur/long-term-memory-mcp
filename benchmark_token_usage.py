@@ -220,11 +220,17 @@ def load_all_memories_raw(ms: RobustMemorySystem) -> list:
     Load all memories directly from SQLite, skipping corrupt rows.
     This avoids the isoformat parsing issue in search_structured().
     """
-    cursor = ms.sqlite_conn.execute(
+    cursor = ms.db.execute(
         "SELECT id, title, content, timestamp, tags, importance, memory_type, metadata "
         "FROM memories ORDER BY importance DESC, timestamp DESC"
     )
-    rows = cursor.fetchall()
+    rows = (
+        cursor.fetchall()
+        if hasattr(cursor, "fetchall")
+        else list(cursor)
+        if cursor
+        else []
+    )
     memories = []
     skipped = 0
     for row in rows:
