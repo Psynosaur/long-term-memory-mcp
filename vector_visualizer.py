@@ -959,6 +959,101 @@ _DARK_CSS = """
     .tag-selector-value-count {
         color: #aaa !important;
     }
+
+    /* ── Reduction method dropdown ──────────────────────────── */
+    .method-dropdown {
+        width: 90px;
+        flex-shrink: 0;
+    }
+
+    /* ── Loading spinner overlay ─────────────────────────────── */
+    .graph-loading-wrapper {
+        height: calc(100vh - 38px);
+        position: relative;
+    }
+    /* Keep the graph visible underneath — override Dash default hide */
+    .graph-loading-wrapper > div[class*="dash-loading"] {
+        position: absolute !important;
+        top: 0; left: 0; right: 0; bottom: 0;
+        z-index: 999;
+        pointer-events: none;
+    }
+    .graph-loading-wrapper > div[class*="dash-loading"] > div {
+        visibility: visible !important;
+        opacity: 1 !important;
+    }
+    /* The spinner itself — centered on top of the graph */
+    .graph-loading-wrapper .dash-spinner,
+    .graph-loading-wrapper ._dash-loading-callback {
+        position: absolute !important;
+        top: 50% !important;
+        left: 50% !important;
+        transform: translate(-50%, -50%) !important;
+        z-index: 1000;
+    }
+    /* Prevent Dash from hiding graph children during load */
+    .graph-loading-wrapper .dash-graph--pending,
+    .graph-loading-wrapper [data-dash-is-loading="true"] > .js-plotly-plot {
+        visibility: visible !important;
+        opacity: 1 !important;
+    }
+
+    /* ── Cluster stats overlay panel ─────────────────────────── */
+    .cluster-stats-panel {
+        position: fixed;
+        bottom: 12px;
+        right: 12px;
+        background: rgba(18, 18, 30, 0.92);
+        border: 1px solid #3a3a4a;
+        border-radius: 6px;
+        padding: 10px 14px;
+        font-family: 'SF Mono', 'Consolas', 'Courier New', monospace;
+        font-size: 11px;
+        color: #b0b0c0;
+        line-height: 1.6;
+        z-index: 1000;
+        pointer-events: auto;
+        min-width: 280px;
+        max-width: 360px;
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+    }
+    .cluster-stats-panel .stats-title {
+        color: #d0d0e0;
+        font-size: 12px;
+        font-weight: 600;
+        margin-bottom: 6px;
+        border-bottom: 1px solid #2a2a3a;
+        padding-bottom: 4px;
+    }
+    .cluster-stats-panel .stat-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 1px 0;
+    }
+    .cluster-stats-panel .stat-label {
+        color: #888;
+    }
+    .cluster-stats-panel .stat-value {
+        color: #c8c8e0;
+        font-weight: 500;
+    }
+    .cluster-stats-panel .stat-value.good {
+        color: #38BE70;
+    }
+    .cluster-stats-panel .stat-value.moderate {
+        color: #F4B042;
+    }
+    .cluster-stats-panel .stat-value.bad {
+        color: #DC4E4E;
+    }
+    .cluster-stats-panel .stat-warning {
+        margin-top: 6px;
+        padding-top: 4px;
+        border-top: 1px solid #2a2a3a;
+        font-size: 10px;
+        color: #999;
+        font-style: italic;
+    }
 """
 
 
@@ -994,6 +1089,289 @@ def _project_new_vectors(high_d: np.ndarray) -> np.ndarray:
     # Normalise into the same unit-cube
     pts = (pts - raw_min) / span
     return pts.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Cluster / density metrics for the 384D embedding space
+# ---------------------------------------------------------------------------
+
+
+def _compute_cluster_stats(embeddings: np.ndarray) -> Dict[str, Any]:
+    """Compute density and clustering metrics on the raw high-D embeddings.
+
+    All metrics are computed in the original embedding space (e.g. 384D),
+    NOT in the projected 3D space.  This gives an honest picture of how
+    tightly packed the vectors are and therefore how reliable top-K
+    nearest-neighbour searches will be.
+
+    Returns a dict with:
+        n_vectors:        number of vectors
+        dimensions:       embedding dimensionality
+        avg_cosine_sim:   mean pairwise cosine similarity (0-1, higher = denser)
+        std_cosine_sim:   std dev of pairwise similarities
+        min_cosine_sim:   minimum pairwise similarity
+        max_cosine_sim:   maximum pairwise similarity
+        hopkins:          Hopkins statistic (0.5 = uniform, >0.7 = clusterable)
+        silhouette:       silhouette score from KMeans auto-clustering (-1 to 1)
+        n_clusters:       number of clusters used for silhouette
+        nn_gap_ratio:     median ratio of (dist_rank2 - dist_rank1) / dist_rank1
+                          (higher = clearer separation between nearest and 2nd nearest)
+        top_k_warning:    human-readable assessment of top-K reliability
+    """
+    n, d = embeddings.shape
+    stats: Dict[str, Any] = {"n_vectors": n, "dimensions": d}
+
+    if n < 3:
+        stats.update(
+            {
+                "avg_cosine_sim": None,
+                "std_cosine_sim": None,
+                "min_cosine_sim": None,
+                "max_cosine_sim": None,
+                "hopkins": None,
+                "silhouette": None,
+                "n_clusters": None,
+                "nn_gap_ratio": None,
+                "top_k_warning": "Too few vectors for analysis",
+            }
+        )
+        return stats
+
+    t0 = time.perf_counter()
+
+    # ── Pairwise cosine similarity ───────────────────────────────
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-10)
+    normed = embeddings / norms
+    # (N, N) similarity matrix — use float32 to keep memory reasonable
+    sim_matrix = normed @ normed.T
+    # Extract upper triangle (excluding diagonal)
+    triu_idx = np.triu_indices(n, k=1)
+    pairwise_sims = sim_matrix[triu_idx]
+
+    stats["avg_cosine_sim"] = round(float(np.mean(pairwise_sims)), 4)
+    stats["std_cosine_sim"] = round(float(np.std(pairwise_sims)), 4)
+    stats["min_cosine_sim"] = round(float(np.min(pairwise_sims)), 4)
+    stats["max_cosine_sim"] = round(float(np.max(pairwise_sims)), 4)
+
+    # ── Hopkins statistic (clustering tendency) ──────────────────
+    # Sample m points from the dataset.  For each, find the nearest
+    # neighbour distance.  Also generate m random points in the data's
+    # bounding box and find their nearest real-point distance.
+    # H = sum(rand_nn) / (sum(rand_nn) + sum(data_nn))
+    # H ~ 0.5 => uniform, H > 0.7 => clusterable.
+    try:
+        from sklearn.neighbors import NearestNeighbors
+
+        m = min(50, n // 2)  # sample size
+        rng = np.random.RandomState(42)
+        sample_idx = rng.choice(n, size=m, replace=False)
+        sample = embeddings[sample_idx]
+
+        # Fit NN on all points
+        nn = NearestNeighbors(n_neighbors=2, metric="cosine")
+        nn.fit(embeddings)
+        # Distance to nearest neighbour for sampled real points
+        # (k=2 because the point itself is distance 0)
+        dists_real, _ = nn.kneighbors(sample)
+        data_nn = dists_real[:, 1]  # second column = nearest OTHER point
+
+        # Generate random points in the bounding box
+        mins = embeddings.min(axis=0)
+        maxs = embeddings.max(axis=0)
+        random_pts = rng.uniform(mins, maxs, size=(m, d)).astype(np.float32)
+        dists_rand, _ = nn.kneighbors(random_pts)
+        rand_nn = dists_rand[:, 0]  # nearest real point to each random point
+
+        sum_rand = float(np.sum(rand_nn))
+        sum_data = float(np.sum(data_nn))
+        hopkins = sum_rand / (sum_rand + sum_data) if (sum_rand + sum_data) > 0 else 0.5
+        stats["hopkins"] = round(hopkins, 4)
+    except Exception as exc:
+        log.warning("Hopkins statistic failed: %s", exc)
+        stats["hopkins"] = None
+
+    # ── Silhouette score (auto-clustered via KMeans) ─────────────
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import silhouette_score
+
+        # Try a few k values, pick the one with the best silhouette
+        best_sil = -2.0
+        best_k = 2
+        max_k = min(10, n - 1)
+        for k in range(2, max_k + 1):
+            km = KMeans(n_clusters=k, random_state=42, n_init=5, max_iter=100)
+            labels = km.fit_predict(embeddings)
+            sil = silhouette_score(
+                embeddings, labels, metric="cosine", sample_size=min(300, n)
+            )
+            if sil > best_sil:
+                best_sil = sil
+                best_k = k
+        stats["silhouette"] = round(float(best_sil), 4)
+        stats["n_clusters"] = best_k
+    except Exception as exc:
+        log.warning("Silhouette score failed: %s", exc)
+        stats["silhouette"] = None
+        stats["n_clusters"] = None
+
+    # ── Nearest-neighbour gap ratio ──────────────────────────────
+    # For each point, compute distance to rank-1 and rank-2 neighbours.
+    # gap_ratio = (d2 - d1) / d1.  High ratio means rank-1 is clearly
+    # closer than rank-2, so top-K retrieval is discriminative.
+    try:
+        from sklearn.neighbors import NearestNeighbors as _NN3
+
+        nn3 = _NN3(n_neighbors=3, metric="cosine")
+        nn3.fit(embeddings)
+        dists_all, _ = nn3.kneighbors(embeddings)
+        d1 = dists_all[:, 1]  # nearest other
+        d2 = dists_all[:, 2]  # 2nd nearest
+        # Avoid division by zero
+        safe_d1 = np.maximum(d1, 1e-10)
+        gap_ratios = (d2 - d1) / safe_d1
+        stats["nn_gap_ratio"] = round(float(np.median(gap_ratios)), 4)
+    except Exception as exc:
+        log.warning("NN gap ratio failed: %s", exc)
+        stats["nn_gap_ratio"] = None
+
+    # ── Top-K reliability assessment ─────────────────────────────
+    avg_sim = stats.get("avg_cosine_sim", 0) or 0
+    hopkins_val = stats.get("hopkins", 0.5) or 0.5
+    sil_val = stats.get("silhouette", 0) or 0
+    gap = stats.get("nn_gap_ratio", 0) or 0
+
+    if avg_sim > 0.85:
+        warning = "Dense: vectors tightly packed, top-K results may be noisy"
+    elif avg_sim > 0.7:
+        warning = "Moderate: some discrimination, threshold tuning recommended"
+    elif avg_sim > 0.5:
+        warning = "Good: reasonable separation for top-K retrieval"
+    else:
+        warning = "Excellent: well-separated vectors, top-K highly reliable"
+
+    if hopkins_val < 0.55:
+        warning += " | No natural clusters"
+    elif hopkins_val > 0.75:
+        warning += " | Strong clustering tendency"
+
+    stats["top_k_warning"] = warning
+
+    elapsed = time.perf_counter() - t0
+    log.info(
+        "Cluster stats computed in %.2fs: avg_sim=%.4f, hopkins=%.4f, "
+        "silhouette=%.4f (k=%s), nn_gap=%.4f",
+        elapsed,
+        stats.get("avg_cosine_sim", 0),
+        stats.get("hopkins", 0),
+        stats.get("silhouette", 0),
+        stats.get("n_clusters"),
+        stats.get("nn_gap_ratio", 0),
+    )
+    return stats
+
+
+def _build_stats_panel_children() -> list:
+    """Build Dash HTML children for the cluster stats overlay panel.
+
+    Reads from ``_embeddings_cache`` (populated by ``_fetch_and_build``).
+    Returns a list of ``html.Div`` elements ready to drop into the panel.
+    """
+    from dash import html as _html
+
+    emb = _embeddings_cache.get("embeddings")
+    if emb is None or len(emb) < 3:
+        return [_html.Div("Not enough vectors for analysis", className="stat-warning")]
+
+    try:
+        stats = _compute_cluster_stats(emb)
+    except Exception as exc:
+        log.error("Cluster stats computation failed: %s", exc, exc_info=True)
+        return [_html.Div(f"Stats error: {exc}", className="stat-warning")]
+
+    def _row(label: str, value, css_class: str = "") -> Any:
+        return _html.Div(
+            className="stat-row",
+            children=[
+                _html.Span(label, className="stat-label"),
+                _html.Span(
+                    str(value) if value is not None else "n/a",
+                    className=f"stat-value {css_class}".strip(),
+                ),
+            ],
+        )
+
+    # Colour-code the average similarity
+    avg_sim = stats.get("avg_cosine_sim")
+    if avg_sim is not None:
+        if avg_sim > 0.85:
+            sim_class = "bad"
+        elif avg_sim > 0.7:
+            sim_class = "moderate"
+        else:
+            sim_class = "good"
+    else:
+        sim_class = ""
+
+    # Colour-code the silhouette score
+    sil = stats.get("silhouette")
+    if sil is not None:
+        if sil > 0.4:
+            sil_class = "good"
+        elif sil > 0.15:
+            sil_class = "moderate"
+        else:
+            sil_class = "bad"
+    else:
+        sil_class = ""
+
+    # Colour-code Hopkins
+    hop = stats.get("hopkins")
+    if hop is not None:
+        if hop > 0.75:
+            hop_class = "good"
+        elif hop > 0.6:
+            hop_class = "moderate"
+        else:
+            hop_class = "bad"
+    else:
+        hop_class = ""
+
+    # Colour-code NN gap
+    gap = stats.get("nn_gap_ratio")
+    if gap is not None:
+        if gap > 0.3:
+            gap_class = "good"
+        elif gap > 0.1:
+            gap_class = "moderate"
+        else:
+            gap_class = "bad"
+    else:
+        gap_class = ""
+
+    rows = [
+        _row("Vectors", f"{stats['n_vectors']} x {stats['dimensions']}D"),
+        _row("Avg Cosine Sim", avg_sim, sim_class),
+        _row(
+            "Sim Range",
+            f"{stats.get('min_cosine_sim', '?')} .. {stats.get('max_cosine_sim', '?')}",
+        ),
+        _row("Std Dev", stats.get("std_cosine_sim")),
+        _row("Hopkins Stat", hop, hop_class),
+        _row(
+            "Silhouette",
+            f"{sil} (k={stats.get('n_clusters', '?')})" if sil is not None else None,
+            sil_class,
+        ),
+        _row("NN Gap Ratio", gap, gap_class),
+    ]
+
+    warning_text = stats.get("top_k_warning", "")
+    if warning_text:
+        rows.append(_html.Div(warning_text, className="stat-warning"))
+
+    return rows
 
 
 def _fetch_and_build(
@@ -1256,8 +1634,10 @@ def run_dash_app(
             dcc.Store(id="expanded-memories", data=[], storage_type="memory"),
             dcc.Store(id="query-active", data=False, storage_type="memory"),
             dcc.Store(id="query-match-ids", data=[], storage_type="memory"),
+            dcc.Store(id="query-expanded-ids", data=[], storage_type="memory"),
             dcc.Store(id="lines-visible", data=True, storage_type="memory"),
             dcc.Store(id="word-paths-visible", data=False, storage_type="memory"),
+            dcc.Store(id="words-visible", data=True, storage_type="memory"),
             html.Div(
                 className="tag-bar",
                 children=[
@@ -1297,11 +1677,32 @@ def run_dash_app(
                                 className="query-limit",
                             ),
                             html.Button(
+                                "Clear",
+                                id="clear-search-btn",
+                                n_clicks=0,
+                                className="query-words-btn",
+                                title="Clear semantic search and query-expanded words",
+                            ),
+                            html.Button(
                                 "Query Words",
                                 id="query-expand-words-btn",
                                 n_clicks=0,
                                 className="query-words-btn",
                                 title="Expand word vectors for query matches",
+                            ),
+                            html.Button(
+                                "Words",
+                                id="toggle-words-visible-btn",
+                                n_clicks=0,
+                                className="query-words-btn active",
+                                title="Show / hide all word projections",
+                            ),
+                            html.Button(
+                                "Reset",
+                                id="reset-words-btn",
+                                n_clicks=0,
+                                className="query-words-btn",
+                                title="Collapse and remove all expanded words",
                             ),
                             html.Button(
                                 "Lines",
@@ -1330,6 +1731,27 @@ def run_dash_app(
                         ],
                     ),
                     html.Span(
+                        "  |  ",
+                        style={"color": "#444", "marginLeft": "8px"},
+                    ),
+                    html.Div(
+                        className="method-dropdown",
+                        children=[
+                            dcc.Dropdown(
+                                id="reduction-method",
+                                options=[
+                                    {"label": "PCA", "value": "pca"},
+                                    {"label": "t-SNE", "value": "tsne"},
+                                    {"label": "UMAP", "value": "umap"},
+                                ],
+                                value=method,
+                                multi=False,
+                                searchable=False,
+                                clearable=False,
+                            ),
+                        ],
+                    ),
+                    html.Span(
                         "  |  Click point to expand words",
                         style={
                             "color": "#666",
@@ -1340,16 +1762,34 @@ def run_dash_app(
                     ),
                 ],
             ),
-            dcc.Graph(
-                id="scatter-3d",
-                figure={},
-                style={"height": "calc(100vh - 38px)"},
-                responsive=True,
-                config=dict(
-                    displayModeBar=True,
-                    displaylogo=False,
-                    scrollZoom=True,
-                ),
+            dcc.Loading(
+                id="graph-loading",
+                type="circle",
+                color="#6a8aba",
+                delay_show=300,
+                overlay_style={"visibility": "visible", "opacity": 0.5},
+                className="graph-loading-wrapper",
+                children=[
+                    dcc.Graph(
+                        id="scatter-3d",
+                        figure={},
+                        style={"height": "calc(100vh - 38px)"},
+                        responsive=True,
+                        config=dict(
+                            displayModeBar=True,
+                            displaylogo=False,
+                            scrollZoom=True,
+                        ),
+                    ),
+                ],
+            ),
+            html.Div(
+                id="cluster-stats",
+                className="cluster-stats-panel",
+                children=[
+                    html.Div("Vector Space Density", className="stats-title"),
+                    html.Div("Loading...", id="cluster-stats-body"),
+                ],
             ),
         ]
     )
@@ -1370,7 +1810,12 @@ def run_dash_app(
         Output("tag-selector", "value"),
         Output("figure-meta", "data"),
         Output("expanded-memories", "data"),
+        Output("cluster-stats-body", "children"),
+        Output("query-active", "data", allow_duplicate=True),
+        Output("query-match-ids", "data", allow_duplicate=True),
+        Output("query-expanded-ids", "data", allow_duplicate=True),
         Input("url", "pathname"),
+        prevent_initial_call="initial_duplicate",
     )
     def on_page_load(_pathname):
         """Re-fetch vectors from the database on every page load."""
@@ -1419,6 +1864,9 @@ def run_dash_app(
             "memory_texts": memory_texts,
         }
 
+        # Compute cluster / density stats from cached 384D embeddings
+        stats_children = _build_stats_panel_children()
+
         log.debug(
             "CB1 on_page_load: done — n_scatter=%d, tags=%d, texts=%d, "
             "fig traces=%d, expanded=[], dedup reset",
@@ -1427,7 +1875,7 @@ def run_dash_app(
             len(memory_texts),
             len(fig.get("data", [])) if isinstance(fig, dict) else -1,
         )
-        return fig, tag_options, [], meta, []
+        return fig, tag_options, [], meta, [], stats_children, False, [], []
 
     # ── Callback 2: tag selection -> toggle line visibility ─────
     @app.callback(
@@ -1706,6 +2154,7 @@ def run_dash_app(
         Output("scatter-3d", "figure", allow_duplicate=True),
         Output("expanded-memories", "data", allow_duplicate=True),
         Output("query-expand-words-btn", "className"),
+        Output("query-expanded-ids", "data", allow_duplicate=True),
         Input("query-expand-words-btn", "n_clicks"),
         State("scatter-3d", "figure"),
         State("figure-meta", "data"),
@@ -1714,6 +2163,7 @@ def run_dash_app(
         State("lines-visible", "data"),
         State("word-paths-visible", "data"),
         State("word-path-min-input", "value"),
+        State("query-expanded-ids", "data"),
         prevent_initial_call=True,
     )
     def toggle_query_words(
@@ -1725,6 +2175,7 @@ def run_dash_app(
         lines_visible,
         paths_visible,
         wp_threshold,
+        prev_query_expanded,
     ):
         log.debug(
             "CB5 toggle_query_words: n_clicks=%s, match_ids=%s, expanded=%s, "
@@ -1749,7 +2200,7 @@ def run_dash_app(
                     _n_clicks,
                     _words_last_click,
                 )
-                return no_update, no_update, no_update
+                return no_update, no_update, no_update, no_update
             _words_last_click = _n_clicks if _n_clicks is not None else 0
             log.debug("CB5: dedup passed, updated last_click=%s", _words_last_click)
 
@@ -1760,7 +2211,7 @@ def run_dash_app(
                 bool(current_fig),
                 match_ids,
             )
-            return no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update
 
         if expanded is None:
             expanded = []
@@ -1827,7 +2278,7 @@ def run_dash_app(
                 len(path_traces),
                 len(new_expanded),
             )
-            return patched, new_expanded, "query-words-btn"
+            return patched, new_expanded, "query-words-btn", []
 
         # ── Expand: generate word traces for all matched memories ──
         memory_texts = meta.get("memory_texts", {})
@@ -1902,7 +2353,7 @@ def run_dash_app(
 
         if new_expanded == expanded:
             log.debug("CB5: nothing new expanded, returning no_update")
-            return no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update
 
         # Rebuild word-path traces with updated registry
         wp_visible = paths_visible if paths_visible is not None else False
@@ -1915,7 +2366,14 @@ def run_dash_app(
             len(new_expanded),
             len(path_traces),
         )
-        return patched, new_expanded, "query-words-btn active"
+        # Track which IDs were actually expanded by this query-words action
+        # (not already expanded by click). Used by Clear Search.
+        newly_expanded_by_query = [m for m in new_expanded if m not in expanded]
+        # Merge with any previously query-expanded IDs still alive
+        all_query_expanded = list(
+            set((prev_query_expanded or []) + newly_expanded_by_query)
+        )
+        return patched, new_expanded, "query-words-btn active", all_query_expanded
 
     # ── Callback 6: toggle all connection lines on / off ────────
     @app.callback(
@@ -2127,6 +2585,254 @@ def run_dash_app(
             _threshold,
         )
         return patched
+
+    # ── Callback 9: toggle all word projections on / off ─────────
+    @app.callback(
+        Output("scatter-3d", "figure", allow_duplicate=True),
+        Output("words-visible", "data"),
+        Output("toggle-words-visible-btn", "className"),
+        Input("toggle-words-visible-btn", "n_clicks"),
+        State("scatter-3d", "figure"),
+        State("words-visible", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_all_words(_n_clicks, current_fig, currently_visible):
+        log.debug(
+            "CB9 toggle_all_words: n_clicks=%s, currently_visible=%s",
+            _n_clicks,
+            currently_visible,
+        )
+        if not current_fig:
+            return no_update, no_update, no_update
+
+        new_visible = not currently_visible
+        patched = Patch()
+
+        word_count = 0
+        for i, trace in enumerate(current_fig.get("data", [])):
+            lg = trace.get("legendgroup", "")
+            if lg.startswith("words:"):
+                patched["data"][i]["visible"] = new_visible
+                word_count += 1
+
+        log.debug("CB9: toggled %d word traces, visible=%s", word_count, new_visible)
+        btn_class = "query-words-btn active" if new_visible else "query-words-btn"
+        return patched, new_visible, btn_class
+
+    # ── Callback 10: reset — collapse and remove ALL expanded words ─
+    @app.callback(
+        Output("scatter-3d", "figure", allow_duplicate=True),
+        Output("expanded-memories", "data", allow_duplicate=True),
+        Output("query-expanded-ids", "data", allow_duplicate=True),
+        Output("word-paths-visible", "data", allow_duplicate=True),
+        Output("toggle-word-paths-btn", "className", allow_duplicate=True),
+        Input("reset-words-btn", "n_clicks"),
+        State("scatter-3d", "figure"),
+        prevent_initial_call=True,
+    )
+    def on_reset_words(_n_clicks, current_fig):
+        log.debug(
+            "CB10 on_reset_words: fig_traces=%d",
+            len(current_fig.get("data", [])) if current_fig else 0,
+        )
+        if not current_fig:
+            return (no_update,) * 5
+
+        patched = Patch()
+
+        # Find all word and word-path trace indices
+        remove_indices = [
+            i
+            for i, t in enumerate(current_fig.get("data", []))
+            if t.get("legendgroup", "").startswith("words:")
+            or t.get("legendgroup", "") == "word-paths"
+        ]
+
+        if not remove_indices:
+            log.debug("CB10: nothing to reset")
+            return (no_update,) * 5
+
+        for i in sorted(remove_indices, reverse=True):
+            del patched["data"][i]
+
+        # Clear all registries
+        _word_registry.clear()
+        _word_positions.clear()
+        _parent_positions.clear()
+
+        log.info(
+            "CB10 RESET: removed %d word/path traces, registries cleared",
+            len(remove_indices),
+        )
+        return patched, [], [], False, "query-words-btn"
+
+    # ── Callback 11: clear semantic search and query-expanded words ─
+    @app.callback(
+        Output("scatter-3d", "figure", allow_duplicate=True),
+        Output("query-active", "data", allow_duplicate=True),
+        Output("query-match-ids", "data", allow_duplicate=True),
+        Output("query-expanded-ids", "data", allow_duplicate=True),
+        Output("expanded-memories", "data", allow_duplicate=True),
+        Output("query-input", "value"),
+        Input("clear-search-btn", "n_clicks"),
+        State("scatter-3d", "figure"),
+        State("query-active", "data"),
+        State("query-expanded-ids", "data"),
+        State("expanded-memories", "data"),
+        State("word-paths-visible", "data"),
+        State("word-path-min-input", "value"),
+        prevent_initial_call=True,
+    )
+    def on_clear_search(
+        _n_clicks,
+        current_fig,
+        query_active,
+        query_expanded_ids,
+        expanded,
+        paths_visible,
+        wp_threshold,
+    ):
+        log.debug(
+            "CB10 on_clear_search: query_active=%s, query_expanded=%s, "
+            "expanded=%d, fig_traces=%d",
+            query_active,
+            query_expanded_ids,
+            len(expanded or []),
+            len(current_fig.get("data", [])) if current_fig else 0,
+        )
+        if not current_fig:
+            return (no_update,) * 6
+
+        patched = Patch()
+
+        # ── Remove semantic-query traces (query point, match highlights, lines)
+        query_indices = [
+            i
+            for i, t in enumerate(current_fig.get("data", []))
+            if t.get("legendgroup", "") == "semantic-query"
+        ]
+
+        # ── Remove word traces for query-expanded memories only
+        qe_ids = set(query_expanded_ids or [])
+        word_groups = {f"words:{mid}" for mid in qe_ids}
+        word_indices = [
+            i
+            for i, t in enumerate(current_fig.get("data", []))
+            if t.get("legendgroup", "") in word_groups
+        ]
+
+        # ── Remove word-path traces (they'll be rebuilt)
+        path_indices = [
+            i
+            for i, t in enumerate(current_fig.get("data", []))
+            if t.get("legendgroup", "") == "word-paths"
+        ]
+
+        all_remove = sorted(
+            set(query_indices + word_indices + path_indices), reverse=True
+        )
+        for i in all_remove:
+            del patched["data"][i]
+
+        # Unregister words for query-expanded memories
+        for mid in qe_ids:
+            _unregister_words(mid)
+
+        # Update expanded list — remove query-expanded IDs
+        new_expanded = [m for m in (expanded or []) if m not in qe_ids]
+
+        # Rebuild word-path traces if any words remain
+        _threshold = int(wp_threshold) if wp_threshold else 2
+        wp_visible = paths_visible if paths_visible is not None else False
+        if _word_registry:
+            path_traces = _build_word_path_traces(
+                visible=wp_visible, min_shared=_threshold
+            )
+            for t in path_traces:
+                patched["data"].append(t)
+
+        log.info(
+            "CB10 CLEAR: removed %d query + %d word + %d path traces, "
+            "unregistered %d memories, expanded %d -> %d",
+            len(query_indices),
+            len(word_indices),
+            len(path_indices),
+            len(qe_ids),
+            len(expanded or []),
+            len(new_expanded),
+        )
+        # Return: figure, query-active, query-match-ids, query-expanded-ids,
+        #         expanded-memories, query-input value (clear the text box)
+        return patched, False, [], [], new_expanded, ""
+
+    # ── Callback 11: switch reduction method (PCA / t-SNE / UMAP) ─
+    @app.callback(
+        Output("scatter-3d", "figure", allow_duplicate=True),
+        Output("tag-selector", "options", allow_duplicate=True),
+        Output("tag-selector", "value", allow_duplicate=True),
+        Output("figure-meta", "data", allow_duplicate=True),
+        Output("expanded-memories", "data", allow_duplicate=True),
+        Output("cluster-stats-body", "children", allow_duplicate=True),
+        Input("reduction-method", "value"),
+        prevent_initial_call=True,
+    )
+    def on_method_change(new_method):
+        """Rebuild the entire figure with a different reduction method."""
+        log.info("CB9 on_method_change: method=%s", new_method)
+        if not new_method or new_method not in REDUCERS:
+            return (no_update,) * 6
+
+        # Clear word registries (expanded words use PCA projection
+        # which is re-fit during _fetch_and_build)
+        _word_registry.clear()
+        _word_positions.clear()
+        _parent_positions.clear()
+
+        # Reset dedup counters
+        global _words_last_click, _lines_last_click, _word_paths_last_click
+        _words_last_click = 0
+        _lines_last_click = 0
+        _word_paths_last_click = 0
+
+        fig, n_scatter, tag_to_indices, sorted_tags, metadatas, ids, memory_texts = (
+            _fetch_and_build(
+                backend_type=backend_cfg["backend_type"],
+                method=new_method,
+                colour_by=colour_by,
+                pg_host=backend_cfg.get("pg_host"),
+                pg_port=backend_cfg.get("pg_port"),
+                pg_database=backend_cfg.get("pg_database"),
+                pg_user=backend_cfg.get("pg_user"),
+                pg_password=backend_cfg.get("pg_password"),
+            )
+        )
+
+        tag_options = [
+            {"label": f"{tag}  ({len(tag_to_indices[tag])})", "value": tag}
+            for tag in sorted_tags
+        ]
+
+        for mid in ids:
+            if mid not in memory_texts or not memory_texts[mid].strip():
+                idx = ids.index(mid)
+                meta_i = metadatas[idx] if idx < len(metadatas) else {}
+                memory_texts[mid] = str(meta_i.get("title", ""))
+
+        meta = {
+            "n_scatter": n_scatter,
+            "sorted_tags": sorted_tags,
+            "memory_texts": memory_texts,
+        }
+
+        stats_children = _build_stats_panel_children()
+
+        log.info(
+            "CB9 on_method_change: done — method=%s, n_scatter=%d, fig traces=%d",
+            new_method,
+            n_scatter,
+            len(fig.get("data", [])) if isinstance(fig, dict) else -1,
+        )
+        return fig, tag_options, [], meta, [], stats_children
 
     log.info(f"Starting Dash app on http://127.0.0.1:{port}/")
     log.info("Hover over points to see memory titles.")

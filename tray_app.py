@@ -370,6 +370,478 @@ class ServerManager:
 
 
 # ---------------------------------------------------------------------------
+# Activity Monitor (web-based — avoids macOS tkinter main-thread crash)
+# ---------------------------------------------------------------------------
+
+_ACTIVITY_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Activity Monitor</title>
+<meta http-equiv="refresh" content="3">
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{
+    background: #1e1e2e; color: #d0d0d8;
+    font-family: 'SF Mono','Consolas','Courier New',monospace;
+    font-size: 13px; padding: 20px 28px; line-height: 1.7;
+  }}
+  h1 {{ font-size: 16px; color: #e0e0f0; margin-bottom: 16px;
+       border-bottom: 1px solid #3a3a4a; padding-bottom: 8px; }}
+  .section {{ margin-bottom: 18px; }}
+  .section-title {{
+    color: #6a8aba; font-weight: 700; font-size: 13px; margin-bottom: 4px;
+  }}
+  .row {{ display: flex; gap: 12px; padding: 2px 0 2px 12px; }}
+  .label {{ color: #808090; min-width: 130px; }}
+  .val {{ color: #d0d0d8; }}
+  .val.good {{ color: #38BE70; }}
+  .val.warn {{ color: #F4B042; }}
+  .val.bad  {{ color: #DC4E4E; }}
+  .val.dim  {{ color: #606070; }}
+  .process-block {{ margin-bottom: 10px; padding-left: 12px; }}
+  .proc-header {{ color: #c0c0d0; font-weight: 600; }}
+  .sub {{ padding-left: 24px; color: #a0a0b0; }}
+  hr {{ border: none; border-top: 1px solid #2a2a3a; margin: 12px 0; }}
+</style>
+</head>
+<body>
+<h1>Activity Monitor</h1>
+{body}
+<hr>
+<div style="color:#505060;font-size:11px;margin-top:8px;">
+  Auto-refreshes every 3 seconds
+</div>
+</body>
+</html>
+"""
+
+
+class ActivityMonitor:
+    """Lightweight web-based activity monitor.
+
+    Runs a tiny HTTP server on a background thread, serves a
+    self-refreshing HTML page with process and vector storage stats.
+    Opens the page in the default browser.  Avoids tkinter entirely
+    (tkinter crashes on macOS when called from a non-main thread).
+    """
+
+    PORT = 8051  # one above the visualizer default
+
+    def __init__(
+        self,
+        tray_app: "TrayApp",
+        pg_cfg: Optional[dict] = None,
+    ):
+        self._tray = tray_app
+        self._pg_cfg = pg_cfg or {}
+        self._server = None
+        self._thread = None
+
+        try:
+            import psutil as _ps
+
+            self._psutil = _ps
+        except ImportError:
+            self._psutil = None
+            log.warning("psutil not installed — process stats unavailable")
+
+    # ── Helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _human_bytes(n) -> str:
+        n = float(n)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if abs(n) < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} PB"
+
+    @staticmethod
+    def _human_duration(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        if seconds < 3600:
+            return f"{seconds / 60:.0f}m {seconds % 60:.0f}s"
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
+
+    def _proc_info(self, pid: Optional[int], name: str) -> dict:
+        info: dict = {"name": name, "pid": pid, "status": "stopped"}
+        if pid is None or self._psutil is None:
+            return info
+        try:
+            p = self._psutil.Process(pid)
+            with p.oneshot():
+                info["status"] = p.status()
+                info["cpu"] = p.cpu_percent(interval=None)
+                mem = p.memory_info()
+                info["rss"] = mem.rss
+                info["vms"] = mem.vms
+                info["create_time"] = p.create_time()
+                info["uptime"] = time.time() - p.create_time()
+                children = p.children(recursive=True)
+                info["n_children"] = len(children)
+                child_rss = sum(c.memory_info().rss for c in children if c.is_running())
+                info["total_rss"] = mem.rss + child_rss
+        except Exception:
+            info["status"] = "dead"
+        return info
+
+    def _find_postgres_pid(self) -> Optional[int]:
+        if self._psutil is None:
+            return None
+        port = self._pg_cfg.get("pg_port") or 5433
+        return self._find_pid_by_port(port)
+
+    def _find_pid_by_port(self, port: int) -> Optional[int]:
+        """Find a process listening on the given TCP port."""
+        # Try psutil first (works on Linux, may fail on macOS without root)
+        if self._psutil:
+            try:
+                for conn in self._psutil.net_connections(kind="inet"):
+                    if (
+                        conn.laddr
+                        and conn.laddr.port == port
+                        and conn.status == "LISTEN"
+                    ):
+                        return conn.pid
+            except (self._psutil.AccessDenied, OSError):
+                pass
+        # Fallback: lsof (works on macOS without root)
+        try:
+            result = subprocess.run(
+                ["lsof", "-i", f":{port}", "-sTCP:LISTEN", "-t"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return int(result.stdout.strip().split("\n")[0])
+        except Exception:
+            pass
+        return None
+
+    def _find_pid_by_script(self, script_name: str) -> Optional[int]:
+        """Find a running Python process whose cmdline contains *script_name*."""
+        if self._psutil is None:
+            return None
+        try:
+            for proc in self._psutil.process_iter(["pid", "cmdline"]):
+                try:
+                    cmdline = proc.info.get("cmdline") or []
+                    if any(script_name in arg for arg in cmdline):
+                        return proc.info["pid"]
+                except (self._psutil.NoSuchProcess, self._psutil.AccessDenied):
+                    continue
+        except Exception:
+            pass
+        return None
+
+    def _get_gpu_info(self) -> Optional[dict]:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return {
+                    "name": torch.cuda.get_device_name(0),
+                    "allocated": torch.cuda.memory_allocated(0),
+                    "reserved": torch.cuda.memory_reserved(0),
+                    "total": torch.cuda.get_device_properties(0).total_mem,
+                }
+        except Exception:
+            pass
+        try:
+            import torch
+
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                alloc = 0
+                if hasattr(torch.mps, "current_allocated_memory"):
+                    alloc = torch.mps.current_allocated_memory()
+                return {
+                    "name": "Apple Silicon (MPS)",
+                    "allocated": alloc,
+                    "reserved": 0,
+                    "total": 0,
+                }
+        except Exception:
+            pass
+        return None
+
+    def _get_vector_stats(self) -> dict:
+        # Cache vector stats for 30 seconds to avoid hammering the DB
+        now = time.time()
+        if (
+            hasattr(self, "_vstats_cache")
+            and self._vstats_cache
+            and now - self._vstats_cache_time < 30
+        ):
+            return self._vstats_cache
+        stats = self._fetch_vector_stats()
+        self._vstats_cache = stats
+        self._vstats_cache_time = now
+        return stats
+
+    def _fetch_vector_stats(self) -> dict:
+        stats: dict = {}
+        try:
+            from memory_mcp.config import EMBEDDING_MODEL_CONFIG
+
+            stats["dimensions"] = EMBEDDING_MODEL_CONFIG.get("dimensions", "?")
+            stats["model"] = EMBEDDING_MODEL_CONFIG.get("model_name", "?")
+        except Exception:
+            stats["dimensions"] = "?"
+            stats["model"] = "?"
+
+        pg_cfg = self._pg_cfg
+        if pg_cfg.get("backend_type") == "pgvector":
+            try:
+                from memory_mcp.vector_backends.pgvector_backend import PgvectorBackend
+                from memory_mcp.config import EMBEDDING_MODEL_CONFIG
+
+                backend = PgvectorBackend(
+                    host=pg_cfg.get("pg_host"),
+                    port=pg_cfg.get("pg_port"),
+                    database=pg_cfg.get("pg_database"),
+                    user=pg_cfg.get("pg_user"),
+                    password=pg_cfg.get("pg_password"),
+                    dimensions=EMBEDDING_MODEL_CONFIG.get("dimensions", 384),
+                )
+                backend.initialize()
+                stats["count"] = backend.count()
+                stats["storage_bytes"] = backend.storage_size_bytes()
+                stats["backend"] = "pgvector"
+                backend.close()
+            except Exception as exc:
+                stats["count"] = f"error: {exc}"
+                stats["backend"] = "pgvector (error)"
+        else:
+            try:
+                from memory_mcp.vector_backends.chroma import ChromaBackend
+                from memory_mcp.config import DATA_FOLDER
+
+                backend = ChromaBackend(db_folder=Path(DATA_FOLDER) / "memory_db")
+                backend.initialize()
+                stats["count"] = backend.count()
+                stats["backend"] = "chromadb"
+                chroma_dir = Path(DATA_FOLDER) / "memory_db" / "chroma_db"
+                if chroma_dir.exists():
+                    total = sum(
+                        f.stat().st_size for f in chroma_dir.rglob("*") if f.is_file()
+                    )
+                    stats["storage_bytes"] = total
+                backend.close()
+            except Exception as exc:
+                stats["count"] = f"error: {exc}"
+                stats["backend"] = "chromadb (error)"
+        return stats
+
+    # ── HTML generation ─────────────────────────────────────────
+
+    def _build_html(self) -> str:
+        sections: list[str] = []
+
+        def _row(label: str, value: str, css: str = "") -> str:
+            cls = f' class="val {css}"' if css else ' class="val"'
+            return (
+                f'<div class="row"><span class="label">{label}</span>'
+                f"<span{cls}>{value}</span></div>"
+            )
+
+        # ── System ──────────────────────────────────────────────
+        if self._psutil:
+            try:
+                vm = self._psutil.virtual_memory()
+                cpu = self._psutil.cpu_percent(interval=None)
+                cores = self._psutil.cpu_count()
+                s = '<div class="section"><div class="section-title">System</div>'
+                s += _row("CPU", f"{cpu}% ({cores} cores)")
+                s += _row(
+                    "Memory",
+                    f"{self._human_bytes(vm.used)} / {self._human_bytes(vm.total)} "
+                    f"({vm.percent}%)",
+                )
+                s += "</div>"
+                sections.append(s)
+            except Exception:
+                pass
+
+        # ── Processes ───────────────────────────────────────────
+        s = '<div class="section"><div class="section-title">Processes</div>'
+        processes = []
+
+        server_pid = self._tray._server.pid
+        processes.append(self._proc_info(server_pid, "MCP Server"))
+
+        gui_pid = None
+        with self._tray._subprocess_lock:
+            if self._tray._gui_proc and self._tray._gui_proc.poll() is None:
+                gui_pid = self._tray._gui_proc.pid
+        if gui_pid is None:
+            gui_pid = self._find_pid_by_script("memory_manager_gui.py")
+        processes.append(self._proc_info(gui_pid, "Memory Manager"))
+
+        viz_pid = None
+        with self._tray._subprocess_lock:
+            if (
+                self._tray._visualizer_proc
+                and self._tray._visualizer_proc.poll() is None
+            ):
+                viz_pid = self._tray._visualizer_proc.pid
+        if viz_pid is None:
+            viz_pid = self._find_pid_by_port(self._tray.VISUALIZER_PORT)
+        processes.append(self._proc_info(viz_pid, "Visualizer"))
+
+        tb_pid = None
+        with self._tray._subprocess_lock:
+            if (
+                self._tray._tensorboard_proc
+                and self._tray._tensorboard_proc.poll() is None
+            ):
+                tb_pid = self._tray._tensorboard_proc.pid
+        if tb_pid is None:
+            tb_pid = self._find_pid_by_port(self._tray.TENSORBOARD_PORT)
+        processes.append(self._proc_info(tb_pid, "TensorBoard"))
+
+        pg_pid = self._find_postgres_pid()
+        if pg_pid:
+            processes.append(self._proc_info(pg_pid, "PostgreSQL"))
+
+        for p in processes:
+            pid_str = str(p["pid"]) if p["pid"] else "\u2014"
+            status = p.get("status", "stopped")
+            if status in ("running", "sleeping", "idle"):
+                st_display, st_css = "running", "good"
+            elif status == "stopped":
+                st_display, st_css = "stopped", "dim"
+            elif status == "dead":
+                st_display, st_css = "dead", "bad"
+            else:
+                st_display, st_css = status, "warn"
+
+            s += '<div class="process-block">'
+            s += f'<div class="proc-header">{p["name"]}</div>'
+            s += (
+                f'<div class="sub">PID: {pid_str} &nbsp; '
+                f'Status: <span class="val {st_css}">{st_display}</span></div>'
+            )
+            if p["pid"] and p.get("rss"):
+                cpu_str = f"{p.get('cpu', 0):.1f}%"
+                rss_str = self._human_bytes(p.get("rss", 0))
+                s += f'<div class="sub">CPU: {cpu_str} &nbsp; RSS: {rss_str}'
+                if p.get("n_children", 0) > 0:
+                    s += (
+                        f" (total w/{p['n_children']} children: "
+                        f"{self._human_bytes(p.get('total_rss', 0))})"
+                    )
+                s += "</div>"
+                if "uptime" in p:
+                    s += (
+                        f'<div class="sub">Uptime: '
+                        f"{self._human_duration(p['uptime'])}</div>"
+                    )
+            s += "</div>"
+
+        s += "</div>"
+        sections.append(s)
+
+        # ── GPU ─────────────────────────────────────────────────
+        gpu = self._get_gpu_info()
+        if gpu:
+            s = '<div class="section"><div class="section-title">GPU</div>'
+            s += _row("Device", gpu.get("name", "?"))
+            if gpu.get("total"):
+                s += _row(
+                    "VRAM",
+                    f"{self._human_bytes(gpu['allocated'])} allocated "
+                    f"/ {self._human_bytes(gpu['total'])} total",
+                )
+            elif gpu.get("allocated"):
+                s += _row("Allocated", self._human_bytes(gpu["allocated"]))
+            s += "</div>"
+            sections.append(s)
+
+        # ── Vector Storage ──────────────────────────────────────
+        try:
+            vstats = self._get_vector_stats()
+            s = '<div class="section"><div class="section-title">Vector Storage</div>'
+            s += _row("Backend", str(vstats.get("backend", "?")))
+            s += _row("Model", str(vstats.get("model", "?")))
+            s += _row("Dimensions", str(vstats.get("dimensions", "?")))
+            count = vstats.get("count", "?")
+            s += _row("Vectors", str(count))
+            if "storage_bytes" in vstats:
+                s += _row("Table Size", self._human_bytes(vstats["storage_bytes"]))
+            if isinstance(count, int) and vstats.get("dimensions"):
+                try:
+                    dims = int(vstats["dimensions"])
+                    raw_bytes = count * dims * 4
+                    s += _row(
+                        "Raw Embeddings",
+                        f"{self._human_bytes(raw_bytes)} ({count} x {dims} x 4B)",
+                    )
+                except (ValueError, TypeError):
+                    pass
+            s += "</div>"
+            sections.append(s)
+        except Exception as exc:
+            sections.append(f'<div class="section">Vector stats error: {exc}</div>')
+
+        body = "\n".join(sections)
+        return _ACTIVITY_HTML.format(body=body)
+
+    # ── Server lifecycle ────────────────────────────────────────
+
+    def show(self):
+        """Start the HTTP server (if not running) and open the browser."""
+        import webbrowser
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+
+        if self._server is not None:
+            webbrowser.open(f"http://127.0.0.1:{self.PORT}")
+            return
+
+        monitor = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                html = monitor._build_html()
+                encoded = html.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, format, *args):
+                pass  # suppress request logging
+
+        try:
+            self._server = HTTPServer(("127.0.0.1", self.PORT), Handler)
+        except OSError as exc:
+            log.error("Activity Monitor: port %d busy: %s", self.PORT, exc)
+            webbrowser.open(f"http://127.0.0.1:{self.PORT}")
+            return
+
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True, name="activity-monitor"
+        )
+        self._thread.start()
+        log.info("Activity Monitor started on http://127.0.0.1:%d", self.PORT)
+        webbrowser.open(f"http://127.0.0.1:{self.PORT}")
+
+    def stop(self):
+        """Shutdown the HTTP server."""
+        if self._server:
+            self._server.shutdown()
+            self._server = None
+            self._thread = None
+            log.info("Activity Monitor stopped")
+
+
+# ---------------------------------------------------------------------------
 # Tray Application
 # ---------------------------------------------------------------------------
 
@@ -387,6 +859,7 @@ class TrayApp:
         server_env: Optional[dict] = None,
         visualizer_args: Optional[list[str]] = None,
         visualizer_env: Optional[dict] = None,
+        pg_cfg: Optional[dict] = None,
     ):
         self._server = ServerManager(server_args, server_env=server_env)
         self._auto_start = auto_start
@@ -397,15 +870,70 @@ class TrayApp:
         self._visualizer_env = visualizer_env  # extra env vars (e.g. PGPASSWORD)
         self._visualizer_proc: Optional[subprocess.Popen] = None
         self._tensorboard_proc: Optional[subprocess.Popen] = None
+        self._gui_proc: Optional[subprocess.Popen] = None
         self._subprocess_lock = (
             threading.Lock()
-        )  # protects _visualizer_proc/_tensorboard_proc
+        )  # protects _visualizer_proc/_tensorboard_proc/_gui_proc
+        self._activity_monitor = ActivityMonitor(self, pg_cfg=pg_cfg)
 
     def _build_subprocess_env(self) -> Optional[dict]:
         """Build subprocess environment with PGPASSWORD if configured."""
         if self._visualizer_env:
             return {**os.environ, **self._visualizer_env}
         return None
+
+    def _find_pid_by_port(self, port: int) -> Optional[int]:
+        """Find a process listening on the given TCP port."""
+        # Try psutil first (works on Linux, may fail on macOS without root)
+        try:
+            import psutil
+
+            for conn in psutil.net_connections(kind="inet"):
+                if conn.laddr and conn.laddr.port == port and conn.status == "LISTEN":
+                    return conn.pid
+        except Exception:
+            pass
+        # Fallback: lsof (works on macOS without root)
+        try:
+            result = subprocess.run(
+                ["lsof", "-i", f":{port}", "-sTCP:LISTEN", "-t"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return int(result.stdout.strip().split("\n")[0])
+        except Exception:
+            pass
+        return None
+
+    def _kill_by_port(self, port: int, name: str) -> bool:
+        """Find and terminate a process listening on a port. Returns True if killed."""
+        pid = self._find_pid_by_port(port)
+        if pid is None:
+            return False
+        log.info("Killing orphan %s (pid %d) on port %d", name, pid, port)
+        try:
+            os.kill(pid, signal.SIGTERM)
+            # Wait briefly for graceful shutdown
+            import psutil
+
+            try:
+                p = psutil.Process(pid)
+                p.wait(timeout=5)
+            except Exception:
+                # Force kill if still alive
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        except ProcessLookupError:
+            pass  # already dead
+        except PermissionError:
+            log.warning("No permission to kill pid %d", pid)
+            return False
+        log.info("Orphan %s (pid %d) stopped", name, pid)
+        return True
 
     # ── Menu builders ───────────────────────────────────────────
 
@@ -423,6 +951,15 @@ class TrayApp:
         is_running = status == STATUS_RUNNING
         viz_running = self._is_visualizer_running()
         tb_running = self._is_tensorboard_running()
+
+        # Build GUI sub-menu: context-aware based on running state
+        gui_running = self._is_gui_running()
+        if gui_running:
+            gui_items = Menu(
+                Item("Stop Memory Manager", self._on_stop_gui_menu),
+            )
+        else:
+            gui_items = None
 
         # Build visualizer sub-menu: context-aware based on running state
         if viz_running:
@@ -455,7 +992,9 @@ class TrayApp:
             Item("Stop Server", self._on_stop, enabled=is_running),
             Item("Restart Server", self._on_restart, enabled=is_running),
             Menu.SEPARATOR,
-            Item("Open Memory Manager", self._on_open_gui),
+            Item("Open Memory Manager", self._on_open_gui)
+            if not gui_running
+            else Item("Memory Manager", gui_items),
             Item("Open Vector Visualizer", self._on_open_visualizer)
             if not viz_running
             else Item("Vector Visualizer", viz_items),
@@ -463,6 +1002,7 @@ class TrayApp:
             if not tb_running
             else Item("TensorBoard Projector", tb_items),
             Menu.SEPARATOR,
+            Item("Activity Monitor", self._on_activity_monitor),
             Item("View Server Log", self._on_view_log),
             Item("View Visualizer Log", self._on_view_visualizer_log),
             Menu.SEPARATOR,
@@ -499,17 +1039,70 @@ class TrayApp:
         self._refresh_icon()
 
     def _on_open_gui(self, icon, item):
-        """Launch the Memory Manager GUI in a detached process."""
+        """Launch the Memory Manager GUI (single instance)."""
         if not GUI_SCRIPT.exists():
             log.warning("GUI script not found: %s", GUI_SCRIPT)
             return
+        if self._is_gui_running():
+            log.info("Memory Manager already running")
+            return
         log.info("Launching Memory Manager GUI")
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, str(GUI_SCRIPT)],
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        with self._subprocess_lock:
+            self._gui_proc = proc
+
+    def _is_gui_running(self) -> bool:
+        """Check if the Memory Manager GUI is alive (proc or cmdline scan)."""
+        with self._subprocess_lock:
+            if self._gui_proc is not None:
+                if self._gui_proc.poll() is None:
+                    return True
+                self._gui_proc = None
+        # Fallback: scan for python process running the script
+        pid = self._activity_monitor._find_pid_by_script("memory_manager_gui.py")
+        return pid is not None
+
+    def _stop_gui(self) -> None:
+        """Terminate the Memory Manager GUI."""
+        with self._subprocess_lock:
+            proc = self._gui_proc
+            if proc is not None and proc.poll() is not None:
+                self._gui_proc = None
+                proc = None
+        if proc is None:
+            # Try finding by cmdline
+            pid = self._activity_monitor._find_pid_by_script("memory_manager_gui.py")
+            if pid:
+                log.info("Killing orphan Memory Manager (pid %d)", pid)
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            return
+        log.info("Stopping Memory Manager (pid %d)", proc.pid)
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception as e:
+                log.error("Failed to kill Memory Manager: %s", e)
+        except Exception as e:
+            log.error("Error stopping Memory Manager: %s", e)
+        with self._subprocess_lock:
+            self._gui_proc = None
+        log.info("Memory Manager stopped")
+
+    def _on_stop_gui_menu(self, icon, item):
+        """Menu handler to stop the Memory Manager."""
+        threading.Thread(target=self._stop_gui, daemon=True).start()
 
     def _on_open_visualizer(self, icon, item):
         """Launch the Vector Visualizer Dash app and open the browser."""
@@ -570,25 +1163,27 @@ class TrayApp:
         self._on_open_visualizer(None, None)
 
     def _is_visualizer_running(self) -> bool:
-        """Check if the visualizer subprocess is still alive."""
+        """Check if the visualizer subprocess is still alive (proc or port)."""
         with self._subprocess_lock:
-            if self._visualizer_proc is None:
-                return False
-            if self._visualizer_proc.poll() is not None:
+            if self._visualizer_proc is not None:
+                if self._visualizer_proc.poll() is None:
+                    return True
                 self._visualizer_proc = None
-                return False
-            return True
+        # Fallback: scan for anything listening on the visualizer port
+        return self._find_pid_by_port(self.VISUALIZER_PORT) is not None
 
     def _stop_visualizer(self) -> None:
-        """Terminate the visualizer process."""
+        """Terminate the visualizer process (proc handle or port fallback)."""
         with self._subprocess_lock:
             proc = self._visualizer_proc
-            if proc is None:
-                return
-            if proc.poll() is not None:
+            if proc is not None and proc.poll() is not None:
                 self._visualizer_proc = None
+                proc = None
+        if proc is None:
+            # No tracked proc — try killing by port (orphan from prior session)
+            if self._kill_by_port(self.VISUALIZER_PORT, "visualizer"):
                 self._close_vis_log()
-                return
+            return
         log.info("Stopping visualizer (pid %d)", proc.pid)
         try:
             proc.terminate()
@@ -690,24 +1285,24 @@ class TrayApp:
         self._on_open_tensorboard(None, None)
 
     def _is_tensorboard_running(self) -> bool:
-        """Check if the TensorBoard subprocess is still alive."""
+        """Check if the TensorBoard subprocess is still alive (proc or port)."""
         with self._subprocess_lock:
-            if self._tensorboard_proc is None:
-                return False
-            if self._tensorboard_proc.poll() is not None:
+            if self._tensorboard_proc is not None:
+                if self._tensorboard_proc.poll() is None:
+                    return True
                 self._tensorboard_proc = None
-                return False
-            return True
+        return self._find_pid_by_port(self.TENSORBOARD_PORT) is not None
 
     def _stop_tensorboard(self) -> None:
-        """Terminate the TensorBoard process."""
+        """Terminate the TensorBoard process (proc handle or port fallback)."""
         with self._subprocess_lock:
             proc = self._tensorboard_proc
-            if proc is None:
-                return
-            if proc.poll() is not None:
+            if proc is not None and proc.poll() is not None:
                 self._tensorboard_proc = None
-                return
+                proc = None
+        if proc is None:
+            self._kill_by_port(self.TENSORBOARD_PORT, "TensorBoard")
+            return
         log.info("Stopping TensorBoard (pid %d)", proc.pid)
         try:
             proc.terminate()
@@ -732,6 +1327,11 @@ class TrayApp:
         url = f"http://127.0.0.1:{self.TENSORBOARD_PORT}/#projector"
         log.info("Opening browser to %s", url)
         webbrowser.open(url)
+
+    def _on_activity_monitor(self, icon, item):
+        """Open the Activity Monitor window."""
+        log.info("Opening Activity Monitor")
+        threading.Thread(target=self._activity_monitor.show, daemon=True).start()
 
     def _on_view_log(self, icon, item):
         """Open the server log in the system default viewer."""
@@ -761,6 +1361,8 @@ class TrayApp:
         """Stop server, visualizer, TensorBoard, and exit."""
         log.info("Quit requested")
         self._running = False
+        self._activity_monitor.stop()
+        self._stop_gui()
         self._stop_visualizer()
         self._stop_tensorboard()
         self._server.stop()
@@ -901,12 +1503,23 @@ def main():
     if args.pg_password is not None:
         visualizer_env = {"PGPASSWORD": args.pg_password}
 
+    # Build pg config for Activity Monitor's vector stats queries
+    pg_cfg = {
+        "backend_type": args.vector_backend,
+        "pg_host": args.pg_host,
+        "pg_port": args.pg_port,
+        "pg_database": args.pg_database,
+        "pg_user": args.pg_user,
+        "pg_password": args.pg_password,
+    }
+
     app = TrayApp(
         server_args=server_args,
         auto_start=args.auto_start,
         server_env=server_env,
         visualizer_args=visualizer_args,
         visualizer_env=visualizer_env,
+        pg_cfg=pg_cfg,
     )
     app.run()
 
