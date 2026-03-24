@@ -94,6 +94,11 @@ long-term-memory-mcp/
 ├── mcp-config-examples.json         # 15+ MCP client config examples
 ├── docker-compose.yml               # pgvector Docker service
 ├── pyproject.toml                   # Package config with optional extras
+├── requirements.txt                 # Dependencies
+├── opencode/
+│   ├── plugin/
+│   │   └── long-term-memory.ts      # OpenCode enforcement plugin
+│   └── AGENTS.md                    # OpenCode global system prompt
 └── requirements.txt                 # Dependencies
 ```
 
@@ -245,6 +250,60 @@ OpenCode uses specialized sub-agents (explore, general, etc.) launched via the T
 ```
 
 The wildcard `long-term-memory_*` grants each sub-agent access to all tools exposed by the memory MCP server (`remember`, `search_memories`, `search_by_tags`, etc.). Without this, only the primary agent can call memory tools -- sub-agents launched via Task will not have access.
+
+### Enforcement Plugin (OpenCode)
+
+The repo ships with an OpenCode plugin (`opencode/plugin/long-term-memory.ts`) that actively enforces memory usage on every turn by hooking into OpenCode's lifecycle.
+
+**What it enforces:**
+
+| Hook | Behaviour |
+|---|---|
+| System prompt injection | Injects mandatory memory rules into every LLM call |
+| Universal tool gate | Blocks ALL tools (bash, read, edit, write, etc.) until `get_recent_memories` + `search_by_tags` are called this turn |
+| End-of-turn store gate | If files were edited but `remember` was not called, ALL tools are blocked at the start of the next turn until `remember` is called |
+| Idle warning | Logs a warning when a turn ends with edits but no store |
+| Compaction hook | Rewrites the compaction prompt so enforcement state and memory rules survive context compaction |
+
+**Install:**
+
+```bash
+# macOS / Linux
+cp opencode/plugin/long-term-memory.ts ~/.config/opencode/plugins/
+
+# Windows
+copy opencode\plugin\long-term-memory.ts %APPDATA%\opencode\plugins\
+```
+
+Install the OpenCode plugin SDK if not already installed:
+
+```bash
+cd ~/.config/opencode   # or %APPDATA%\opencode on Windows
+bun add @opencode-ai/plugin
+```
+
+**How the gate works:**
+
+The recall gate re-arms every turn. The model must call both of these in parallel as its first action before any other tool:
+
+```
+long-term-memory_get_recent_memories(limit=5, current_project="<project>")
+long-term-memory_search_by_tags(tags="preference,project")
+```
+
+If any other tool is called first, the plugin throws an error and blocks until recall is done. Memory tools themselves are always allowed through. After a turn where files were edited without a `remember` call, all tools are blocked at the start of the next turn until `remember` is called.
+
+### AGENTS.md (OpenCode)
+
+`opencode/AGENTS.md` is a condensed system prompt that tells the model what to store, how to tag, and how to write sub-agent prompts. Copy it to your OpenCode global config directory:
+
+```bash
+# macOS / Linux
+cp opencode/AGENTS.md ~/.config/opencode/AGENTS.md
+
+# Windows
+copy opencode\AGENTS.md %APPDATA%\opencode\AGENTS.md
+```
 
 ### CLI Arguments
 
@@ -628,7 +687,12 @@ Your AI companion chooses memory tools automatically based on the conversation. 
 
 ## What's New
 
-**3D Vector Visualizer, TensorBoard Projector & System Tray App (Latest)**
+**OpenCode Enforcement Plugin (Latest)**
+- `opencode/plugin/long-term-memory.ts`: OpenCode plugin enforcing memory recall before every tool call and memory storage after every file edit
+  - Universal tool gate, end-of-turn store gate, system prompt injection, compaction hook, idle warning
+- `opencode/AGENTS.md`: condensed system prompt covering what to store, tagging conventions, and sub-agent memory instructions
+
+**3D Vector Visualizer, TensorBoard Projector & System Tray App**
 - `vector_visualizer.py`: interactive Plotly + Dash 3D scatter plot of memory embeddings
   - PCA, t-SNE, and UMAP dimensionality reduction (384D -> 3D)
   - Semantic search with adaptive thresholding (same algorithm as MCP `search_memories`)

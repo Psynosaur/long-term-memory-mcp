@@ -129,8 +129,9 @@ If you skip this, ALL tools will be blocked at the start of the next turn until 
         if (RECALL_TOOLS.has(input.tool)) state.recalledThisTurn = true;
         if (STORE_TOOLS.has(input.tool)) {
           state.storedThisTurn = true;
-          // Storing clears the "prev turn edited without store" gate
+          // Storing clears the "prev turn edited without store" gate and resets the warning
           state.prevTurnEditedWithoutStore = false;
+          state.idleWarned = false;
         }
         return;
       }
