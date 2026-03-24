@@ -379,40 +379,119 @@ _ACTIVITY_HTML = """\
 <head>
 <meta charset="utf-8">
 <title>Activity Monitor</title>
-<meta http-equiv="refresh" content="3">
 <style>
-  * {{ margin:0; padding:0; box-sizing:border-box; }}
-  body {{
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
     background: #1e1e2e; color: #d0d0d8;
     font-family: 'SF Mono','Consolas','Courier New',monospace;
     font-size: 13px; padding: 20px 28px; line-height: 1.7;
-  }}
-  h1 {{ font-size: 16px; color: #e0e0f0; margin-bottom: 16px;
-       border-bottom: 1px solid #3a3a4a; padding-bottom: 8px; }}
-  .section {{ margin-bottom: 18px; }}
-  .section-title {{
+  }
+  h1 { font-size: 16px; color: #e0e0f0; margin-bottom: 4px;
+       border-bottom: 1px solid #3a3a4a; padding-bottom: 8px; }
+  .header-row { display: flex; justify-content: space-between;
+                align-items: baseline; margin-bottom: 16px; }
+  .last-updated { color: #404055; font-size: 11px; }
+  .section { margin-bottom: 18px; }
+  .section-title {
     color: #6a8aba; font-weight: 700; font-size: 13px; margin-bottom: 4px;
-  }}
-  .row {{ display: flex; gap: 12px; padding: 2px 0 2px 12px; }}
-  .label {{ color: #808090; min-width: 130px; }}
-  .val {{ color: #d0d0d8; }}
-  .val.good {{ color: #38BE70; }}
-  .val.warn {{ color: #F4B042; }}
-  .val.bad  {{ color: #DC4E4E; }}
-  .val.dim  {{ color: #606070; }}
-  .process-block {{ margin-bottom: 10px; padding-left: 12px; }}
-  .proc-header {{ color: #c0c0d0; font-weight: 600; }}
-  .sub {{ padding-left: 24px; color: #a0a0b0; }}
-  hr {{ border: none; border-top: 1px solid #2a2a3a; margin: 12px 0; }}
+  }
+  .row { display: flex; gap: 12px; padding: 2px 0 2px 12px; }
+  .label { color: #808090; min-width: 130px; }
+  .val { color: #d0d0d8; }
+  .val.good { color: #38BE70; }
+  .val.warn { color: #F4B042; }
+  .val.bad  { color: #DC4E4E; }
+  .val.dim  { color: #606070; }
+  .process-block { margin-bottom: 10px; padding-left: 12px; }
+  .proc-header { color: #c0c0d0; font-weight: 600; }
+  .sub { padding-left: 24px; color: #a0a0b0; }
+  hr { border: none; border-top: 1px solid #2a2a3a; margin: 12px 0; }
 </style>
 </head>
 <body>
-<h1>Activity Monitor</h1>
-{body}
-<hr>
-<div style="color:#505060;font-size:11px;margin-top:8px;">
-  Auto-refreshes every 3 seconds
+<div class="header-row">
+  <h1>Activity Monitor</h1>
+  <span class="last-updated" id="last-updated">Loading...</span>
 </div>
+<div id="content">Loading...</div>
+<hr>
+<script>
+  async function refresh() {
+    try {
+      const res = await fetch('/data');
+      if (!res.ok) return;
+      const d = await res.json();
+
+      function row(label, value, css) {
+        const cls = css ? `val ${css}` : 'val';
+        return `<div class="row"><span class="label">${label}</span>`
+             + `<span class="${cls}">${value}</span></div>`;
+      }
+
+      let html = '';
+
+      if (d.system) {
+        const s = d.system;
+        html += '<div class="section"><div class="section-title">System</div>';
+        html += row('CPU', `${s.cpu_percent}% (${s.cpu_count} cores)`);
+        html += row('Memory', `${s.mem_used} / ${s.mem_total} (${s.mem_percent}%)`);
+        html += '</div>';
+      }
+
+      if (d.processes && d.processes.length) {
+        html += '<div class="section"><div class="section-title">Processes</div>';
+        for (const p of d.processes) {
+          const statusCss = ['running','sleeping','idle'].includes(p.status) ? 'good'
+                          : p.status === 'dead' ? 'bad'
+                          : p.status === 'stopped' ? 'dim' : 'warn';
+          html += '<div class="process-block">';
+          html += `<div class="proc-header">${p.name}</div>`;
+          html += `<div class="sub">PID: ${p.pid || '\u2014'} &nbsp; `
+               +  `Status: <span class="val ${statusCss}">${p.status}</span></div>`;
+          if (p.pid && p.rss) {
+            html += `<div class="sub">CPU: ${p.cpu} &nbsp; RSS: ${p.rss}`;
+            if (p.children) html += ` (total w/${p.n_children} children: ${p.total_rss})`;
+            html += '</div>';
+            if (p.uptime) html += `<div class="sub">Uptime: ${p.uptime}</div>`;
+          }
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+
+      if (d.gpu) {
+        const g = d.gpu;
+        html += '<div class="section"><div class="section-title">GPU</div>';
+        html += row('Device', g.name);
+        if (g.total) html += row('VRAM', `${g.allocated} allocated / ${g.total} total`);
+        else if (g.allocated) html += row('Allocated', g.allocated);
+        html += '</div>';
+      }
+
+      if (d.vectors) {
+        const v = d.vectors;
+        html += '<div class="section"><div class="section-title">Vector Storage</div>';
+        html += row('Backend', v.backend || '?');
+        html += row('Model', v.model || '?');
+        html += row('Dimensions', v.dimensions || '?');
+        html += row('Vectors', String(v.count ?? '?'));
+        if (v.table_size) html += row('Table Size', v.table_size);
+        if (v.raw_embed) html += row('Raw Embeddings', v.raw_embed);
+        html += '</div>';
+      }
+
+      document.getElementById('content').innerHTML = html;
+      const now = new Date();
+      document.getElementById('last-updated').textContent =
+        'Updated ' + now.toLocaleTimeString();
+    } catch (e) {
+      document.getElementById('last-updated').textContent = 'Error: ' + e.message;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 3000);
+</script>
 </body>
 </html>
 """
@@ -638,42 +717,34 @@ class ActivityMonitor:
                 stats["backend"] = "chromadb (error)"
         return stats
 
-    # ── HTML generation ─────────────────────────────────────────
+    # ── Data generation ─────────────────────────────────────────
 
-    def _build_html(self) -> str:
-        sections: list[str] = []
-
-        def _row(label: str, value: str, css: str = "") -> str:
-            cls = f' class="val {css}"' if css else ' class="val"'
-            return (
-                f'<div class="row"><span class="label">{label}</span>'
-                f"<span{cls}>{value}</span></div>"
-            )
+    def _build_data(self) -> dict:
+        """Build a JSON-serialisable dict of current stats for the /data endpoint."""
+        data: dict = {}
 
         # ── System ──────────────────────────────────────────────
         if self._psutil:
             try:
                 vm = self._psutil.virtual_memory()
                 cpu = self._psutil.cpu_percent(interval=None)
-                cores = self._psutil.cpu_count()
-                s = '<div class="section"><div class="section-title">System</div>'
-                s += _row("CPU", f"{cpu}% ({cores} cores)")
-                s += _row(
-                    "Memory",
-                    f"{self._human_bytes(vm.used)} / {self._human_bytes(vm.total)} "
-                    f"({vm.percent}%)",
-                )
-                s += "</div>"
-                sections.append(s)
+                data["system"] = {
+                    "cpu_percent": cpu,
+                    "cpu_count": self._psutil.cpu_count(),
+                    "mem_used": self._human_bytes(vm.used),
+                    "mem_total": self._human_bytes(vm.total),
+                    "mem_percent": vm.percent,
+                }
             except Exception:
                 pass
 
         # ── Processes ───────────────────────────────────────────
-        s = '<div class="section"><div class="section-title">Processes</div>'
-        processes = []
+        processes_out = []
 
         server_pid = self._tray._server.pid
-        processes.append(self._proc_info(server_pid, "MCP Server"))
+        procs_to_gather = [
+            (server_pid, "MCP Server"),
+        ]
 
         gui_pid = None
         with self._tray._subprocess_lock:
@@ -681,7 +752,7 @@ class ActivityMonitor:
                 gui_pid = self._tray._gui_proc.pid
         if gui_pid is None:
             gui_pid = self._find_pid_by_script("memory_manager_gui.py")
-        processes.append(self._proc_info(gui_pid, "Memory Manager"))
+        procs_to_gather.append((gui_pid, "Memory Manager"))
 
         viz_pid = None
         with self._tray._subprocess_lock:
@@ -692,7 +763,7 @@ class ActivityMonitor:
                 viz_pid = self._tray._visualizer_proc.pid
         if viz_pid is None:
             viz_pid = self._find_pid_by_port(self._tray.VISUALIZER_PORT)
-        processes.append(self._proc_info(viz_pid, "Visualizer"))
+        procs_to_gather.append((viz_pid, "Visualizer"))
 
         tb_pid = None
         with self._tray._subprocess_lock:
@@ -703,94 +774,69 @@ class ActivityMonitor:
                 tb_pid = self._tray._tensorboard_proc.pid
         if tb_pid is None:
             tb_pid = self._find_pid_by_port(self._tray.TENSORBOARD_PORT)
-        processes.append(self._proc_info(tb_pid, "TensorBoard"))
+        procs_to_gather.append((tb_pid, "TensorBoard"))
 
         pg_pid = self._find_postgres_pid()
         if pg_pid:
-            processes.append(self._proc_info(pg_pid, "PostgreSQL"))
+            procs_to_gather.append((pg_pid, "PostgreSQL"))
 
-        for p in processes:
-            pid_str = str(p["pid"]) if p["pid"] else "\u2014"
-            status = p.get("status", "stopped")
-            if status in ("running", "sleeping", "idle"):
-                st_display, st_css = "running", "good"
-            elif status == "stopped":
-                st_display, st_css = "stopped", "dim"
-            elif status == "dead":
-                st_display, st_css = "dead", "bad"
-            else:
-                st_display, st_css = status, "warn"
+        for pid, name in procs_to_gather:
+            info = self._proc_info(pid, name)
+            entry: dict = {
+                "name": info["name"],
+                "pid": info["pid"],
+                "status": info.get("status", "stopped"),
+            }
+            if info["pid"] and info.get("rss"):
+                entry["cpu"] = f"{info.get('cpu', 0):.1f}%"
+                entry["rss"] = self._human_bytes(info["rss"])
+                entry["n_children"] = info.get("n_children", 0)
+                if info.get("n_children", 0) > 0:
+                    entry["children"] = True
+                    entry["total_rss"] = self._human_bytes(info.get("total_rss", 0))
+                if "uptime" in info:
+                    entry["uptime"] = self._human_duration(info["uptime"])
+            processes_out.append(entry)
 
-            s += '<div class="process-block">'
-            s += f'<div class="proc-header">{p["name"]}</div>'
-            s += (
-                f'<div class="sub">PID: {pid_str} &nbsp; '
-                f'Status: <span class="val {st_css}">{st_display}</span></div>'
-            )
-            if p["pid"] and p.get("rss"):
-                cpu_str = f"{p.get('cpu', 0):.1f}%"
-                rss_str = self._human_bytes(p.get("rss", 0))
-                s += f'<div class="sub">CPU: {cpu_str} &nbsp; RSS: {rss_str}'
-                if p.get("n_children", 0) > 0:
-                    s += (
-                        f" (total w/{p['n_children']} children: "
-                        f"{self._human_bytes(p.get('total_rss', 0))})"
-                    )
-                s += "</div>"
-                if "uptime" in p:
-                    s += (
-                        f'<div class="sub">Uptime: '
-                        f"{self._human_duration(p['uptime'])}</div>"
-                    )
-            s += "</div>"
-
-        s += "</div>"
-        sections.append(s)
+        data["processes"] = processes_out
 
         # ── GPU ─────────────────────────────────────────────────
         gpu = self._get_gpu_info()
         if gpu:
-            s = '<div class="section"><div class="section-title">GPU</div>'
-            s += _row("Device", gpu.get("name", "?"))
+            gpu_out: dict = {"name": gpu.get("name", "?")}
             if gpu.get("total"):
-                s += _row(
-                    "VRAM",
-                    f"{self._human_bytes(gpu['allocated'])} allocated "
-                    f"/ {self._human_bytes(gpu['total'])} total",
-                )
+                gpu_out["allocated"] = self._human_bytes(gpu["allocated"])
+                gpu_out["total"] = self._human_bytes(gpu["total"])
             elif gpu.get("allocated"):
-                s += _row("Allocated", self._human_bytes(gpu["allocated"]))
-            s += "</div>"
-            sections.append(s)
+                gpu_out["allocated"] = self._human_bytes(gpu["allocated"])
+            data["gpu"] = gpu_out
 
         # ── Vector Storage ──────────────────────────────────────
         try:
             vstats = self._get_vector_stats()
-            s = '<div class="section"><div class="section-title">Vector Storage</div>'
-            s += _row("Backend", str(vstats.get("backend", "?")))
-            s += _row("Model", str(vstats.get("model", "?")))
-            s += _row("Dimensions", str(vstats.get("dimensions", "?")))
-            count = vstats.get("count", "?")
-            s += _row("Vectors", str(count))
+            vec_out: dict = {
+                "backend": str(vstats.get("backend", "?")),
+                "model": str(vstats.get("model", "?")),
+                "dimensions": str(vstats.get("dimensions", "?")),
+                "count": vstats.get("count", "?"),
+            }
             if "storage_bytes" in vstats:
-                s += _row("Table Size", self._human_bytes(vstats["storage_bytes"]))
-            if isinstance(count, int) and vstats.get("dimensions"):
+                vec_out["table_size"] = self._human_bytes(vstats["storage_bytes"])
+            count = vstats.get("count")
+            dims = vstats.get("dimensions")
+            if isinstance(count, int) and dims:
                 try:
-                    dims = int(vstats["dimensions"])
-                    raw_bytes = count * dims * 4
-                    s += _row(
-                        "Raw Embeddings",
-                        f"{self._human_bytes(raw_bytes)} ({count} x {dims} x 4B)",
+                    raw_bytes = count * int(dims) * 4
+                    vec_out["raw_embed"] = (
+                        f"{self._human_bytes(raw_bytes)} ({count} x {dims} x 4B)"
                     )
                 except (ValueError, TypeError):
                     pass
-            s += "</div>"
-            sections.append(s)
+            data["vectors"] = vec_out
         except Exception as exc:
-            sections.append(f'<div class="section">Vector stats error: {exc}</div>')
+            data["vectors"] = {"backend": f"error: {exc}"}
 
-        body = "\n".join(sections)
-        return _ACTIVITY_HTML.format(body=body)
+        return data
 
     # ── Server lifecycle ────────────────────────────────────────
 
@@ -807,13 +853,22 @@ class ActivityMonitor:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                html = monitor._build_html()
-                encoded = html.encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(encoded)))
-                self.end_headers()
-                self.wfile.write(encoded)
+                if self.path == "/data":
+                    import json as _json
+
+                    payload = _json.dumps(monitor._build_data()).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    page = _ACTIVITY_HTML.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(page)))
+                    self.end_headers()
+                    self.wfile.write(page)
 
             def log_message(self, format, *args):
                 pass  # suppress request logging
