@@ -344,6 +344,8 @@ python memory_manager_gui.py
 
 ## 3D Vector Visualizer
 
+![alt text](image.png)
+
 `vector_visualizer.py` renders your memory embeddings as an interactive 3D scatter plot using Plotly + Dash. High-dimensional vectors (384/768D) are projected to 3D via PCA, t-SNE, or UMAP. Launches a local web app (default `http://127.0.0.1:8050`) with hover-over labels showing each memory's title, type, importance, and ID.
 
 ### Install

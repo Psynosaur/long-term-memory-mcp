@@ -310,7 +310,8 @@ def main():
     signal.signal(signal.SIGTERM, _graceful_shutdown)
 
     # SIGHUP:  sent when terminal is closed or SSH disconnects
-    signal.signal(signal.SIGHUP, _graceful_shutdown)
+    if hasattr(signal, 'SIGHUP'):
+        signal.signal(signal.SIGHUP, _graceful_shutdown)
 
     # ── Run the server ──────────────────────────────────────────
     backend_info = f"[{args.vector_backend}]"
