@@ -94,12 +94,13 @@ STATUS_RUNNING = "running"
 STATUS_ERROR = "error"
 
 # Cross-platform subprocess detach kwargs.
-# On Windows, start_new_session and creationflags are mutually exclusive;
-# use DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so child processes are
-# isolated from the parent console (no Ctrl+C leakthrough).
+# On Windows, use CREATE_NO_WINDOW to run child processes headlessly without
+# spawning a visible console window. Also add CREATE_NEW_PROCESS_GROUP so the
+# child is isolated from the parent's Ctrl+C/Ctrl+Break signal group.
+# NOTE: start_new_session and creationflags are mutually exclusive on Windows.
 if sys.platform == "win32":
     _DETACH_KWARGS: dict = {
-        "creationflags": subprocess.DETACHED_PROCESS
+        "creationflags": subprocess.CREATE_NO_WINDOW
         | subprocess.CREATE_NEW_PROCESS_GROUP,
     }
 else:
@@ -945,6 +946,204 @@ class ActivityMonitor:
 
 
 # ---------------------------------------------------------------------------
+# Autostart Manager
+# ---------------------------------------------------------------------------
+
+_AUTOSTART_APP_NAME = "LongTermMemoryMCP"
+_AUTOSTART_TRAY_SCRIPT = Path(__file__).resolve()
+
+# macOS
+_MACOS_PLIST_DIR = Path.home() / "Library" / "LaunchAgents"
+_MACOS_PLIST_NAME = f"com.{_AUTOSTART_APP_NAME.lower()}.tray"
+_MACOS_PLIST_PATH = _MACOS_PLIST_DIR / f"{_MACOS_PLIST_NAME}.plist"
+
+# Linux
+_LINUX_SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
+_LINUX_SERVICE_NAME = f"{_AUTOSTART_APP_NAME.lower()}-tray.service"
+_LINUX_SERVICE_PATH = _LINUX_SYSTEMD_DIR / _LINUX_SERVICE_NAME
+
+
+class AutostartManager:
+    """Install / uninstall / query the tray app as a login autostart item."""
+
+    def is_enabled(self) -> bool:
+        """Return True if autostart is currently registered."""
+        try:
+            if sys.platform == "win32":
+                return self._windows_is_enabled()
+            elif sys.platform == "darwin":
+                return _MACOS_PLIST_PATH.exists()
+            else:
+                return _LINUX_SERVICE_PATH.exists()
+        except Exception as e:
+            log.warning("AutostartManager.is_enabled error: %s", e)
+            return False
+
+    def enable(self, extra_args: Optional[list] = None) -> bool:
+        """Register autostart. Returns True on success."""
+        extra_args = extra_args or []
+        try:
+            if sys.platform == "win32":
+                self._windows_enable(extra_args)
+            elif sys.platform == "darwin":
+                self._macos_enable(extra_args)
+            else:
+                self._linux_enable(extra_args)
+            log.info("Autostart enabled")
+            return True
+        except Exception as e:
+            log.error("Failed to enable autostart: %s", e)
+            return False
+
+    def disable(self) -> bool:
+        """Unregister autostart. Returns True on success."""
+        try:
+            if sys.platform == "win32":
+                self._windows_disable()
+            elif sys.platform == "darwin":
+                self._macos_disable()
+            else:
+                self._linux_disable()
+            log.info("Autostart disabled")
+            return True
+        except Exception as e:
+            log.error("Failed to disable autostart: %s", e)
+            return False
+
+    # ── helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _cmd(extra_args: list) -> list:
+        return [sys.executable, str(_AUTOSTART_TRAY_SCRIPT)] + extra_args
+
+    # Windows ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _reg_key():
+        import winreg
+
+        return winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_READ | winreg.KEY_SET_VALUE,
+        )
+
+    def _windows_is_enabled(self) -> bool:
+        import winreg
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_READ,
+            ) as key:
+                winreg.QueryValueEx(key, _AUTOSTART_APP_NAME)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def _windows_enable(self, extra_args: list) -> None:
+        import winreg
+
+        cmd_str = subprocess.list2cmdline(self._cmd(extra_args))
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            winreg.SetValueEx(key, _AUTOSTART_APP_NAME, 0, winreg.REG_SZ, cmd_str)
+
+    def _windows_disable(self) -> None:
+        import winreg
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                winreg.DeleteValue(key, _AUTOSTART_APP_NAME)
+        except FileNotFoundError:
+            pass
+
+    # macOS ────────────────────────────────────────────────────
+
+    def _macos_enable(self, extra_args: list) -> None:
+        cmd = self._cmd(extra_args)
+        log_dir = Path.home() / "Library" / "Logs" / _AUTOSTART_APP_NAME
+        log_dir.mkdir(parents=True, exist_ok=True)
+        _MACOS_PLIST_DIR.mkdir(parents=True, exist_ok=True)
+        program_args = "\n        ".join(f"<string>{a}</string>" for a in cmd)
+        plist = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{_MACOS_PLIST_NAME}</string>
+    <key>ProgramArguments</key>
+    <array>
+        {program_args}
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>StandardOutPath</key><string>{log_dir}/tray_stdout.log</string>
+    <key>StandardErrorPath</key><string>{log_dir}/tray_stderr.log</string>
+</dict>
+</plist>
+"""
+        _MACOS_PLIST_PATH.write_text(plist, encoding="utf-8")
+        subprocess.run(
+            ["launchctl", "unload", str(_MACOS_PLIST_PATH)], capture_output=True
+        )
+        subprocess.run(
+            ["launchctl", "load", str(_MACOS_PLIST_PATH)], capture_output=True
+        )
+
+    def _macos_disable(self) -> None:
+        if _MACOS_PLIST_PATH.exists():
+            subprocess.run(
+                ["launchctl", "unload", str(_MACOS_PLIST_PATH)], capture_output=True
+            )
+            _MACOS_PLIST_PATH.unlink()
+
+    # Linux ────────────────────────────────────────────────────
+
+    def _linux_enable(self, extra_args: list) -> None:
+        cmd = self._cmd(extra_args)
+        exec_start = " ".join(f'"{a}"' if " " in a else a for a in cmd)
+        _LINUX_SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+        _LINUX_SERVICE_PATH.write_text(
+            f"[Unit]\nDescription=Long-Term Memory MCP Tray App\n"
+            f"After=graphical-session.target\n\n"
+            f"[Service]\nType=simple\nExecStart={exec_start}\n"
+            f"Restart=on-failure\nRestartSec=5\n\n"
+            f"[Install]\nWantedBy=default.target\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", _LINUX_SERVICE_NAME],
+            capture_output=True,
+        )
+
+    def _linux_disable(self) -> None:
+        if _LINUX_SERVICE_PATH.exists():
+            subprocess.run(
+                ["systemctl", "--user", "disable", "--now", _LINUX_SERVICE_NAME],
+                capture_output=True,
+            )
+            _LINUX_SERVICE_PATH.unlink()
+            subprocess.run(
+                ["systemctl", "--user", "daemon-reload"], capture_output=True
+            )
+
+
+# ---------------------------------------------------------------------------
 # Tray Application
 # ---------------------------------------------------------------------------
 
@@ -978,6 +1177,9 @@ class TrayApp:
             threading.Lock()
         )  # protects _visualizer_proc/_tensorboard_proc/_gui_proc
         self._activity_monitor = ActivityMonitor(self, pg_cfg=pg_cfg)
+        self._autostart = AutostartManager()
+        # Remember the args used to launch this tray so autostart can replay them
+        self._server_args = server_args
 
     def _build_subprocess_env(self) -> Optional[dict]:
         """Build subprocess environment with PGPASSWORD if configured."""
@@ -1130,10 +1332,27 @@ class TrayApp:
             Item("View Server Log", self._on_view_log),
             Item("View Visualizer Log", self._on_view_visualizer_log),
             Menu.SEPARATOR,
+            Item(
+                "Start at Login",
+                self._on_toggle_autostart,
+                checked=lambda item: self._autostart.is_enabled(),
+            ),
+            Menu.SEPARATOR,
             Item("Quit", self._on_quit),
         )
 
     # ── Menu actions ────────────────────────────────────────────
+
+    def _on_toggle_autostart(self, icon, item):
+        """Toggle 'Start at Login' on/off."""
+        if self._autostart.is_enabled():
+            self._autostart.disable()
+        else:
+            # Always include --auto-start so the MCP server launches automatically
+            # when the tray app is started at login.
+            autostart_args = ["--auto-start"] + self._server_args
+            self._autostart.enable(extra_args=autostart_args)
+        self._refresh_icon()
 
     def _on_start(self, icon, item):
         threading.Thread(target=self._do_start, daemon=True).start()
