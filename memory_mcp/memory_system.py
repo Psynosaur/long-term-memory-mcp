@@ -288,7 +288,42 @@ class RobustMemorySystem:
         Uses the model configured in config.py (EMBEDDING_MODEL_CONFIG).
         Override with env var MEMORY_EMBEDDING_MODEL to switch models.
         After switching, run rebuild_vector_index() to re-embed all memories.
+
+        SSL / offline notes
+        -------------------
+        When launched via macOS LaunchAgent (login autostart) the process
+        inherits a minimal environment that lacks the system certificate bundle,
+        causing huggingface_hub to fail with CERTIFICATE_VERIFY_FAILED even
+        though the model is already cached locally.
+
+        We therefore:
+        1. Point SSL_CERT_FILE / REQUESTS_CA_BUNDLE at certifi's bundle so
+           httpx/requests always have a valid CA store (needed for any network
+           call, e.g. an explicit model refresh).
+        2. Set HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1 so huggingface_hub
+           skips all network checks and loads straight from the local cache.
+           The model *must* already be cached; a fresh install still needs a
+           one-time manual download in a terminal session.
         """
+        import os as _os
+
+        # --- Point SSL libraries at certifi's CA bundle ----------------------
+        try:
+            import certifi as _certifi
+
+            _ca = _certifi.where()
+            _os.environ.setdefault("SSL_CERT_FILE", _ca)
+            _os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca)
+        except ImportError:
+            pass  # certifi not installed; SSL env vars remain as-is
+
+        # --- Disable HuggingFace Hub network checks --------------------------
+        # The model is expected to be cached.  If it isn't, the user should
+        # run the server once from a terminal so it can download over a normal
+        # SSL-capable session.
+        _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
         try:
             model_name = EMBEDDING_MODEL_CONFIG["model_name"]
             # Normalise the query prefix: strip whitespace so the separator

@@ -1078,6 +1078,34 @@ class AutostartManager:
         log_dir.mkdir(parents=True, exist_ok=True)
         _MACOS_PLIST_DIR.mkdir(parents=True, exist_ok=True)
         program_args = "\n        ".join(f"<string>{a}</string>" for a in cmd)
+
+        # Resolve certifi's CA bundle path from the same Python that runs the tray.
+        # If certifi isn't installed this stays empty and the key is omitted.
+        try:
+            import certifi as _certifi
+
+            _ca_bundle = _certifi.where()
+        except ImportError:
+            _ca_bundle = None
+
+        # Build the EnvironmentVariables block.
+        # HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE: tell huggingface_hub to load
+        # the embedding model straight from the local cache — no network needed.
+        # Without this the launchd environment lacks a valid CA bundle, so TLS
+        # to huggingface.co fails and the server crashes on every autostart.
+        env_entries = (
+            "    <key>EnvironmentVariables</key>\n"
+            "    <dict>\n"
+            "        <key>HF_HUB_OFFLINE</key><string>1</string>\n"
+            "        <key>TRANSFORMERS_OFFLINE</key><string>1</string>\n"
+        )
+        if _ca_bundle:
+            env_entries += (
+                f"        <key>SSL_CERT_FILE</key><string>{_ca_bundle}</string>\n"
+                f"        <key>REQUESTS_CA_BUNDLE</key><string>{_ca_bundle}</string>\n"
+            )
+        env_entries += "    </dict>"
+
         plist = f"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -1091,6 +1119,7 @@ class AutostartManager:
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><false/>
+{env_entries}
     <key>StandardOutPath</key><string>{log_dir}/tray_stdout.log</string>
     <key>StandardErrorPath</key><string>{log_dir}/tray_stderr.log</string>
 </dict>
@@ -1769,11 +1798,60 @@ class TrayApp:
 # ---------------------------------------------------------------------------
 
 
+def _acquire_single_instance_lock():
+    """Ensure only one tray process runs at a time.
+
+    Uses an exclusive flock on a well-known lock file (same directory as the
+    PID file for the MCP server).  The lock is held until the process exits —
+    no explicit release needed.
+
+    On Windows, a named-mutex approach is used instead (fcntl is unavailable).
+
+    Returns the open file handle (Unix) or None (Windows / already locked).
+    Exits with code 0 if another instance is already running.
+    """
+    lock_path = LOG_DIR / "tray_app.lock"
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            mutex = ctypes.windll.kernel32.CreateMutexW(
+                None, True, "LongTermMemoryMCPTray"
+            )
+            if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+                log.info("Another tray instance is already running — exiting")
+                sys.exit(0)
+            return mutex
+        except Exception as e:
+            log.warning("Single-instance mutex failed: %s", e)
+            return None
+    else:
+        import fcntl
+
+        try:
+            fh = open(lock_path, "w")
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fh.write(str(os.getpid()))
+            fh.flush()
+            return fh  # caller must keep reference alive for the lock to hold
+        except BlockingIOError:
+            log.info("Another tray instance is already running — exiting")
+            sys.exit(0)
+        except Exception as e:
+            log.warning("Single-instance lock failed: %s", e)
+            return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="System Tray for Long-Term Memory MCP Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+
+    # Acquire single-instance lock before doing anything else.
+    # The handle must stay in scope for the lifetime of the process.
+    _instance_lock = _acquire_single_instance_lock()  # noqa: F841
 
     parser.add_argument(
         "--auto-start",

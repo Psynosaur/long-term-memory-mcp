@@ -310,7 +310,7 @@ def main():
     signal.signal(signal.SIGTERM, _graceful_shutdown)
 
     # SIGHUP:  sent when terminal is closed or SSH disconnects
-    if hasattr(signal, 'SIGHUP'):
+    if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, _graceful_shutdown)
 
     # ── Run the server ──────────────────────────────────────────
@@ -322,13 +322,14 @@ def main():
                 f"Starting Long-Term Memory MCP Server {backend_info} "
                 f"on http://{args.host}:{args.port}{args.path}"
             )
-            asyncio.run(
-                mcp.run(
-                    transport="http", host=args.host, port=args.port, path=args.path
-                )
-            )
+            # mcp.run() is synchronous in FastMCP 3.x — it calls anyio.run()
+            # internally and blocks until the server stops.
+            # Do NOT wrap in asyncio.run(): that expects a coroutine and would
+            # receive None (the return value of the sync run()), raising
+            # "a coroutine was expected, got None" on shutdown.
+            mcp.run(transport="http", host=args.host, port=args.port, path=args.path)
         else:
-            # Default: stdio transport
+            # stdio transport — run_async is a coroutine so asyncio.run() is correct
             asyncio.run(mcp.run_stdio_async(show_banner=False))
     except KeyboardInterrupt:
         print("\nShutting down memory system...")
