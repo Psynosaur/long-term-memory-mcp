@@ -1,33 +1,10 @@
 #!/usr/bin/env python3
-"""
-Main entry point for the Long-Term Memory MCP Server.
-
-This is a refactored version that uses a modular architecture with separate concerns:
-- config.py: Configuration constants
-- models.py: Data models (dataclasses)
-- memory_system.py: Core RobustMemorySystem class
-- mcp_tools.py: MCP tool handler registration
-- vector_backends/: Pluggable vector storage (chromadb, pgvector)
-
-Usage examples:
-    # Default: ChromaDB backend, stdio transport
-    python server.py
-
-    # pgvector backend (first run auto-migrates from ChromaDB)
-    python server.py --vector-backend pgvector \\
-        --pg-host localhost --pg-port 5432 \\
-        --pg-database memories --pg-user memory_user --pg-password secret
-
-    # pgvector using PG* environment variables
-    PGHOST=localhost PGDATABASE=memories python server.py --vector-backend pgvector
-
-    # HTTP transport with pgvector
-    python server.py --transport http --port 8000 --vector-backend pgvector
-"""
+"""Main entry point for the Long-Term Memory MCP Server."""
 
 import asyncio
 import atexit
 import argparse
+import logging
 import signal
 import sys
 
@@ -187,6 +164,12 @@ def _maybe_migrate_chromadb_to_pgvector(memory_system, args):
 
 def main():
     """Main entry point for the MCP server"""
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     # ── Parse command-line arguments FIRST ──────────────────────
     parser = argparse.ArgumentParser(

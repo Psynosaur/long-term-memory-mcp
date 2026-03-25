@@ -254,12 +254,58 @@ class NetworkSharingManager:
 
     @staticmethod
     def _resolve_lan_ip() -> str:
-        """Return this machine's LAN IP by connecting a UDP socket (no packet sent)."""
+        """Return the best LAN IP for mDNS advertisement.
+
+        Uses psutil.net_if_addrs() to enumerate all interfaces and pick the
+        first IPv4 address that looks like a real LAN IP, skipping:
+        - 127.x.x.x   (loopback)
+        - 169.254.x.x (link-local / APIPA)
+        - 100.64.x.x  (CGNAT / Tailscale / ZeroTier)
+
+        Falls back to UDP-connect trick only if nothing better is found.
+        """
+        import ipaddress as _ip
+
+        _SKIP = [
+            _ip.ip_network("127.0.0.0/8"),
+            _ip.ip_network("169.254.0.0/16"),
+            _ip.ip_network("100.64.0.0/10"),  # CGNAT / Tailscale / ZeroTier
+        ]
+
+        def _is_lan(addr: str) -> bool:
+            try:
+                a = _ip.ip_address(addr)
+                return a.version == 4 and not any(a in n for n in _SKIP)
+            except ValueError:
+                return False
+
+        try:
+            import psutil
+
+            for iface, addrs in psutil.net_if_addrs().items():
+                for addr in addrs:
+                    # AF_INET == 2
+                    if addr.family == 2 and _is_lan(addr.address):
+                        logger.info(
+                            "[network-sharing] Resolved LAN IP via %s: %s",
+                            iface,
+                            addr.address,
+                        )
+                        return addr.address
+        except Exception:
+            pass
+
+        # Last resort: UDP connect — may return VPN IP
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
+            logger.warning(
+                "[network-sharing] Could not find clean LAN IP — using UDP fallback: %s "
+                "(may be a VPN address)",
+                ip,
+            )
             return ip
         except Exception:
             return "127.0.0.1"
