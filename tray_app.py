@@ -1582,11 +1582,83 @@ class TrayApp:
                     log.info("Set identity dialog: cancelled")
                     return
                 new_name = proc.stdout.strip()
-            else:
-                log.warning(
-                    "Set identity: non-macOS platform, edit data/identity.json manually"
+
+            elif sys.platform == "win32":
+                # PowerShell + VB InputBox. Must run with -Sta so the
+                # dialog gets a proper STA COM context — without it the
+                # dialog silently fails and returns empty stdout (returncode 0).
+                safe_username = current_username.replace("'", "''")
+                safe_uuid = current_uuid.replace("'", "''")
+                ps_script = (
+                    "Add-Type -AssemblyName Microsoft.VisualBasic\n"
+                    "$result = [Microsoft.VisualBasic.Interaction]::InputBox("
+                    f"'Username shown to peers during memory sharing.`n`n"
+                    f"Node UUID: {safe_uuid}', "
+                    f"'Set Identity', '{safe_username}')\n"
+                    "Write-Output $result"
                 )
-                return
+                import subprocess as _sp
+
+                log.info("Set identity dialog: running PowerShell InputBox (STA)")
+                proc = _sp.run(
+                    [
+                        "powershell",
+                        "-Sta",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        ps_script,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                log.info(
+                    "Set identity dialog: powershell returncode=%d stdout=%r stderr=%r",
+                    proc.returncode,
+                    proc.stdout,
+                    proc.stderr,
+                )
+                if proc.returncode != 0:
+                    log.info("Set identity dialog: powershell failed")
+                    return
+                new_name = proc.stdout.strip()
+
+            else:
+                # Linux — try zenity then kdialog
+                import subprocess as _sp
+
+                new_name = ""
+                for cmd in [
+                    [
+                        "zenity",
+                        "--entry",
+                        "--title=Set Identity",
+                        "--text=Username shown to peers during memory sharing:",
+                        f"--entry-text={current_username}",
+                    ],
+                    [
+                        "kdialog",
+                        "--inputbox",
+                        "Username shown to peers during memory sharing:",
+                        current_username,
+                        "--title",
+                        "Set Identity",
+                    ],
+                ]:
+                    try:
+                        proc = _sp.run(cmd, capture_output=True, text=True, timeout=60)
+                        if proc.returncode == 0:
+                            new_name = proc.stdout.strip()
+                            break
+                    except FileNotFoundError:
+                        continue
+                if not new_name:
+                    log.warning(
+                        "Set identity: no dialog tool (zenity/kdialog) found. "
+                        "Edit data/identity.json manually to change username."
+                    )
+                    return
 
             if new_name:
                 NodeIdentity.load_or_create(DATA_FOLDER, username=new_name)

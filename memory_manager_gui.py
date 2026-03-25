@@ -114,9 +114,10 @@ class MemoryManagerGUI:
         self._pg_user = os.environ.get("PGUSER", "memory_user")
         self._pg_password = os.environ.get("PGPASSWORD", "")
 
-        # Initialize RobustMemorySystem for write operations (keeps SQLite + ChromaDB in sync)
+        # RobustMemorySystem is loaded lazily on first Save — not at startup.
+        # self.memory_system stays None until the user confirms they want to embed.
         self.memory_system = None
-        self.init_memory_system()
+        self._memory_system_load_attempted = False
 
         # Initialize tokenizer
         self.tokenizer = None
@@ -357,6 +358,34 @@ class MemoryManagerGUI:
                 "Write operations will fall back to raw SQLite (ChromaDB may get out of sync)"
             )
             self.memory_system = None
+
+    def _ensure_memory_system(self) -> bool:
+        """Lazily load RobustMemorySystem on first Save, with user confirmation.
+
+        Returns True if the memory system is ready (already loaded or just loaded).
+        Returns False if the user cancelled or loading failed.
+        """
+        if self.memory_system is not None:
+            return True
+
+        if self._memory_system_load_attempted:
+            # Already tried and failed — don't prompt again this session
+            return False
+
+        # Prompt the user before loading the embedding model
+        confirmed = messagebox.askokcancel(
+            "Load Embedding Model",
+            "Saving a memory requires the embedding model to be loaded "
+            "(BAAI/bge-small-en-v1.5, ~130 MB).\n\n"
+            "This may take a few seconds on the first save.\n\n"
+            "Proceed?",
+        )
+        if not confirmed:
+            return False
+
+        self._memory_system_load_attempted = True
+        self.init_memory_system()
+        return self.memory_system is not None
 
     def count_tokens(self, text: str) -> int:
         """Count tokens in text using tiktoken"""
@@ -1448,27 +1477,30 @@ class MemoryManagerGUI:
             messagebox.showerror("Error", f"Failed to load memory details:\n{str(e)}")
 
     def _open_peer_picker(self):
-        """Open a dialog to pick peers to share this memory with.
+        """Open a dialog to pick peers to share this memory with."""
+        import logging as _logging
 
-        Fetches known peers from GET /peers on the local server and shows
-        them as checkboxes.  Selected peers' UUIDs are written back to
-        self.shared_with_var (comma-separated).  "*" = share with everyone.
+        _log = _logging.getLogger("memory_manager_gui")
 
-        Falls back to a simple text entry when no peers are found or the
-        Toplevel dialog is unavailable.
-        """
         peers = []
         try:
             import requests as _req
 
+            _log.info("Peers button clicked — fetching http://127.0.0.1:8000/peers")
             resp = _req.get("http://127.0.0.1:8000/peers", timeout=3)
+            _log.info("GET /peers status=%d body=%r", resp.status_code, resp.text[:200])
             if resp.ok:
                 peers = resp.json().get("peers", [])
-        except Exception:
-            pass
+                _log.info(
+                    "Peers found: %d — %s",
+                    len(peers),
+                    [(p.get("username"), p.get("node_uuid", "")[:8]) for p in peers],
+                )
+        except Exception as e:
+            _log.warning("Failed to fetch peers: %s", e)
 
         if not peers:
-            # No peers — fall back to inline text entry (already in the UI)
+            _log.info("No peers — showing fallback messagebox")
             messagebox.showinfo(
                 "No peers",
                 "No peers discovered yet.\n\n"
@@ -1477,12 +1509,16 @@ class MemoryManagerGUI:
             )
             return
 
+        _log.info("Building peer picker dialog with %d peer(s)", len(peers))
         # Build picker dialog using Tkinter Toplevel
-        # (memory_manager_gui.py runs Tkinter on the main thread — safe here)
-        dlg = tk.Toplevel(self)
+        dlg = tk.Toplevel(self.root)
         dlg.title("Share with peers")
         dlg.resizable(False, False)
         dlg.grab_set()
+        dlg.lift()
+        dlg.focus_force()
+        dlg.attributes("-topmost", True)
+        _log.info("Peer picker dialog created and raised")
 
         ttk.Label(dlg, text="Select peers to share this memory with:").pack(
             padx=16, pady=(12, 4), anchor=tk.W
@@ -1547,6 +1583,14 @@ class MemoryManagerGUI:
                     "Validation Error", "Title and content are required."
                 )
                 return
+
+            # For the memory_system path (SQLite + ChromaDB sync + embedding),
+            # lazily load the model with user confirmation on first use.
+            # The pgvector and raw-SQLite paths don't need the embedding model
+            # for metadata-only saves, so we only gate the memory_system branch.
+            if self.data_source not in ("pgvector",) and self.memory_system is None:
+                if not self._ensure_memory_system():
+                    return  # User cancelled or load failed
 
             memory_type = self.detail_type_var.get()
             importance = int(self.detail_importance_var.get())
@@ -3336,6 +3380,13 @@ class MemoryManagerGUI:
 
 def main():
     """Main entry point"""
+    import logging as _logging
+
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%H:%M:%S",
+    )
     root = tk.Tk()
     app = MemoryManagerGUI(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
