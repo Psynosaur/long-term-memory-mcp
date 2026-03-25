@@ -266,21 +266,34 @@ class NetworkSharingManager:
     # ── Polling ──────────────────────────────────────────────────
 
     def _poll_loop(self) -> None:
-        """Background thread: poll all known peers every poll_interval seconds."""
-        # Initial short delay so mDNS has time to discover peers after startup
-        time.sleep(10)
+        """Background thread: poll all known peers every poll_interval seconds.
+
+        Polls immediately after a 3-second startup grace period (for mDNS to
+        register). If no peers were found yet, retries every 15 seconds until
+        at least one peer is discovered, then switches to poll_interval cadence.
+        """
+        time.sleep(3)
         while self._running:
-            if self._listener:
-                for node_id, (host, port) in self._listener.peers().items():
+            peers = self._listener.peers() if self._listener else {}
+            if peers:
+                for node_id, (host, port) in peers.items():
                     try:
                         self._poll_peer(node_id, host, port)
                     except Exception as exc:
                         logger.debug("Poll failed for peer %s: %s", node_id, exc)
-            # Sleep in small increments so stop() responds quickly
-            for _ in range(self._poll_interval):
-                if not self._running:
-                    break
-                time.sleep(1)
+                # Full interval sleep between polls
+                for _ in range(self._poll_interval):
+                    if not self._running:
+                        break
+                    time.sleep(1)
+            else:
+                # No peers discovered yet — retry every 15s instead of waiting
+                # the full poll_interval so we pick up new peers quickly.
+                logger.debug("No peers discovered yet, retrying in 15s")
+                for _ in range(15):
+                    if not self._running:
+                        break
+                    time.sleep(1)
 
     def _poll_peer(self, node_id: str, host: str, port: int) -> None:
         """Fetch shared memories from one peer and ingest any new ones."""
