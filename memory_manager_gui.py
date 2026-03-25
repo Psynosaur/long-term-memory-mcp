@@ -1044,7 +1044,7 @@ class MemoryManagerGUI:
         self.tree.column("Title", width=300)
         self.tree.column("Type", width=100)
         self.tree.column("Importance", width=80, anchor=tk.CENTER)
-        self.tree.column("Shared", width=60, anchor=tk.CENTER)
+        self.tree.column("Shared", width=70, anchor=tk.CENTER)
         self.tree.column("Date", width=150)
 
         # Configure headings
@@ -1183,17 +1183,30 @@ class MemoryManagerGUI:
             foreground="#888888",
         ).grid(row=4, column=1, sticky=tk.W, padx=(10, 0))
 
-        # Shared
-        ttk.Label(details_frame, text="Shared:", style="Header.TLabel").grid(
+        # Share with
+        ttk.Label(details_frame, text="Share with:", style="Header.TLabel").grid(
             row=5, column=0, sticky=tk.W, pady=5
         )
-        self.shared_var = tk.BooleanVar(value=False)
-        shared_check = ttk.Checkbutton(
-            details_frame,
-            variable=self.shared_var,
-            text="Broadcast to LAN peers",
+        shared_row = ttk.Frame(details_frame)
+        shared_row.grid(row=5, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
+        shared_row.columnconfigure(0, weight=1)
+
+        self.shared_with_var = tk.StringVar(value="")
+        shared_entry = ttk.Entry(
+            shared_row, textvariable=self.shared_with_var, width=28
         )
-        shared_check.grid(row=5, column=1, sticky=tk.W, pady=5, padx=(10, 0))
+        shared_entry.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+        ttk.Button(
+            shared_row, text="Peers...", command=self._open_peer_picker, width=8
+        ).grid(row=0, column=1, padx=(4, 0))
+
+        ttk.Label(
+            details_frame,
+            text="UUIDs or * for everyone. Leave empty = private.",
+            font=("Segoe UI", 8),
+            foreground="#888888",
+        ).grid(row=5, column=1, sticky=(tk.W, tk.S), pady=(0, 0), padx=(10, 0))
 
         # Content
         ttk.Label(details_frame, text="Content:", style="Header.TLabel").grid(
@@ -1344,7 +1357,10 @@ class MemoryManagerGUI:
                         row["title"][:50] + ("..." if len(row["title"]) > 50 else ""),
                         row["memory_type"],
                         row["importance"],
-                        "✓" if (row["shared"] if "shared" in row.keys() else 0) else "",
+                        "✓"
+                        if (row["shared_with"] if "shared_with" in row.keys() else None)
+                        not in (None, "[]", "")
+                        else "",
                         date_str,
                     ),
                     tags=("row",),
@@ -1388,12 +1404,16 @@ class MemoryManagerGUI:
                 self.content_text.delete("1.0", tk.END)
                 self.content_text.insert("1.0", row["content"])
 
-                # Shared flag
+                # shared_with
                 try:
-                    shared_val = row["shared"] if "shared" in row.keys() else 0
-                    self.shared_var.set(bool(shared_val))
+                    raw = row["shared_with"] if "shared_with" in row.keys() else None
+                    if raw and raw not in ("[]", ""):
+                        sw_list = json.loads(raw)
+                        self.shared_with_var.set(", ".join(sw_list) if sw_list else "")
+                    else:
+                        self.shared_with_var.set("")
                 except Exception:
-                    self.shared_var.set(False)
+                    self.shared_with_var.set("")
 
                 # Display metadata
                 try:
@@ -1427,6 +1447,83 @@ class MemoryManagerGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load memory details:\n{str(e)}")
 
+    def _open_peer_picker(self):
+        """Open a dialog to pick peers to share this memory with.
+
+        Fetches known peers from GET /peers on the local server and shows
+        them as checkboxes.  Selected peers' UUIDs are written back to
+        self.shared_with_var (comma-separated).  "*" = share with everyone.
+
+        Falls back to a simple text entry when no peers are found or the
+        Toplevel dialog is unavailable.
+        """
+        peers = []
+        try:
+            import requests as _req
+
+            resp = _req.get("http://127.0.0.1:8000/peers", timeout=3)
+            if resp.ok:
+                peers = resp.json().get("peers", [])
+        except Exception:
+            pass
+
+        if not peers:
+            # No peers — fall back to inline text entry (already in the UI)
+            messagebox.showinfo(
+                "No peers",
+                "No peers discovered yet.\n\n"
+                "Type UUIDs directly in the 'Share with' field,\n"
+                "or use '*' to share with everyone.",
+            )
+            return
+
+        # Build picker dialog using Tkinter Toplevel
+        # (memory_manager_gui.py runs Tkinter on the main thread — safe here)
+        dlg = tk.Toplevel(self)
+        dlg.title("Share with peers")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Select peers to share this memory with:").pack(
+            padx=16, pady=(12, 4), anchor=tk.W
+        )
+
+        current = [
+            s.strip() for s in self.shared_with_var.get().split(",") if s.strip()
+        ]
+
+        frame = ttk.Frame(dlg)
+        frame.pack(padx=16, pady=4, fill=tk.BOTH)
+
+        everyone_var = tk.BooleanVar(value="*" in current)
+        ttk.Checkbutton(frame, text="Everyone  (*)", variable=everyone_var).pack(
+            anchor=tk.W
+        )
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        peer_vars = {}
+        for p in peers:
+            uuid = p.get("node_uuid", p.get("node_id", ""))
+            label = f"{p.get('username', uuid)}  ({uuid[:8]}...)"
+            var = tk.BooleanVar(value=(uuid in current))
+            ttk.Checkbutton(frame, text=label, variable=var).pack(anchor=tk.W)
+            peer_vars[uuid] = var
+
+        def _apply():
+            if everyone_var.get():
+                self.shared_with_var.set("*")
+            else:
+                selected = [uuid for uuid, v in peer_vars.items() if v.get()]
+                self.shared_with_var.set(", ".join(selected))
+            dlg.destroy()
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(padx=16, pady=(8, 12), fill=tk.X)
+        ttk.Button(btn_frame, text="Apply", command=_apply).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(
+            side=tk.RIGHT, padx=(0, 4)
+        )
+
     def new_memory(self):
         """Create a new memory"""
         self.selected_memory_id = None
@@ -1435,7 +1532,7 @@ class MemoryManagerGUI:
         self.detail_type_var.set("conversation")
         self.detail_importance_var.set("5")
         self.tags_var.set("")
-        self.shared_var.set(False)
+        self.shared_with_var.set("")
         self.content_text.delete("1.0", tk.END)
         self.metadata_label.config(text="New memory - fill in details and click Save")
 
@@ -1462,7 +1559,11 @@ class MemoryManagerGUI:
                 else []
             )
 
-            shared = self.shared_var.get()
+            # Parse shared_with
+            raw_sw = self.shared_with_var.get().strip()
+            shared_with = (
+                [s.strip() for s in raw_sw.split(",") if s.strip()] if raw_sw else []
+            )
 
             if self.data_source == "pgvector" and self.pg_conn is not None:
                 # Write directly to Postgres — memory_system targets SQLite and
@@ -1476,7 +1577,7 @@ class MemoryManagerGUI:
                             UPDATE memories
                             SET title = %s, content = %s, memory_type = %s,
                                 importance = %s, tags = %s, updated_at = %s,
-                                token_count = %s, shared = %s
+                                token_count = %s, shared_with = %s
                             WHERE id = %s
                             """,
                             (
@@ -1487,7 +1588,7 @@ class MemoryManagerGUI:
                                 json.dumps(tags),
                                 now_iso,
                                 self.count_tokens(content),
-                                1 if shared else 0,
+                                json.dumps(shared_with),
                                 self.selected_memory_id,
                             ),
                         )
@@ -1505,7 +1606,7 @@ class MemoryManagerGUI:
                             INSERT INTO memories
                                 (id, title, content, timestamp, tags, importance,
                                  memory_type, metadata, content_hash, created_at,
-                                 updated_at, last_accessed, token_count, shared)
+                                 updated_at, last_accessed, token_count, shared_with)
                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                             """,
                             (
@@ -1522,7 +1623,7 @@ class MemoryManagerGUI:
                                 now_iso,
                                 now_iso,
                                 token_count,
-                                1 if shared else 0,
+                                json.dumps(shared_with),
                             ),
                         )
                         self.pg_conn.commit()
@@ -1543,7 +1644,6 @@ class MemoryManagerGUI:
             elif self.memory_system:
                 # Use RobustMemorySystem to keep SQLite + ChromaDB in sync
                 if self.selected_memory_id:
-                    # Update existing memory
                     result = self.memory_system.update_memory(
                         memory_id=self.selected_memory_id,
                         title=title,
@@ -1551,7 +1651,7 @@ class MemoryManagerGUI:
                         tags=tags,
                         importance=importance,
                         memory_type=memory_type,
-                        shared=shared,
+                        shared_with=shared_with,
                     )
                     if result.success:
                         messagebox.showinfo("Success", "Memory updated successfully!")
@@ -1561,14 +1661,13 @@ class MemoryManagerGUI:
                         )
                         return
                 else:
-                    # Create new memory
                     result = self.memory_system.remember(
                         title=title,
                         content=content,
                         tags=tags,
                         importance=importance,
                         memory_type=memory_type,
-                        shared=shared,
+                        shared_with=shared_with,
                     )
                     if result.success:
                         self.selected_memory_id = result.data[0]["id"]
@@ -1587,7 +1686,7 @@ class MemoryManagerGUI:
                     self.db_conn.execute(
                         """
                         UPDATE memories
-                        SET title = ?, content = ?, memory_type = ?, importance = ?, tags = ?, updated_at = ?, token_count = ?, shared = ?
+                        SET title = ?, content = ?, memory_type = ?, importance = ?, tags = ?, updated_at = ?, token_count = ?, shared_with = ?
                         WHERE id = ?
                     """,
                         (
@@ -1598,7 +1697,7 @@ class MemoryManagerGUI:
                             json.dumps(tags),
                             now_iso,
                             token_count,
-                            1 if shared else 0,
+                            json.dumps(shared_with),
                             self.selected_memory_id,
                         ),
                     )
@@ -1616,7 +1715,7 @@ class MemoryManagerGUI:
 
                     self.db_conn.execute(
                         """
-                        INSERT INTO memories (id, title, content, timestamp, tags, importance, memory_type, metadata, content_hash, created_at, updated_at, last_accessed, token_count, shared)
+                        INSERT INTO memories (id, title, content, timestamp, tags, importance, memory_type, metadata, content_hash, created_at, updated_at, last_accessed, token_count, shared_with)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
@@ -1633,7 +1732,7 @@ class MemoryManagerGUI:
                             now_iso,
                             now_iso,
                             token_count,
-                            1 if shared else 0,
+                            json.dumps(shared_with),
                         ),
                     )
                     self.db_conn.commit()

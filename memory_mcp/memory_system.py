@@ -192,7 +192,7 @@ class RobustMemorySystem:
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 last_accessed TEXT DEFAULT CURRENT_TIMESTAMP,
                 token_count INTEGER DEFAULT 0,
-                shared INTEGER DEFAULT 0
+                shared_with TEXT DEFAULT '[]'
             );
 
             CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp);
@@ -262,10 +262,24 @@ class RobustMemorySystem:
             )
             self.db.commit()
 
-        if "shared" not in columns:
-            self.logger.info("Adding shared column to existing memories table")
-            self.db.execute("ALTER TABLE memories ADD COLUMN shared INTEGER DEFAULT 0")
-            self.db.execute("UPDATE memories SET shared = 0 WHERE shared IS NULL")
+        if "shared" in columns and "shared_with" not in columns:
+            self.logger.info("Migrating shared INTEGER → shared_with TEXT")
+            self.db.execute(
+                "ALTER TABLE memories ADD COLUMN shared_with TEXT DEFAULT '[]'"
+            )
+            # Migrate existing data: shared=1 → shared_with='["*"]', shared=0 → '[]'
+            self.db.execute(
+                "UPDATE memories SET shared_with = CASE WHEN shared = 1 THEN '[\"*\"]' ELSE '[]' END"
+            )
+            self.db.commit()
+        elif "shared_with" not in columns:
+            self.logger.info("Adding shared_with column to existing memories table")
+            self.db.execute(
+                "ALTER TABLE memories ADD COLUMN shared_with TEXT DEFAULT '[]'"
+            )
+            self.db.execute(
+                "UPDATE memories SET shared_with = '[]' WHERE shared_with IS NULL"
+            )
             self.db.commit()
 
     def _init_vector_backend(self, backend: Optional[VectorBackend] = None):
@@ -490,7 +504,7 @@ class RobustMemorySystem:
         importance: int = 5,
         memory_type: str = "conversation",
         metadata: Dict[str, Any] = None,
-        shared: bool = False,
+        shared_with: List[str] = None,
     ) -> Result:
         """
         Store a new memory with both vector and structured storage
@@ -531,19 +545,15 @@ class RobustMemorySystem:
                 importance=importance,
                 memory_type=memory_type,
                 metadata=metadata,
-                shared=shared,
+                shared_with=shared_with or [],
             )
 
             # Store in SQLite FIRST, then ChromaDB.
-            # Order matters: if we crash between the two writes, it's better
-            # to have a SQLite row with no vector (detectable via count
-            # mismatch and fixable with rebuild_vector_index) than an orphan
-            # vector with no SQLite row (invisible and unfixable).
             self.db.execute(
                 """
                 INSERT INTO memories 
                 (id, title, content, timestamp, tags, importance,
-                 memory_type, metadata, content_hash, last_accessed, token_count, shared)
+                 memory_type, metadata, content_hash, last_accessed, token_count, shared_with)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
@@ -556,11 +566,17 @@ class RobustMemorySystem:
                     record.memory_type,
                     json.dumps(record.metadata),
                     content_hash,
-                    record.timestamp.isoformat(),  # Set last_accessed to creation time
+                    record.timestamp.isoformat(),
                     token_count,
-                    1 if shared else 0,
+                    json.dumps(record.shared_with),
                 ),
             )
+
+            # Store in SQLite FIRST, then ChromaDB.
+            # Order matters: if we crash between the two writes, it's better
+            # to have a SQLite row with no vector (detectable via count
+            # mismatch and fixable with rebuild_vector_index) than an orphan
+            # vector with no SQLite row (invisible and unfixable).
             self.db.commit()
 
             # Generate embedding and store in vector backend
@@ -743,7 +759,9 @@ class RobustMemorySystem:
                     importance=row["importance"],
                     memory_type=row["memory_type"],
                     metadata=json.loads(row["metadata"]),
-                    shared=bool(row["shared"]) if row["shared"] is not None else False,
+                    shared_with=json.loads(row["shared_with"])
+                    if row.get("shared_with")
+                    else [],
                 )
 
                 search_results.append(
@@ -866,7 +884,9 @@ class RobustMemorySystem:
                     importance=row["importance"],
                     memory_type=row["memory_type"],
                     metadata=json.loads(row["metadata"]),
-                    shared=bool(row["shared"]) if row["shared"] is not None else False,
+                    shared_with=json.loads(row["shared_with"])
+                    if row.get("shared_with")
+                    else [],
                 )
 
                 result_dict = asdict(record)
@@ -953,7 +973,7 @@ class RobustMemorySystem:
         importance: int = None,
         memory_type: str = None,
         metadata: Dict[str, Any] = None,
-        shared: bool = None,
+        shared_with: List[str] = None,
     ) -> Result:
         """
         Update or modify an existing memory by its unique ID.
@@ -1003,9 +1023,9 @@ class RobustMemorySystem:
                 updates.append("metadata = ?")
                 params.append(json.dumps(metadata))
 
-            if shared is not None:
-                updates.append("shared = ?")
-                params.append(1 if shared else 0)
+            if shared_with is not None:
+                updates.append("shared_with = ?")
+                params.append(json.dumps(shared_with))
 
             now_iso = datetime.now(timezone.utc).isoformat()
             updates.append("updated_at = ?")

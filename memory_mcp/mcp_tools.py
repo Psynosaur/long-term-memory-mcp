@@ -66,7 +66,7 @@ def register_tools(mcp, memory_system):
         tags: str = "",
         importance: int = 5,
         memory_type: str = "conversation",
-        shared: bool = False,
+        shared_with: str = "",
     ) -> dict:
         """
         Store a new memory (fact, preference, event, or conversation snippet).
@@ -81,22 +81,18 @@ def register_tools(mcp, memory_system):
         - tags (str, optional): Comma-separated tags, e.g., "personal, preference".
         - importance (int, optional): 1–10 (default 5). Higher = more important.
         - memory_type (str, optional): e.g., "conversation", "fact", "preference", "event".
-        - shared (bool, optional): If True, broadcast this memory to LAN peers (default False).
+        - shared_with (str, optional): Comma-separated peer UUIDs, or "*" for everyone.
+            Leave empty for private (default). Examples:
+            "*"                         — share with all discovered peers
+            "uuid1,uuid2"               — share with specific peers only
 
         Returns:
             dict: Dictionary with the following keys:
                 - success (bool): Whether the operation succeeded.
                 - reason (str, optional): Explanation when the operation fails.
                 - data (list, optional): List of memory objects. Each object includes:
-                    - id
-                    - title
-                    - content
-                    - timestamp
-                    - tags
-                    - importance
-                    - memory_type
-                    - shared
-                    - ... (additional fields as needed)
+                    - id, title, content, timestamp, tags, importance, memory_type,
+                      shared_with, ... (additional fields as needed)
 
         Example triggers:
         - "My birthday is July 4th."
@@ -106,8 +102,18 @@ def register_tools(mcp, memory_system):
         tag_list = (
             [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
         )
+        shared_with_list = (
+            [s.strip() for s in shared_with.split(",") if s.strip()]
+            if shared_with
+            else []
+        )
         res = memory_system.remember(
-            title, content, tag_list, importance, memory_type, shared=shared
+            title,
+            content,
+            tag_list,
+            importance,
+            memory_type,
+            shared_with=shared_with_list,
         )
         return jsonify_result(res)
 
@@ -266,7 +272,7 @@ def register_tools(mcp, memory_system):
         tags: str = None,
         importance: int = None,
         memory_type: str = None,
-        shared: bool = None,
+        shared_with: str = None,
     ) -> dict:
         """
         Update or modify an existing memory by its unique ID.
@@ -274,7 +280,7 @@ def register_tools(mcp, memory_system):
         When to use:
         - User wants to correct, change, or add details to a stored memory.
         - Requests like "update that memory" or "change my favorite color to blue."
-        - Use this to change content, tags, importance, type, or shared status.
+        - Use this to change content, tags, importance, type, or shared_with.
 
         Args:
         - memory_id (str): Unique ID of the memory to update.
@@ -284,7 +290,8 @@ def register_tools(mcp, memory_system):
         - importance (int, optional): New importance 1–10.
         - memory_type (str, optional): New category, e.g., "fact", "preference", "event",
         "conversation".
-        - shared (bool, optional): Set True to share with LAN peers, False to make private.
+        - shared_with (str, optional): Comma-separated peer UUIDs or "*" for everyone.
+            Pass "" (empty string) to make private.
 
         Returns:
         - dict: { "success": bool, "reason"?: str, "data"?: [ {id, ...} ] }
@@ -292,9 +299,12 @@ def register_tools(mcp, memory_system):
         Example triggers:
         - "Change that to type 'preference' and tag it 'personal'."
         - "Update the camping note to type 'event'."
-        - "Share that memory with the network."
+        - "Share that memory with everyone on the network."
         """
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+        shared_with_list = None
+        if shared_with is not None:
+            shared_with_list = [s.strip() for s in shared_with.split(",") if s.strip()]
         res = memory_system.update_memory(
             memory_id=memory_id,
             title=title,
@@ -302,7 +312,7 @@ def register_tools(mcp, memory_system):
             tags=tag_list,
             importance=importance,
             memory_type=memory_type,
-            shared=shared,
+            shared_with=shared_with_list,
         )
         return jsonify_result(res)
 

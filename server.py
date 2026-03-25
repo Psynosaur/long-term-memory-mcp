@@ -22,6 +22,7 @@ from starlette.responses import JSONResponse
 # Local imports
 from memory_mcp import RobustMemorySystem, register_tools
 from memory_mcp.config import EMBEDDING_MODEL_CONFIG
+from memory_mcp.identity import NodeIdentity
 from memory_mcp.network_sharing import NetworkSharingManager
 
 
@@ -316,6 +317,12 @@ def main():
     # ── Run the server ──────────────────────────────────────────
     backend_info = f"[{args.vector_backend}]"
 
+    # ── Identity ─────────────────────────────────────────────────
+    from memory_mcp.config import DATA_FOLDER
+
+    identity = NodeIdentity.load_or_create(DATA_FOLDER)
+    logging.info("Identity: username=%s uuid=%s", identity.username, identity.node_uuid)
+
     # ── Network sharing (Option A) ───────────────────────────────
     sharing_mgr: NetworkSharingManager | None = None
 
@@ -327,19 +334,47 @@ def main():
         else:
             sharing_mgr = NetworkSharingManager(
                 memory_system=memory_system,
+                identity=identity,
                 http_host=args.host,
                 http_port=args.port,
                 poll_interval=args.sharing_poll_interval,
             )
 
-            # Register the /shared/memories GET endpoint on the FastMCP HTTP server
-            @mcp.custom_route("/shared/memories", methods=["GET"])
-            async def shared_memories_endpoint(request: Request) -> JSONResponse:
-                """Return all locally shared memories for LAN peers to ingest."""
-                memories = sharing_mgr.get_shared_memories()
+            @mcp.custom_route("/identity", methods=["GET"])
+            async def identity_endpoint(request: Request) -> JSONResponse:
+                """Return this node's identity (username + UUID) for peer discovery."""
                 return JSONResponse(
                     {
                         "node_id": sharing_mgr.node_id,
+                        "node_uuid": identity.node_uuid,
+                        "username": identity.username,
+                    }
+                )
+
+            @mcp.custom_route("/peers", methods=["GET"])
+            async def peers_endpoint(request: Request) -> JSONResponse:
+                """Return all currently discovered LAN peers."""
+                return JSONResponse(
+                    {
+                        "peers": sharing_mgr.get_known_peers(),
+                    }
+                )
+
+            @mcp.custom_route("/shared/memories", methods=["GET"])
+            async def shared_memories_endpoint(request: Request) -> JSONResponse:
+                """Return shared memories, optionally filtered to a specific peer UUID.
+
+                Query param:
+                  ?for=<uuid>   — only return memories shared with that UUID or everyone
+                  (omit)        — return all shared memories (admin use)
+                """
+                for_uuid = request.query_params.get("for", "")
+                memories = sharing_mgr.get_shared_memories(for_uuid=for_uuid)
+                return JSONResponse(
+                    {
+                        "node_id": sharing_mgr.node_id,
+                        "node_uuid": identity.node_uuid,
+                        "username": identity.username,
                         "count": len(memories),
                         "memories": memories,
                     }
@@ -353,9 +388,8 @@ def main():
             )
             if sharing_mgr:
                 print(
-                    f"Network sharing enabled (node_id={sharing_mgr.node_id}, "
-                    f"poll_interval={args.sharing_poll_interval}s). "
-                    f"Shared memories available at http://{args.host}:{args.port}/shared/memories"
+                    f"Network sharing enabled (username={identity.username}, "
+                    f"uuid={identity.node_uuid}, poll_interval={args.sharing_poll_interval}s)"
                 )
                 # Start after the HTTP server is up — run in a short-delay thread
                 # so mDNS advertisement happens once uvicorn is accepting connections.

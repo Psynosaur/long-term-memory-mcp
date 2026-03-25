@@ -1210,6 +1210,7 @@ class TrayApp:
             threading.Lock()
         )  # protects _visualizer_proc/_tensorboard_proc/_gui_proc
         self._activity_monitor = ActivityMonitor(self, pg_cfg=pg_cfg)
+        self._pg_cfg = pg_cfg or {}
         self._autostart = AutostartManager()
         # Remember the args used to launch this tray so autostart can replay them
         self._server_args = server_args
@@ -1375,6 +1376,7 @@ class TrayApp:
                 self._on_toggle_network_sharing,
                 checked=lambda item: self._network_sharing_enabled(),
             ),
+            Item("Set Identity...", self._on_set_identity),
             Menu.SEPARATOR,
             Item("Quit", self._on_quit),
         )
@@ -1488,14 +1490,112 @@ class TrayApp:
             log.info("Memory Manager already running")
             return
         log.info("Launching Memory Manager GUI")
+
+        # Pass pgvector connection details via standard PG env vars —
+        # the GUI reads PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD on startup.
+        pg = self._pg_cfg
+        gui_env = None
+        if pg.get("backend_type") == "pgvector":
+            gui_env = {**os.environ}
+            if pg.get("pg_host"):
+                gui_env["PGHOST"] = str(pg["pg_host"])
+            if pg.get("pg_port"):
+                gui_env["PGPORT"] = str(pg["pg_port"])
+            if pg.get("pg_database"):
+                gui_env["PGDATABASE"] = str(pg["pg_database"])
+            if pg.get("pg_user"):
+                gui_env["PGUSER"] = str(pg["pg_user"])
+            if pg.get("pg_password"):
+                gui_env["PGPASSWORD"] = str(pg["pg_password"])
+
         proc = subprocess.Popen(
             [sys.executable, str(GUI_SCRIPT)],
             **_DETACH_KWARGS,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=gui_env,
         )
         with self._subprocess_lock:
             self._gui_proc = proc
+
+    def _on_set_identity(self, icon, item):
+        """Prompt to change the username stored in identity.json."""
+        threading.Thread(target=self._run_set_identity_dialog, daemon=True).start()
+
+    def _run_set_identity_dialog(self):
+        """Show the Set Identity dialog using osascript — no Tkinter.
+
+        Tkinter 9 (Python 3.12 on macOS) calls [NSApplication macOSVersion]
+        which crashes the process regardless of thread. Use osascript instead.
+        """
+        log.info("Set identity dialog: opening")
+        try:
+            from memory_mcp.config import DATA_FOLDER
+            from memory_mcp.identity import NodeIdentity
+
+            try:
+                identity = NodeIdentity.load_or_create(DATA_FOLDER)
+                current_username = identity.username
+                current_uuid = identity.node_uuid
+            except Exception as exc:
+                log.warning("Could not load identity: %s", exc)
+                current_username = ""
+                current_uuid = "unavailable"
+
+            log.info(
+                "Set identity dialog: current username=%s uuid=%s",
+                current_username,
+                current_uuid,
+            )
+
+            if sys.platform == "darwin":
+                # Escape any double-quotes in username for AppleScript string safety
+                safe_username = current_username.replace('"', '\\"')
+                safe_uuid = current_uuid.replace('"', '\\"')
+                script = (
+                    'tell application "System Events"\n'
+                    "  activate\n"
+                    "  set result to text returned of (display dialog "
+                    f'"Username shown to peers during memory sharing.\\n\\nNode UUID: {safe_uuid}" '
+                    f'default answer "{safe_username}" '
+                    'with title "Set Identity" '
+                    'buttons {"Cancel", "OK"} default button "OK")\n'
+                    "end tell\n"
+                    "return result"
+                )
+                import subprocess as _sp
+
+                log.info("Set identity dialog: running osascript")
+                proc = _sp.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                log.info(
+                    "Set identity dialog: osascript returncode=%d stdout=%r stderr=%r",
+                    proc.returncode,
+                    proc.stdout,
+                    proc.stderr,
+                )
+                if proc.returncode != 0:
+                    log.info("Set identity dialog: cancelled")
+                    return
+                new_name = proc.stdout.strip()
+            else:
+                log.warning(
+                    "Set identity: non-macOS platform, edit data/identity.json manually"
+                )
+                return
+
+            if new_name:
+                NodeIdentity.load_or_create(DATA_FOLDER, username=new_name)
+                log.info("Identity username set to '%s'", new_name)
+            else:
+                log.info("Set identity dialog: empty input, no change")
+
+        except Exception as e:
+            log.error("Set identity dialog failed: %s", e, exc_info=True)
 
     def _is_gui_running(self) -> bool:
         """Check if the Memory Manager GUI is alive (proc or cmdline scan)."""
