@@ -93,6 +93,18 @@ STATUS_STARTING = "starting"
 STATUS_RUNNING = "running"
 STATUS_ERROR = "error"
 
+# Cross-platform subprocess detach kwargs.
+# On Windows, start_new_session and creationflags are mutually exclusive;
+# use DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so child processes are
+# isolated from the parent console (no Ctrl+C leakthrough).
+if sys.platform == "win32":
+    _DETACH_KWARGS: dict = {
+        "creationflags": subprocess.DETACHED_PROCESS
+        | subprocess.CREATE_NEW_PROCESS_GROUP,
+    }
+else:
+    _DETACH_KWARGS = {"start_new_session": True}
+
 
 # ---------------------------------------------------------------------------
 # Icon generation  (Pillow — no external assets needed)
@@ -133,7 +145,15 @@ def _make_icon(status: str) -> Image.Image:
 
     # "M" letter centred — try platform-appropriate fonts
     font = None
-    for font_name in ["Arial", "DejaVuSans", "FreeSans", "LiberationSans"]:
+    for font_name in [
+        "arial.ttf",
+        "Arial",
+        "DejaVuSans.ttf",
+        "DejaVuSans",
+        "FreeSans",
+        "LiberationSans-Regular.ttf",
+        "LiberationSans",
+    ]:
         try:
             font = ImageFont.truetype(font_name, size=ICON_SIZE // 2)
             break
@@ -203,8 +223,10 @@ class ServerManager:
         # Check if the process is still running
         try:
             os.kill(old_pid, 0)  # signal 0 = existence check, no actual signal
-        except (ProcessLookupError, PermissionError):
+        except (ProcessLookupError, PermissionError, OSError):
             # Process is gone — stale PID file
+            # OSError covers WinError 87 (invalid parameter) on Windows for
+            # processes that are in a zombie/exiting state.
             log.info("Stale PID file (pid %d is dead), cleaning up", old_pid)
             self._clear_pid()
             return
@@ -263,7 +285,7 @@ class ServerManager:
                     stderr=subprocess.STDOUT,
                     env=env,
                     # Detach from tray's process group so killing tray doesn't kill server
-                    start_new_session=True,
+                    **_DETACH_KWARGS,
                 )
         except Exception as e:
             log.error("Failed to start server: %s", e)
@@ -299,8 +321,12 @@ class ServerManager:
                 # Orphan from a previous tray session — kill by PID
                 log.info("Stopping orphan server (pid %d)...", orphan_pid)
                 try:
-                    os.kill(orphan_pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
+                    import psutil as _ps
+
+                    _ps.Process(orphan_pid).terminate()
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                except Exception:
                     pass
                 self._orphan_pid = None
                 self._status = STATUS_STOPPED
@@ -588,17 +614,39 @@ class ActivityMonitor:
                     ):
                         return conn.pid
             except (self._psutil.AccessDenied, OSError):
+                if sys.platform == "win32":
+                    log.debug(
+                        "psutil.net_connections() requires admin on Windows; "
+                        "falling back to netstat"
+                    )
                 pass
-        # Fallback: lsof (works on macOS without root)
+        # Fallback: netstat on Windows, lsof on macOS/Linux
         try:
-            result = subprocess.run(
-                ["lsof", "-i", f":{port}", "-sTCP:LISTEN", "-t"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return int(result.stdout.strip().split("\n")[0])
+            if sys.platform == "win32":
+                result = subprocess.run(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        if f":{port}" in line and "LISTENING" in line:
+                            parts = line.split()
+                            if parts:
+                                try:
+                                    return int(parts[-1])
+                                except ValueError:
+                                    pass
+            else:
+                result = subprocess.run(
+                    ["lsof", "-i", f":{port}", "-sTCP:LISTEN", "-t"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return int(result.stdout.strip().split("\n")[0])
         except Exception:
             pass
         return None
@@ -939,25 +987,46 @@ class TrayApp:
 
     def _find_pid_by_port(self, port: int) -> Optional[int]:
         """Find a process listening on the given TCP port."""
-        # Try psutil first (works on Linux, may fail on macOS without root)
+        # Try psutil first (works on Linux, may fail on macOS/Windows without root/admin)
         try:
-            import psutil
+            import psutil as _psutil2
 
-            for conn in psutil.net_connections(kind="inet"):
+            for conn in _psutil2.net_connections(kind="inet"):
                 if conn.laddr and conn.laddr.port == port and conn.status == "LISTEN":
                     return conn.pid
-        except Exception:
-            pass
-        # Fallback: lsof (works on macOS without root)
+        except Exception as _e:
+            if sys.platform == "win32" and "access" in str(_e).lower():
+                log.debug(
+                    "psutil.net_connections() requires admin on Windows; "
+                    "falling back to netstat"
+                )
+        # Fallback: netstat on Windows, lsof on macOS/Linux
         try:
-            result = subprocess.run(
-                ["lsof", "-i", f":{port}", "-sTCP:LISTEN", "-t"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return int(result.stdout.strip().split("\n")[0])
+            if sys.platform == "win32":
+                result = subprocess.run(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        if f":{port}" in line and "LISTENING" in line:
+                            parts = line.split()
+                            if parts:
+                                try:
+                                    return int(parts[-1])
+                                except ValueError:
+                                    pass
+            else:
+                result = subprocess.run(
+                    ["lsof", "-i", f":{port}", "-sTCP:LISTEN", "-t"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return int(result.stdout.strip().split("\n")[0])
         except Exception:
             pass
         return None
@@ -969,23 +1038,23 @@ class TrayApp:
             return False
         log.info("Killing orphan %s (pid %d) on port %d", name, pid, port)
         try:
-            os.kill(pid, signal.SIGTERM)
-            # Wait briefly for graceful shutdown
-            import psutil
+            import psutil as _psutil
 
+            p = _psutil.Process(pid)
+            p.terminate()  # SIGTERM on Unix, TerminateProcess on Windows
             try:
-                p = psutil.Process(pid)
                 p.wait(timeout=5)
             except Exception:
-                # Force kill if still alive
+                # Force kill if still alive after grace period
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
+                    p.kill()  # SIGKILL on Unix, TerminateProcess on Windows
+                    p.wait(timeout=3)
+                except Exception:
                     pass
-        except ProcessLookupError:
-            pass  # already dead
-        except PermissionError:
-            log.warning("No permission to kill pid %d", pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass  # already dead or no permission
+        except Exception as e:
+            log.warning("Failed to kill pid %d: %s", pid, e)
             return False
         log.info("Orphan %s (pid %d) stopped", name, pid)
         return True
@@ -1104,7 +1173,7 @@ class TrayApp:
         log.info("Launching Memory Manager GUI")
         proc = subprocess.Popen(
             [sys.executable, str(GUI_SCRIPT)],
-            start_new_session=True,
+            **_DETACH_KWARGS,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1135,8 +1204,12 @@ class TrayApp:
             if pid:
                 log.info("Killing orphan Memory Manager (pid %d)", pid)
                 try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
+                    import psutil as _ps
+
+                    _ps.Process(pid).terminate()
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                except Exception:
                     pass
             return
         log.info("Stopping Memory Manager (pid %d)", proc.pid)
@@ -1180,7 +1253,7 @@ class TrayApp:
             self._vis_log_fh = open(vis_log, "a", encoding="utf-8")
             self._visualizer_proc = subprocess.Popen(
                 cmd,
-                start_new_session=True,
+                **_DETACH_KWARGS,
                 stdout=self._vis_log_fh,
                 stderr=subprocess.STDOUT,
                 env=self._build_subprocess_env(),
@@ -1303,7 +1376,7 @@ class TrayApp:
         try:
             self._tensorboard_proc = subprocess.Popen(
                 cmd,
-                start_new_session=True,
+                **_DETACH_KWARGS,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=self._build_subprocess_env(),
@@ -1535,14 +1608,15 @@ def main():
         server_args += ["--pg-user", args.pg_user]
 
     # Pass pg-password via environment variable (not CLI arg) to avoid
-    # exposing it in the process list visible via `ps aux`.
+    # exposing it in the process list (visible via `ps aux` on Unix /
+    # `tasklist /v` or `Get-Process` on Windows).
     server_env = None
     if args.pg_password is not None:
         server_env = {"PGPASSWORD": args.pg_password}
 
     # Build args to forward to vector_visualizer.py and tensorboard_visualizer.py
-    # NOTE: pg-password is NOT passed as CLI arg (visible in `ps aux`).
-    # Both visualizers read PGPASSWORD from the environment instead.
+    # NOTE: pg-password is NOT passed as CLI arg (visible in `ps aux` on Unix /
+    # `tasklist /v` on Windows). Both visualizers read PGPASSWORD from the environment instead.
     visualizer_args = ["--vector-backend", args.vector_backend]
     if args.pg_host is not None:
         visualizer_args += ["--pg-host", args.pg_host]

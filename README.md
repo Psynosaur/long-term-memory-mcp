@@ -2,6 +2,7 @@
 
 A persistent, human-like memory system for AI companions, powered by pluggable backends for both structured storage and vector search. Designed for decades-long use, seamless recall across sessions, and automatic backups -- making your AI companion feel like a continuous, living persona. Now with biological behavior: time-based lazy decay and reinforcement by use.
 
+Detached fork from [Rotoslider](https://github.com/Rotoslider/long-term-memory-mcp)
 ---
 
 ## Features
