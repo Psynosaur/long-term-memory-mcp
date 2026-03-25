@@ -23,6 +23,7 @@ class MemoryRecord:
         importance (int): 1–10 scale
         memory_type (str): conversation, fact, preference, event, etc.
         metadata (Dict[str, Any])
+        shared (bool): Whether this memory is broadcast to LAN peers via mDNS sharing.
     """
 
     id: str
@@ -33,6 +34,7 @@ class MemoryRecord:
     importance: int
     memory_type: str
     metadata: Dict[str, Any]
+    shared: bool = False
 
 
 @dataclass

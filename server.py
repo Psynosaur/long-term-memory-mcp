@@ -39,9 +39,13 @@ except ImportError as e:
     print(f"Error: {e}")
     sys.exit(1)
 
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
 # Local imports
 from memory_mcp import RobustMemorySystem, register_tools
 from memory_mcp.config import EMBEDDING_MODEL_CONFIG
+from memory_mcp.network_sharing import NetworkSharingManager
 
 
 def _build_vector_backend(args):
@@ -262,6 +266,19 @@ def main():
         default=None,
         help="PostgreSQL password (default: PGPASSWORD env or 'memory_pass')",
     )
+    parser.add_argument(
+        "--network-sharing",
+        action="store_true",
+        default=False,
+        help="Enable LAN memory sharing via mDNS (Option A). "
+        "Advertises this node and polls peers for shared memories.",
+    )
+    parser.add_argument(
+        "--sharing-poll-interval",
+        type=int,
+        default=300,
+        help="Seconds between peer polls when --network-sharing is enabled (default: 300)",
+    )
 
     args = parser.parse_args()
 
@@ -316,12 +333,59 @@ def main():
     # ── Run the server ──────────────────────────────────────────
     backend_info = f"[{args.vector_backend}]"
 
+    # ── Network sharing (Option A) ───────────────────────────────
+    sharing_mgr: NetworkSharingManager | None = None
+
+    if args.network_sharing:
+        if args.transport != "http":
+            print(
+                "Warning: --network-sharing requires --transport http; sharing disabled."
+            )
+        else:
+            sharing_mgr = NetworkSharingManager(
+                memory_system=memory_system,
+                http_host=args.host,
+                http_port=args.port,
+                poll_interval=args.sharing_poll_interval,
+            )
+
+            # Register the /shared/memories GET endpoint on the FastMCP HTTP server
+            @mcp.custom_route("/shared/memories", methods=["GET"])
+            async def shared_memories_endpoint(request: Request) -> JSONResponse:
+                """Return all locally shared memories for LAN peers to ingest."""
+                memories = sharing_mgr.get_shared_memories()
+                return JSONResponse(
+                    {
+                        "node_id": sharing_mgr.node_id,
+                        "count": len(memories),
+                        "memories": memories,
+                    }
+                )
+
     try:
         if args.transport == "http":
             print(
                 f"Starting Long-Term Memory MCP Server {backend_info} "
                 f"on http://{args.host}:{args.port}{args.path}"
             )
+            if sharing_mgr:
+                print(
+                    f"Network sharing enabled (node_id={sharing_mgr.node_id}, "
+                    f"poll_interval={args.sharing_poll_interval}s). "
+                    f"Shared memories available at http://{args.host}:{args.port}/shared/memories"
+                )
+                # Start after the HTTP server is up — run in a short-delay thread
+                # so mDNS advertisement happens once uvicorn is accepting connections.
+                import threading as _threading
+
+                def _delayed_start():
+                    import time as _time
+
+                    _time.sleep(2)
+                    sharing_mgr.start()
+
+                _threading.Thread(target=_delayed_start, daemon=True).start()
+
             # mcp.run() is synchronous in FastMCP 3.x — it calls anyio.run()
             # internally and blocks until the server stops.
             # Do NOT wrap in asyncio.run(): that expects a coroutine and would
@@ -333,9 +397,13 @@ def main():
             asyncio.run(mcp.run_stdio_async(show_banner=False))
     except KeyboardInterrupt:
         print("\nShutting down memory system...")
+        if sharing_mgr:
+            sharing_mgr.stop()
         memory_system.close()
     except Exception as e:
         print(f"Error running MCP server: {e}")
+        if sharing_mgr:
+            sharing_mgr.stop()
         memory_system.close()
 
 

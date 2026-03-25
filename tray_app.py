@@ -195,6 +195,10 @@ class ServerManager:
         # On startup, try to reattach to an orphaned server from a prior crash
         self._reattach_orphan()
 
+    def update_args(self, server_args: list[str]) -> None:
+        """Update the server args used for the next start/restart."""
+        self._server_args = server_args
+
     # ── PID file management ──────────────────────────────────────
 
     def _write_pid(self, pid: int) -> None:
@@ -1366,6 +1370,11 @@ class TrayApp:
                 self._on_toggle_autostart,
                 checked=lambda item: self._autostart.is_enabled(),
             ),
+            Item(
+                "Network Sharing",
+                self._on_toggle_network_sharing,
+                checked=lambda item: self._network_sharing_enabled(),
+            ),
             Menu.SEPARATOR,
             Item("Quit", self._on_quit),
         )
@@ -1374,14 +1383,74 @@ class TrayApp:
 
     def _on_toggle_autostart(self, icon, item):
         """Toggle 'Start at Login' on/off."""
-        if self._autostart.is_enabled():
-            self._autostart.disable()
-        else:
-            # Always include --auto-start so the MCP server launches automatically
-            # when the tray app is started at login.
-            autostart_args = ["--auto-start"] + self._server_args
-            self._autostart.enable(extra_args=autostart_args)
-        self._refresh_icon()
+        try:
+            if self._autostart.is_enabled():
+                self._autostart.disable()
+            else:
+                autostart_args = ["--auto-start"] + self._server_args
+                self._autostart.enable(extra_args=autostart_args)
+            self._refresh_icon()
+        except Exception as e:
+            log.error("Autostart toggle failed: %s", e, exc_info=True)
+
+    # ── Network sharing toggle ───────────────────────────────────
+
+    def _network_sharing_enabled(self) -> bool:
+        """Return True if --network-sharing is present in the current server args."""
+        return "--network-sharing" in self._server_args
+
+    def _on_toggle_network_sharing(self, icon, item):
+        """Toggle LAN memory sharing on/off.
+
+        Updates _server_args, restarts the server if it was running, and
+        re-registers autostart so the plist reflects the new state.
+
+        Wrapped in a broad try/except because pystray silently kills the
+        icon if any unhandled exception escapes a menu callback.
+        """
+        try:
+            if self._network_sharing_enabled():
+                # Remove --network-sharing (and adjacent --sharing-poll-interval if present)
+                new_args = []
+                skip_next = False
+                for arg in self._server_args:
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if arg == "--network-sharing":
+                        continue
+                    if arg == "--sharing-poll-interval":
+                        skip_next = True
+                        continue
+                    new_args.append(arg)
+                self._server_args = new_args
+            else:
+                self._server_args = self._server_args + ["--network-sharing"]
+
+            # Propagate the new args to the ServerManager
+            self._server.update_args(self._server_args)
+
+            # Restart the server if it's currently running so the change takes effect
+            was_running = self._server.status == STATUS_RUNNING
+            if was_running:
+                threading.Thread(target=self._do_restart, daemon=True).start()
+
+            # Keep autostart in sync if it's enabled
+            if self._autostart.is_enabled():
+                try:
+                    self._autostart.disable()
+                    autostart_args = ["--auto-start"] + self._server_args
+                    self._autostart.enable(extra_args=autostart_args)
+                except Exception as ae:
+                    log.error(
+                        "Failed to update autostart after network sharing toggle: %s",
+                        ae,
+                    )
+
+            self._refresh_icon()
+
+        except Exception as e:
+            log.error("Network sharing toggle failed: %s", e, exc_info=True)
 
     def _on_start(self, icon, item):
         threading.Thread(target=self._do_start, daemon=True).start()
@@ -1836,8 +1905,41 @@ def _acquire_single_instance_lock():
             fh.flush()
             return fh  # caller must keep reference alive for the lock to hold
         except BlockingIOError:
-            log.info("Another tray instance is already running — exiting")
-            sys.exit(0)
+            # Lock is held — check if the owning PID is actually alive.
+            # If not (stale lock from a crash), remove the file and retry once.
+            try:
+                stale_pid = int(lock_path.read_text().strip())
+                try:
+                    os.kill(stale_pid, 0)  # signal 0 = existence check only
+                    # Process is alive — another real instance is running
+                    log.info(
+                        "Another tray instance is already running (pid %d) — exiting",
+                        stale_pid,
+                    )
+                    sys.exit(0)
+                except ProcessLookupError:
+                    # PID is dead — stale lock from a crash, remove and retry
+                    log.warning(
+                        "Stale lock file (pid %d dead) — removing and retrying",
+                        stale_pid,
+                    )
+                    lock_path.unlink(missing_ok=True)
+                    try:
+                        fh2 = open(lock_path, "w")
+                        fcntl.flock(fh2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fh2.write(str(os.getpid()))
+                        fh2.flush()
+                        return fh2
+                    except Exception as retry_err:
+                        log.warning("Lock retry failed: %s", retry_err)
+                        return None
+                except PermissionError:
+                    # Can't check the PID (different user) — treat as live
+                    log.info("Another tray instance is already running — exiting")
+                    sys.exit(0)
+            except Exception:
+                log.info("Another tray instance is already running — exiting")
+                sys.exit(0)
         except Exception as e:
             log.warning("Single-instance lock failed: %s", e)
             return None
@@ -1879,6 +1981,18 @@ def main():
     parser.add_argument("--pg-database", type=str, default=None)
     parser.add_argument("--pg-user", type=str, default=None)
     parser.add_argument("--pg-password", type=str, default=None)
+    parser.add_argument(
+        "--network-sharing",
+        action="store_true",
+        default=False,
+        help="Enable LAN memory sharing via mDNS on startup",
+    )
+    parser.add_argument(
+        "--sharing-poll-interval",
+        type=int,
+        default=300,
+        help="Seconds between peer polls when network sharing is enabled (default: 300)",
+    )
 
     args = parser.parse_args()
 
@@ -1903,6 +2017,10 @@ def main():
         server_args += ["--pg-database", args.pg_database]
     if args.pg_user is not None:
         server_args += ["--pg-user", args.pg_user]
+    if args.network_sharing:
+        server_args += ["--network-sharing"]
+    if args.sharing_poll_interval != 300:
+        server_args += ["--sharing-poll-interval", str(args.sharing_poll_interval)]
 
     # Pass pg-password via environment variable (not CLI arg) to avoid
     # exposing it in the process list (visible via `ps aux` on Unix /

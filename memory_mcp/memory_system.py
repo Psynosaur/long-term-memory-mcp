@@ -191,7 +191,8 @@ class RobustMemorySystem:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 last_accessed TEXT DEFAULT CURRENT_TIMESTAMP,
-                token_count INTEGER DEFAULT 0
+                token_count INTEGER DEFAULT 0,
+                shared INTEGER DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp);
@@ -261,6 +262,12 @@ class RobustMemorySystem:
             )
             self.db.commit()
 
+        if "shared" not in columns:
+            self.logger.info("Adding shared column to existing memories table")
+            self.db.execute("ALTER TABLE memories ADD COLUMN shared INTEGER DEFAULT 0")
+            self.db.execute("UPDATE memories SET shared = 0 WHERE shared IS NULL")
+            self.db.commit()
+
     def _init_vector_backend(self, backend: Optional[VectorBackend] = None):
         """Initialize the pluggable vector storage backend.
 
@@ -289,46 +296,55 @@ class RobustMemorySystem:
         Override with env var MEMORY_EMBEDDING_MODEL to switch models.
         After switching, run rebuild_vector_index() to re-embed all memories.
 
-        SSL / offline notes
-        -------------------
-        When launched via macOS LaunchAgent (login autostart) the process
-        inherits a minimal environment that lacks the system certificate bundle,
-        causing huggingface_hub to fail with CERTIFICATE_VERIFY_FAILED even
-        though the model is already cached locally.
+        SSL / offline strategy
+        ----------------------
+        Zscaler and corporate proxies intercept TLS and re-sign it with their
+        own CA.  The venv's certifi bundle does not include that CA, so any
+        outbound HTTPS call (including the HuggingFace Hub update-check that
+        SentenceTransformer triggers on every load) fails with
+        CERTIFICATE_VERIFY_FAILED.
 
-        We therefore:
-        1. Point SSL_CERT_FILE / REQUESTS_CA_BUNDLE at certifi's bundle so
-           httpx/requests always have a valid CA store (needed for any network
-           call, e.g. an explicit model refresh).
-        2. Set HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1 so huggingface_hub
-           skips all network checks and loads straight from the local cache.
-           The model *must* already be cached; a fresh install still needs a
-           one-time manual download in a terminal session.
+        Strategy:
+        1. If the model is already in the HF cache → force offline mode so no
+           network call is made at all.  Fast, safe, works under launchd.
+        2. If the model is NOT cached (fresh install) → disable SSL verification
+           for the one-time download, then the next start will hit path 1.
+
+        The offline flag is set unconditionally (not via setdefault) so it
+        overrides any stale env vars that might have been inherited.
         """
         import os as _os
 
-        # --- Point SSL libraries at certifi's CA bundle ----------------------
+        model_name = EMBEDDING_MODEL_CONFIG["model_name"]
+        self._query_prefix = EMBEDDING_MODEL_CONFIG.get("query_prefix", "").strip()
+
+        # --- Determine whether the model is already cached -------------------
+        model_cached = self._is_model_cached(model_name)
+
+        if model_cached:
+            # Force offline — no network call whatsoever.
+            # Use direct assignment, not setdefault, to override inherited vars.
+            _os.environ["HF_HUB_OFFLINE"] = "1"
+            _os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            self.logger.info("Model '%s' found in cache — loading offline", model_name)
+        else:
+            # One-time download with SSL verification disabled.
+            # Necessary on Zscaler/corporate networks where the proxy re-signs
+            # TLS and certifi's bundle doesn't include the corporate CA.
+            self.logger.warning(
+                "Model '%s' not in cache — downloading with SSL verification "
+                "disabled (Zscaler/corporate proxy environment). "
+                "Subsequent starts will load from cache with no network call.",
+                model_name,
+            )
+            # Disable SSL for requests, httpx, and curl (all used by huggingface_hub)
+            _os.environ["CURL_CA_BUNDLE"] = ""
+            _os.environ["REQUESTS_CA_BUNDLE"] = ""
+            _os.environ["SSL_CERT_FILE"] = ""
+            _os.environ["HF_HUB_OFFLINE"] = "0"
+            _os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
         try:
-            import certifi as _certifi
-
-            _ca = _certifi.where()
-            _os.environ.setdefault("SSL_CERT_FILE", _ca)
-            _os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca)
-        except ImportError:
-            pass  # certifi not installed; SSL env vars remain as-is
-
-        # --- Disable HuggingFace Hub network checks --------------------------
-        # The model is expected to be cached.  If it isn't, the user should
-        # run the server once from a terminal so it can download over a normal
-        # SSL-capable session.
-        _os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
-        try:
-            model_name = EMBEDDING_MODEL_CONFIG["model_name"]
-            # Normalise the query prefix: strip whitespace so the separator
-            # between prefix and query is always explicit and consistent.
-            self._query_prefix = EMBEDDING_MODEL_CONFIG.get("query_prefix", "").strip()
             self.embedding_model = SentenceTransformer(model_name)
             self.logger.info(
                 "Embedding model '%s' (preset: %s, dims: %d) loaded successfully",
@@ -336,11 +352,39 @@ class RobustMemorySystem:
                 EMBEDDING_MODEL,
                 EMBEDDING_MODEL_CONFIG["dimensions"],
             )
-
         except Exception as e:
             self.logger.error("Failed to load embedding model: %s", e)
-            # Fallback to a simpler approach if needed
             raise
+
+    @staticmethod
+    def _is_model_cached(model_name: str) -> bool:
+        """Return True if the HuggingFace model is present in the local cache.
+
+        Checks for the existence of the model's snapshot directory and at
+        least one weight file (.safetensors or .bin) inside it.
+        """
+        try:
+            from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+            import os as _os
+
+            # HF stores models under <cache>/models--<org>--<name>/snapshots/
+            cache_dir = _os.path.join(
+                HUGGINGFACE_HUB_CACHE,
+                "models--" + model_name.replace("/", "--"),
+                "snapshots",
+            )
+            if not _os.path.isdir(cache_dir):
+                return False
+
+            # At least one snapshot must contain model weights
+            for root, _dirs, files in _os.walk(cache_dir):
+                for f in files:
+                    if f.endswith(".safetensors") or f.endswith(".bin"):
+                        return True
+            return False
+        except Exception:
+            # If we can't check, assume not cached — safer to attempt download
+            return False
 
     def _init_tokenizer(self):
         """Initialize tiktoken tokenizer for token counting"""
@@ -446,6 +490,7 @@ class RobustMemorySystem:
         importance: int = 5,
         memory_type: str = "conversation",
         metadata: Dict[str, Any] = None,
+        shared: bool = False,
     ) -> Result:
         """
         Store a new memory with both vector and structured storage
@@ -486,6 +531,7 @@ class RobustMemorySystem:
                 importance=importance,
                 memory_type=memory_type,
                 metadata=metadata,
+                shared=shared,
             )
 
             # Store in SQLite FIRST, then ChromaDB.
@@ -497,8 +543,8 @@ class RobustMemorySystem:
                 """
                 INSERT INTO memories 
                 (id, title, content, timestamp, tags, importance,
-                 memory_type, metadata, content_hash, last_accessed, token_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 memory_type, metadata, content_hash, last_accessed, token_count, shared)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     record.id,
@@ -512,6 +558,7 @@ class RobustMemorySystem:
                     content_hash,
                     record.timestamp.isoformat(),  # Set last_accessed to creation time
                     token_count,
+                    1 if shared else 0,
                 ),
             )
             self.db.commit()
@@ -677,6 +724,7 @@ class RobustMemorySystem:
                     importance=row["importance"],
                     memory_type=row["memory_type"],
                     metadata=json.loads(row["metadata"]),
+                    shared=bool(row["shared"]) if row["shared"] is not None else False,
                 )
 
                 search_results.append(
@@ -799,6 +847,7 @@ class RobustMemorySystem:
                     importance=row["importance"],
                     memory_type=row["memory_type"],
                     metadata=json.loads(row["metadata"]),
+                    shared=bool(row["shared"]) if row["shared"] is not None else False,
                 )
 
                 result_dict = asdict(record)
@@ -885,6 +934,7 @@ class RobustMemorySystem:
         importance: int = None,
         memory_type: str = None,
         metadata: Dict[str, Any] = None,
+        shared: bool = None,
     ) -> Result:
         """
         Update or modify an existing memory by its unique ID.
@@ -933,6 +983,10 @@ class RobustMemorySystem:
             if metadata is not None:
                 updates.append("metadata = ?")
                 params.append(json.dumps(metadata))
+
+            if shared is not None:
+                updates.append("shared = ?")
+                params.append(1 if shared else 0)
 
             now_iso = datetime.now(timezone.utc).isoformat()
             updates.append("updated_at = ?")

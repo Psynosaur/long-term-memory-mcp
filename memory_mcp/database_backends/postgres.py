@@ -183,7 +183,8 @@ class PostgresDatabase(DatabaseBackend):
                     created_at TEXT DEFAULT (NOW()::text),
                     updated_at TEXT DEFAULT (NOW()::text),
                     last_accessed TEXT DEFAULT (NOW()::text),
-                    token_count INTEGER DEFAULT 0
+                    token_count INTEGER DEFAULT 0,
+                    shared INTEGER DEFAULT 0
                 );
             """)
 
@@ -212,6 +213,13 @@ class PostgresDatabase(DatabaseBackend):
                 );
             """)
 
+        self._conn.commit()
+
+        # Column migrations — safe to re-run (IF NOT EXISTS)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "ALTER TABLE memories ADD COLUMN IF NOT EXISTS shared INTEGER DEFAULT 0"
+            )
         self._conn.commit()
 
     def close(self) -> None:
