@@ -566,6 +566,25 @@ class RobustMemorySystem:
             # Generate embedding and store in vector backend
             # Combine title and content for better semantic search
             text_for_embedding = f"{title}\n{content}"
+
+            if self.embedding_model is None:
+                self.logger.error(
+                    "Embedding model not loaded — memory '%s' saved to DB but "
+                    "NOT added to vector index. Run rebuild_vector_index() once "
+                    "the model is available.",
+                    title,
+                )
+                return Result(
+                    success=True,
+                    data=[
+                        {
+                            "id": record.id,
+                            "title": record.title,
+                            "warning": "Saved to database but not embedded — model unavailable",
+                        }
+                    ],
+                )
+
             embedding = self.embedding_model.encode(text_for_embedding).tolist()
 
             try:

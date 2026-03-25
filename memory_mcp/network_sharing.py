@@ -107,18 +107,19 @@ class _MDNSListener:
         port = info.port
         with self._lock:
             self._peers[node_id] = (host, port)
-        logger.info("Peer discovered: %s at %s:%d", node_id, host, port)
+        logger.info(
+            "[network-sharing] Peer discovered: %s at %s:%d", node_id, host, port
+        )
 
     def update_service(self, zc: "Zeroconf", type_: str, name: str) -> None:
         self.add_service(zc, type_, name)
 
     def remove_service(self, zc: "Zeroconf", type_: str, name: str) -> None:
-        # Extract node_id from name (format: "<node_id>._ltm-mcp._tcp.local.")
         node_id = name.split(".")[0]
         with self._lock:
             removed = self._peers.pop(node_id, None)
         if removed:
-            logger.info("Peer removed: %s", node_id)
+            logger.info("[network-sharing] Peer removed: %s", node_id)
 
     # ── Public API ───────────────────────────────────────────────
 
@@ -185,7 +186,7 @@ class NetworkSharingManager:
         )
         self._poll_thread.start()
         logger.info(
-            "Network sharing started (node_id=%s, port=%d, poll_interval=%ds)",
+            "[network-sharing] Started — node_id=%s port=%d poll_interval=%ds",
             self._node_id,
             self._port,
             self._poll_interval,
@@ -266,30 +267,37 @@ class NetworkSharingManager:
     # ── Polling ──────────────────────────────────────────────────
 
     def _poll_loop(self) -> None:
-        """Background thread: poll all known peers every poll_interval seconds.
-
-        Polls immediately after a 3-second startup grace period (for mDNS to
-        register). If no peers were found yet, retries every 15 seconds until
-        at least one peer is discovered, then switches to poll_interval cadence.
-        """
+        """Background thread: poll all known peers every poll_interval seconds."""
         time.sleep(3)
         while self._running:
             peers = self._listener.peers() if self._listener else {}
             if peers:
+                logger.info(
+                    "[network-sharing] Discovered %d peer(s): %s",
+                    len(peers),
+                    ", ".join(
+                        f"{nid}@{host}:{port}" for nid, (host, port) in peers.items()
+                    ),
+                )
                 for node_id, (host, port) in peers.items():
                     try:
                         self._poll_peer(node_id, host, port)
                     except Exception as exc:
-                        logger.debug("Poll failed for peer %s: %s", node_id, exc)
-                # Full interval sleep between polls
+                        logger.warning(
+                            "[network-sharing] Poll failed for peer %s@%s:%d: %s",
+                            node_id,
+                            host,
+                            port,
+                            exc,
+                        )
                 for _ in range(self._poll_interval):
                     if not self._running:
                         break
                     time.sleep(1)
             else:
-                # No peers discovered yet — retry every 15s instead of waiting
-                # the full poll_interval so we pick up new peers quickly.
-                logger.debug("No peers discovered yet, retrying in 15s")
+                logger.info(
+                    "[network-sharing] No peers discovered yet, retrying in 15s"
+                )
                 for _ in range(15):
                     if not self._running:
                         break
@@ -302,42 +310,51 @@ class NetworkSharingManager:
             resp = requests.get(url, timeout=10)
             resp.raise_for_status()
         except requests.RequestException as exc:
-            logger.debug("Could not reach peer %s at %s: %s", node_id, url, exc)
+            logger.warning(
+                "[network-sharing] Could not reach peer %s at %s: %s", node_id, url, exc
+            )
             return
 
         try:
-            memories = resp.json().get("memories", [])
+            data = resp.json()
+            memories = data.get("memories", [])
         except (ValueError, AttributeError):
-            logger.warning("Invalid JSON from peer %s", node_id)
+            logger.warning("[network-sharing] Invalid JSON from peer %s", node_id)
             return
 
+        logger.info(
+            "[network-sharing] Peer %s returned %d shared memory/memories",
+            node_id,
+            len(memories),
+        )
+
         ingested = 0
+        skipped = 0
         for mem in memories:
             peer_mem_id = mem.get("id", "")
             key = f"{node_id}:{peer_mem_id}"
             with self._seen_lock:
                 if key in self._seen:
+                    skipped += 1
                     continue
                 self._seen.add(key)
-
             ingested += self._ingest(mem, node_id)
 
-        if ingested:
-            logger.info("Ingested %d new memories from peer %s", ingested, node_id)
+        logger.info(
+            "[network-sharing] Peer %s: ingested=%d skipped_seen=%d",
+            node_id,
+            ingested,
+            skipped,
+        )
 
     def _ingest(self, mem: dict, peer_node_id: str) -> int:
-        """
-        Ingest a single peer memory into the local store.
-
-        Returns 1 if ingested, 0 if skipped (duplicate or invalid).
-        """
+        """Ingest a single peer memory. Returns 1 if ingested, 0 if skipped."""
         try:
             title = mem.get("title", "").strip()
             content = mem.get("content", "").strip()
             if not title or not content:
                 return 0
 
-            # Don't re-relay peer memories — only ingest originals
             existing_tags = mem.get("tags", [])
             if isinstance(existing_tags, str):
                 try:
@@ -349,6 +366,55 @@ class NetworkSharingManager:
             if _is_peer_memory(existing_tags):
                 return 0
 
+            peer_tag = f"{_PEER_TAG_PREFIX}{peer_node_id}"
+            tags = [t for t in existing_tags if t] + [peer_tag]
+
+            result = self._ms.remember(
+                title=title,
+                content=content,
+                tags=tags,
+                importance=int(mem.get("importance", 5)),
+                memory_type=mem.get("memory_type", "conversation"),
+                shared=False,
+            )
+
+            if result.success:
+                logger.info(
+                    "[network-sharing] Ingested '%s' from peer %s", title, peer_node_id
+                )
+                return 1
+            if "Duplicate" in (result.reason or ""):
+                return 0
+            logger.warning(
+                "[network-sharing] Failed to ingest '%s': %s", title, result.reason
+            )
+            return 0
+
+        except Exception as exc:
+            logger.warning(
+                "[network-sharing] Exception ingesting '%s': %s",
+                mem.get("title", "?"),
+                exc,
+                exc_info=True,
+            )
+            return 0
+
+            # Don't re-relay peer memories — only ingest originals
+            existing_tags = mem.get("tags", [])
+            if isinstance(existing_tags, str):
+                try:
+                    existing_tags = json.loads(existing_tags)
+                except ValueError:
+                    existing_tags = [
+                        t.strip() for t in existing_tags.split(",") if t.strip()
+                    ]
+            if _is_peer_memory(existing_tags):
+                logger.info(
+                    "[network-sharing] Skipping '%s' — already a peer-sourced memory",
+                    title,
+                )
+                return 0
+
             # Build tag list: keep original tags + add peer attribution
             peer_tag = f"{_PEER_TAG_PREFIX}{peer_node_id}"
             tags = [t for t in existing_tags if t] + [peer_tag]
@@ -356,29 +422,48 @@ class NetworkSharingManager:
             importance = int(mem.get("importance", 5))
             memory_type = mem.get("memory_type", "conversation")
 
-            # remember() will reject duplicates via content_hash — safe to call blindly.
-            # We re-embed locally (discard peer's vector) for a consistent embedding space.
+            logger.info(
+                "[network-sharing] Ingesting '%s' from peer %s (type=%s, importance=%d)",
+                title,
+                peer_node_id,
+                memory_type,
+                importance,
+            )
+
             result = self._ms.remember(
                 title=title,
                 content=content,
                 tags=tags,
                 importance=importance,
                 memory_type=memory_type,
-                shared=False,  # ingested peer memories are private by default
+                shared=False,
             )
 
             if result.success:
+                logger.info(
+                    "[network-sharing] Successfully ingested '%s' (id=%s)",
+                    title,
+                    result.data[0]["id"] if result.data else "?",
+                )
                 return 1
-            # "Duplicate content detected" is expected and not an error
             if "Duplicate" in (result.reason or ""):
+                logger.info(
+                    "[network-sharing] Skipping '%s' — duplicate content already in store",
+                    title,
+                )
                 return 0
-            logger.debug(
-                "Ingest skipped for peer memory '%s': %s", title, result.reason
+            logger.warning(
+                "[network-sharing] remember() rejected '%s': %s", title, result.reason
             )
             return 0
 
         except Exception as exc:
-            logger.warning("Failed to ingest peer memory: %s", exc)
+            logger.warning(
+                "[network-sharing] Exception ingesting peer memory '%s': %s",
+                mem.get("title", "?"),
+                exc,
+                exc_info=True,
+            )
             return 0
 
     # ── Shared memories query ────────────────────────────────────
