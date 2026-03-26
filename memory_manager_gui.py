@@ -272,6 +272,39 @@ class MemoryManagerGUI:
             arrowcolor=self.fg_color,
         )
 
+        # Dialog button styles (used in Toplevel dialogs where tk.Button bg is
+        # ignored by macOS Aqua — ttk with named styles is the only reliable fix)
+        self.style.configure(
+            "Dialog.TButton",
+            background=self.secondary_bg,
+            foreground=self.fg_color,
+            bordercolor=self.border_color,
+            darkcolor=self.secondary_bg,
+            lightcolor=self.secondary_bg,
+            font=("Segoe UI", 10),
+            padding=(14, 6),
+        )
+        self.style.map(
+            "Dialog.TButton",
+            background=[("active", self.hover_bg), ("pressed", self.hover_bg)],
+            foreground=[("active", self.fg_color)],
+        )
+        self.style.configure(
+            "DialogAccent.TButton",
+            background=self.button_bg,
+            foreground="#ffffff",
+            bordercolor=self.button_bg,
+            darkcolor=self.button_bg,
+            lightcolor=self.button_bg,
+            font=("Segoe UI", 10, "bold"),
+            padding=(14, 6),
+        )
+        self.style.map(
+            "DialogAccent.TButton",
+            background=[("active", "#1177bb"), ("pressed", "#0d5a8f")],
+            foreground=[("active", "#ffffff")],
+        )
+
     def connect_database(self):
         """Connect to the SQLite database with corruption protection"""
         try:
@@ -1510,39 +1543,83 @@ class MemoryManagerGUI:
             return
 
         _log.info("Building peer picker dialog with %d peer(s)", len(peers))
+
+        # Grab theme colors from the main app instance
+        bg = self.bg_color  # "#1e1e1e"
+        fg = self.fg_color  # "#e0e0e0"
+        sec_bg = self.secondary_bg  # "#2d2d2d"
+        border = self.border_color  # "#3e3e3e"
+        font_ui = ("Segoe UI", 10)
+
         # Build picker dialog using Tkinter Toplevel
         dlg = tk.Toplevel(self.root)
-        dlg.title("Share with peers")
+        dlg.title("Share with")
+        dlg.configure(bg=bg)
         dlg.resizable(False, False)
         dlg.grab_set()
         dlg.lift()
         dlg.focus_force()
         dlg.attributes("-topmost", True)
+        dlg.minsize(300, 0)
         _log.info("Peer picker dialog created and raised")
-
-        ttk.Label(dlg, text="Select peers to share this memory with:").pack(
-            padx=16, pady=(12, 4), anchor=tk.W
-        )
 
         current = [
             s.strip() for s in self.shared_with_var.get().split(",") if s.strip()
         ]
 
-        frame = ttk.Frame(dlg)
-        frame.pack(padx=16, pady=4, fill=tk.BOTH)
+        # Outer padding frame — plain tk.Frame so bg is respected
+        outer = tk.Frame(dlg, bg=bg)
+        outer.pack(fill=tk.BOTH, expand=True, padx=20, pady=(16, 14))
+
+        tk.Label(
+            outer,
+            text="Share this memory with:",
+            bg=bg,
+            fg=fg,
+            font=font_ui,
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(0, 10))
+
+        # Checkbox area
+        check_frame = tk.Frame(outer, bg=bg)
+        check_frame.pack(fill=tk.BOTH, expand=True)
+
+        def _make_check(parent, text, variable):
+            """Create a themed checkbutton that respects the dark background."""
+            cb = tk.Checkbutton(
+                parent,
+                text=text,
+                variable=variable,
+                bg=bg,
+                fg=fg,
+                selectcolor=sec_bg,
+                activebackground=bg,
+                activeforeground=fg,
+                font=font_ui,
+                anchor=tk.W,
+                relief=tk.FLAT,
+                highlightthickness=0,
+                bd=0,
+            )
+            return cb
 
         everyone_var = tk.BooleanVar(value="*" in current)
-        ttk.Checkbutton(frame, text="Everyone  (*)", variable=everyone_var).pack(
-            anchor=tk.W
+        _make_check(check_frame, "Everyone", everyone_var).pack(
+            anchor=tk.W, pady=2, fill=tk.X
         )
-        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        if peers:
+            # Thin separator using a 1px Frame — ttk.Separator is invisible on dark bg
+            tk.Frame(check_frame, bg=border, height=1).pack(fill=tk.X, pady=(8, 6))
 
         peer_vars = {}
         for p in peers:
             uuid = p.get("node_uuid", p.get("node_id", ""))
-            label = f"{p.get('username', uuid)}  ({uuid[:8]}...)"
+            username = p.get("username", uuid)
+            short_id = uuid[:8] if uuid else "?"
+            label = f"{username}  \u2014  {short_id}"
             var = tk.BooleanVar(value=(uuid in current))
-            ttk.Checkbutton(frame, text=label, variable=var).pack(anchor=tk.W)
+            _make_check(check_frame, label, var).pack(anchor=tk.W, pady=2, fill=tk.X)
             peer_vars[uuid] = var
 
         def _apply():
@@ -1553,12 +1630,19 @@ class MemoryManagerGUI:
                 self.shared_with_var.set(", ".join(selected))
             dlg.destroy()
 
-        btn_frame = ttk.Frame(dlg)
-        btn_frame.pack(padx=16, pady=(8, 12), fill=tk.X)
-        ttk.Button(btn_frame, text="Apply", command=_apply).pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(
-            side=tk.RIGHT, padx=(0, 4)
-        )
+        # Separator above buttons
+        tk.Frame(outer, bg=border, height=1).pack(fill=tk.X, pady=(14, 10))
+
+        btn_frame = tk.Frame(outer, bg=bg)
+        btn_frame.pack(fill=tk.X)
+
+        # Use ttk.Button with named styles — tk.Button bg is ignored on macOS Aqua
+        ttk.Button(
+            btn_frame, text="Apply", command=_apply, style="DialogAccent.TButton"
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        ttk.Button(
+            btn_frame, text="Cancel", command=dlg.destroy, style="Dialog.TButton"
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
 
     def new_memory(self):
         """Create a new memory"""
