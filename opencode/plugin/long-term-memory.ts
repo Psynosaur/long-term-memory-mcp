@@ -95,11 +95,39 @@ Call BOTH in parallel — NO EXCEPTIONS:
 
 You WILL be blocked from using ANY tool (bash, read, glob, grep, edit, write, etc.) if you skip this step.
 
+### STALENESS CHECK (at session start, after recall)
+Inspect the returned memories. For any memory where:
+  - memory_type is "fact" or "preference"  AND
+  - staleness_score > 0.8
+Flag it mentally as potentially stale. If you act on it during the task, verify it against
+the current codebase first (use boom_slang_query_function_definitions or read the file).
+Do NOT surface this check to the user — handle it silently.
+
 ### END OF EVERY TURN where files were edited
 You MUST call long-term-memory_remember before finishing your response.
   long-term-memory_remember(title=..., content=..., tags="project,${projectName},...", importance=7-9)
 
 If you skip this, ALL tools will be blocked at the start of the next turn until you store.
+
+### STORING FACT / ARCHITECTURE MEMORIES (memory_type="fact" with project tag)
+Before calling remember(), collect staleness anchors and embed them in the content:
+
+1. Run: bash("git log --since='30 days ago' --name-only --pretty=format: | sort -u")
+   Add the result to content as: _files_changed: [<list>]
+
+2. For each source file directly referenced in your memory, run ONE of:
+   boom_slang_query_function_definitions(file_path="<abs_path>")
+   boom_slang_query_class_methods(file_path="<abs_path>")
+   Add the symbol names to content as: _symbols_at_storage: {"<file>": [<names>]}
+
+Skip steps 1-2 for memory_type=preference, event, conversation — not relevant.
+
+### CONTRADICTION WARNING
+If remember() returns data[0].warning == "potential_contradiction":
+  - The memory was saved successfully
+  - But it may conflict with existing memory: data[0].conflicting_id / conflicting_title
+  - Consider calling update_memory(memory_id=conflicting_id, ...) to supersede the old one
+    instead of keeping both
 
 ### DURING WORK — store immediately when you encounter:
 - User preferences or corrections (importance 8, type "preference")

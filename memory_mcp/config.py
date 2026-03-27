@@ -170,3 +170,56 @@ REINFORCEMENT_ENABLED = True
 REINFORCEMENT_STEP = 0.1  # amount per retrieval
 REINFORCEMENT_WRITEBACK_STEP = 0.5  # write to DB when accumulated ≥ 0.5
 REINFORCEMENT_MAX = 10  # cap importance
+
+
+# ── Staleness Score Configuration ───────────────────────────────────────────
+#
+# Staleness is a STRUCTURAL signal — separate from importance decay.
+# Decay tracks usage (importance falls when a memory isn't accessed).
+# Staleness tracks age vs expected lifetime for the memory type.
+#
+# staleness_score = min(1.0, days_since_stored / expected_lifetime_days)
+# 0.0 = fresh, 1.0 = fully stale
+#
+# Appended to every search result so the agent can see it.
+# Memories with staleness_score > STALENESS_WARN_THRESHOLD and
+# memory_type in STALENESS_WARN_TYPES are flagged at session start.
+#
+STALENESS_ENABLED = True
+
+STALENESS_EXPECTED_LIFETIME_DAYS = {
+    "conversation": 7,
+    "fact": 30,  # architecture facts go stale fast
+    "preference": 180,
+    "task": 14,
+    "event": 365,
+    "ephemeral": 3,
+}
+STALENESS_EXPECTED_LIFETIME_DEFAULT = 60  # fallback for unknown types
+
+# Threshold above which a memory is considered stale enough to flag
+STALENESS_WARN_THRESHOLD = 0.8
+
+# Only flag these types at session start — no need to warn about events/conversations
+STALENESS_WARN_TYPES = {"fact", "preference"}
+
+
+# ── Contradiction Detection Configuration ───────────────────────────────────
+#
+# When remember() is called with memory_type in CONTRADICTION_CHECK_TYPES,
+# a semantic similarity search is run against existing memories of the same type.
+# If a candidate exceeds CONTRADICTION_SIMILARITY_THRESHOLD the write is still
+# performed but the result includes a warning so the agent can decide whether
+# to update the existing memory instead.
+#
+CONTRADICTION_DETECTION_ENABLED = True
+
+# Cosine similarity range for contradiction detection.
+# - Below LOW: unrelated — ignore
+# - Between LOW and HIGH: similar topic, possibly contradictory — warn
+# - Above HIGH: near-identical content — already caught by the exact hash check above
+CONTRADICTION_SIMILARITY_THRESHOLD = 0.75  # lower bound (was 0.85)
+CONTRADICTION_SIMILARITY_UPPER = 0.98  # upper bound — above this = near-duplicate
+
+# Only check these types — no value checking conversations or events
+CONTRADICTION_CHECK_TYPES = {"fact", "preference"}

@@ -51,6 +51,15 @@ from .config import (
     REINFORCEMENT_STEP,
     REINFORCEMENT_WRITEBACK_STEP,
     REINFORCEMENT_MAX,
+    STALENESS_ENABLED,
+    STALENESS_EXPECTED_LIFETIME_DAYS,
+    STALENESS_EXPECTED_LIFETIME_DEFAULT,
+    STALENESS_WARN_THRESHOLD,
+    STALENESS_WARN_TYPES,
+    CONTRADICTION_DETECTION_ENABLED,
+    CONTRADICTION_SIMILARITY_THRESHOLD,
+    CONTRADICTION_SIMILARITY_UPPER,
+    CONTRADICTION_CHECK_TYPES,
 )
 
 
@@ -535,6 +544,60 @@ class RobustMemorySystem:
             if cursor.fetchone():
                 return Result(success=False, reason="Duplicate content detected")
 
+            # ── Contradiction detection ──────────────────────────────────────
+            # For fact/preference types, run a semantic similarity search before
+            # writing. If an existing memory of the same type scores above the
+            # threshold, we still write but return a warning so the agent can
+            # decide whether to update the old memory instead.
+            contradiction_warning = None
+            if (
+                CONTRADICTION_DETECTION_ENABLED
+                and memory_type in CONTRADICTION_CHECK_TYPES
+                and self.embedding_model is not None
+            ):
+                try:
+                    check_embedding = self.embedding_model.encode(
+                        f"{title}\n{content}"
+                    ).tolist()
+                    candidates = self.vector_backend.query(
+                        query_embedding=check_embedding,
+                        n_results=5,
+                    )
+                    for c in candidates:
+                        similarity = 1.0 - c.distance
+                        # Skip if below lower bound (unrelated) or above upper bound
+                        # (near-identical — the exact hash check above already handles those)
+                        if not (
+                            CONTRADICTION_SIMILARITY_THRESHOLD
+                            <= similarity
+                            < CONTRADICTION_SIMILARITY_UPPER
+                        ):
+                            continue
+                        # Check it's the same memory_type (avoid cross-type false positives)
+                        cand_row = self.db.execute(
+                            "SELECT id, title, memory_type FROM memories WHERE id = ?",
+                            (c.id,),
+                        ).fetchone()
+                        if cand_row and cand_row["memory_type"] == memory_type:
+                            contradiction_warning = {
+                                "conflicting_id": cand_row["id"],
+                                "conflicting_title": cand_row["title"],
+                                "similarity": round(similarity, 3),
+                            }
+                            self.logger.info(
+                                "Contradiction candidate: new='%s' conflicts with "
+                                "existing id=%s title='%s' (similarity=%.3f)",
+                                title,
+                                cand_row["id"],
+                                cand_row["title"],
+                                similarity,
+                            )
+                            break  # report the highest-similarity conflict only
+                except Exception as contra_err:
+                    self.logger.warning(
+                        "Contradiction check failed (non-fatal): %s", contra_err
+                    )
+
             # Create memory record
             record = MemoryRecord(
                 id=memory_id,
@@ -644,6 +707,11 @@ class RobustMemorySystem:
             self.logger.info("Memory stored successfully: %s", memory_id)
             rec = asdict(record)
             rec["timestamp"] = record.timestamp.isoformat()
+            if contradiction_warning:
+                rec["warning"] = "potential_contradiction"
+                rec["conflicting_id"] = contradiction_warning["conflicting_id"]
+                rec["conflicting_title"] = contradiction_warning["conflicting_title"]
+                rec["similarity"] = contradiction_warning["similarity"]
             return Result(success=True, data=[rec])
 
         except Exception as e:
@@ -787,6 +855,13 @@ class RobustMemorySystem:
                 result_dict["timestamp"] = sr.record.timestamp.isoformat()
                 result_dict["relevance_score"] = sr.relevance_score
                 result_dict["match_type"] = sr.match_type
+                staleness = self._compute_staleness_score(result_dict)
+                result_dict["staleness_score"] = staleness
+                if (
+                    staleness >= STALENESS_WARN_THRESHOLD
+                    and result_dict.get("memory_type") in STALENESS_WARN_TYPES
+                ):
+                    result_dict["staleness_warning"] = True
                 result_data.append(result_dict)
 
             self.logger.info(
@@ -892,6 +967,13 @@ class RobustMemorySystem:
                 result_dict = asdict(record)
                 result_dict["timestamp"] = record.timestamp.isoformat()
                 result_dict["match_type"] = "structured"
+                staleness = self._compute_staleness_score(row)
+                result_dict["staleness_score"] = staleness
+                if (
+                    staleness >= STALENESS_WARN_THRESHOLD
+                    and result_dict.get("memory_type") in STALENESS_WARN_TYPES
+                ):
+                    result_dict["staleness_warning"] = True
                 results.append(result_dict)
 
             # Batch-commit any decay/reinforcement writes from the loop above
@@ -1658,6 +1740,50 @@ class RobustMemorySystem:
                 "Reinforcement skipped for id=%s: %s", row.get("id", "UNKNOWN"), e
             )
             return None
+
+    def _compute_staleness_score(self, row) -> float:
+        """
+        Compute a staleness score for a memory row.
+
+        Returns a float in [0.0, 1.0]:
+          0.0 = just stored / protected / lifetime misconfigured
+          1.0 = age >= expected lifetime for this type (fully stale)
+
+        This is a STRUCTURAL signal based purely on age vs expected lifetime.
+        It is separate from importance decay, which is a usage signal.
+        Protected tags (core, identity, pinned) are never considered stale.
+        """
+        if not STALENESS_ENABLED:
+            return 0.0
+        try:
+            tags = (
+                row["tags"]
+                if isinstance(row, dict)
+                else (row["tags"] if "tags" in row.keys() else None)
+            )
+            if self._should_protect(tags):
+                return 0.0
+            memory_type = (
+                row.get("memory_type")
+                if isinstance(row, dict)
+                else (row["memory_type"] if "memory_type" in row.keys() else None)
+            )
+            lifetime = STALENESS_EXPECTED_LIFETIME_DAYS.get(
+                memory_type, STALENESS_EXPECTED_LIFETIME_DEFAULT
+            )
+            if not lifetime:
+                self.logger.warning(
+                    "Staleness: lifetime=0 for memory_type=%r — returning 0.0",
+                    memory_type,
+                )
+                return 0.0
+            timestamp = (
+                row.get("timestamp") if isinstance(row, dict) else row["timestamp"]
+            )
+            days_old = self._days_since(timestamp)
+            return round(min(1.0, days_old / lifetime), 3)
+        except Exception:
+            return 0.0
 
     def list_source_memories(self, source_db_path: str, limit: int = 100) -> Result:
         """
