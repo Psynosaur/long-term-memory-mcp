@@ -360,7 +360,7 @@ class RobustMemorySystem:
                 "Subsequent starts will load from cache with no network call.",
                 model_name,
             )
-            # Disable SSL for requests, httpx, and curl (all used by huggingface_hub)
+            # Disable SSL for requests and curl
             _os.environ["CURL_CA_BUNDLE"] = ""
             _os.environ["REQUESTS_CA_BUNDLE"] = ""
             _os.environ["SSL_CERT_FILE"] = ""
@@ -371,6 +371,24 @@ class RobustMemorySystem:
             _os.environ["TRANSFORMERS_OFFLINE"] = "0"
             _os.environ["HUGGINGFACE_HUB_OFFLINE"] = "0"
             _os.environ["HF_DATASETS_OFFLINE"] = "0"
+            # huggingface_hub uses httpx internally. Unlike requests, httpx ignores
+            # REQUESTS_CA_BUNDLE. Monkeypatch httpx.Client to disable SSL verification
+            # for the one-time download. We restore the original __init__ afterward.
+            import httpx as _httpx
+
+            _orig_client_init = _httpx.Client.__init__
+            _orig_async_client_init = _httpx.AsyncClient.__init__
+
+            def _no_ssl_client_init(self, *args, **kwargs):
+                kwargs["verify"] = False
+                _orig_client_init(self, *args, **kwargs)
+
+            def _no_ssl_async_client_init(self, *args, **kwargs):
+                kwargs["verify"] = False
+                _orig_async_client_init(self, *args, **kwargs)
+
+            _httpx.Client.__init__ = _no_ssl_client_init
+            _httpx.AsyncClient.__init__ = _no_ssl_async_client_init
 
         try:
             self.embedding_model = SentenceTransformer(
@@ -388,6 +406,14 @@ class RobustMemorySystem:
         except Exception as e:
             self.logger.error("Failed to load embedding model: %s", e)
             raise
+        finally:
+            # Restore httpx patching if we applied it (only in the non-cached branch)
+            if not model_cached:
+                try:
+                    _httpx.Client.__init__ = _orig_client_init
+                    _httpx.AsyncClient.__init__ = _orig_async_client_init
+                except Exception:
+                    pass
 
     @staticmethod
     def _is_model_cached(model_name: str) -> bool:
@@ -524,6 +550,7 @@ class RobustMemorySystem:
         memory_type: str = "conversation",
         metadata: Dict[str, Any] = None,
         shared_with: List[str] = None,
+        file_paths: List[str] = None,
     ) -> Result:
         """
         Store a new memory with both vector and structured storage
@@ -606,6 +633,34 @@ class RobustMemorySystem:
                 except Exception as contra_err:
                     self.logger.warning(
                         "Contradiction check failed (non-fatal): %s", contra_err
+                    )
+
+            # ── AST symbol enrichment ────────────────────────────────────────
+            # When file_paths are provided and memory_type is "fact", extract
+            # symbol names via ast-grep-py and append as _symbols_at_storage.
+            # Fully optional — degrades silently if ast-grep-py not installed
+            # or if files are unreadable.
+            if file_paths and memory_type == "fact":
+                try:
+                    from .ast_extractor import extract_symbols_multi  # type: ignore[import]
+
+                    symbols = extract_symbols_multi(
+                        [p for p in file_paths if p and p.strip()]
+                    )
+                    if symbols:
+                        import json as _json
+
+                        content = (
+                            content.rstrip()
+                            + f"\n\n_symbols_at_storage: {_json.dumps(symbols)}"
+                        )
+                        self.logger.info(
+                            "AST enrichment: extracted symbols from %d file(s)",
+                            len(symbols),
+                        )
+                except Exception as ast_err:
+                    self.logger.warning(
+                        "AST symbol enrichment failed (non-fatal): %s", ast_err
                     )
 
             # Create memory record
