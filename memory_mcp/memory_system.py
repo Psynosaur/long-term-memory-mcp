@@ -364,11 +364,21 @@ class RobustMemorySystem:
             _os.environ["CURL_CA_BUNDLE"] = ""
             _os.environ["REQUESTS_CA_BUNDLE"] = ""
             _os.environ["SSL_CERT_FILE"] = ""
+            # Explicitly clear ALL offline flags — some corporate environments
+            # pre-set these, which causes huggingface_hub to force local_files_only=True
+            # even when we want to download for the first time.
             _os.environ["HF_HUB_OFFLINE"] = "0"
             _os.environ["TRANSFORMERS_OFFLINE"] = "0"
+            _os.environ["HUGGINGFACE_HUB_OFFLINE"] = "0"
+            _os.environ["HF_DATASETS_OFFLINE"] = "0"
 
         try:
-            self.embedding_model = SentenceTransformer(model_name)
+            self.embedding_model = SentenceTransformer(
+                model_name,
+                # Pass local_files_only explicitly based on cache state,
+                # overriding any env-var that huggingface_hub might have picked up.
+                local_files_only=model_cached,
+            )
             self.logger.info(
                 "Embedding model '%s' (preset: %s, dims: %d) loaded successfully",
                 model_name,
