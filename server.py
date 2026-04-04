@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 # Local imports
-from memory_mcp import RobustMemorySystem, register_tools
+from memory_mcp import RobustMemorySystem, register_tools, AuditLogger
 from memory_mcp.config import EMBEDDING_MODEL_CONFIG
 from memory_mcp.identity import NodeIdentity
 from memory_mcp.network_sharing import NetworkSharingManager
@@ -263,8 +263,24 @@ def main():
         default=300,
         help="Seconds between peer polls when --network-sharing is enabled (default: 300)",
     )
+    parser.add_argument(
+        "--audit-dir",
+        type=str,
+        default=None,
+        help="Directory for audit JSONL files (default: data/audit/ relative to repo root). "
+        "Pass an empty string to disable auditing.",
+    )
 
     args = parser.parse_args()
+
+    # ── Audit logger ─────────────────────────────────────────────
+    if args.audit_dir == "":
+        audit_logger = None  # explicitly disabled
+    else:
+        from pathlib import Path
+
+        audit_dir = Path(args.audit_dir) if args.audit_dir else None
+        audit_logger = AuditLogger(audit_dir=audit_dir)
 
     # ── Build backends ────────────────────────────────────────────
     vector_backend = _build_vector_backend(args)
@@ -283,7 +299,7 @@ def main():
     mcp = FastMCP("RobustMemory")
 
     # Register all MCP tools
-    register_tools(mcp, memory_system)
+    register_tools(mcp, memory_system, audit_logger=audit_logger)
 
     # ── Shutdown helpers ────────────────────────────────────────
     _shutting_down = False

@@ -55,6 +55,9 @@ sharing = [
     "zeroconf>=0.38.0",
     "requests>=2.28.0",
 ]
+staleness = [
+    "ast-grep-py>=0.38.0",
+]
 dev = [
     "pytest>=7.0.0",
     "black>=23.0.0",

@@ -719,6 +719,30 @@ _DARK_CSS = """
         gap: 6px;
         margin-left: 8px;
     }
+    .sim-bar-panel {
+        position: fixed;
+        bottom: 12px;
+        left: 12px;
+        background: rgba(18, 18, 30, 0.92);
+        border: 1px solid #3a3a4a;
+        border-radius: 6px;
+        padding: 8px 10px 4px 10px;
+        font-family: 'SF Mono', 'Consolas', 'Courier New', monospace;
+        font-size: 11px;
+        color: #b0b0c0;
+        z-index: 1000;
+        pointer-events: auto;
+        width: 320px;
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+    }
+    .sim-bar-panel .stats-title {
+        color: #d0d0e0;
+        font-size: 12px;
+        font-weight: 600;
+        margin-bottom: 4px;
+        border-bottom: 1px solid #2a2a3a;
+        padding-bottom: 4px;
+    }
     .query-input {
         background-color: #1e1e2e !important;
         border: 1px solid #3a3a4a !important;
@@ -966,6 +990,89 @@ _DARK_CSS = """
         flex-shrink: 0;
     }
 
+    /* ── Date picker ─────────────────────────────────────────── */
+    .date-picker-box {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+    }
+    .date-picker-box label {
+        color: #aaa;
+        font-size: 13px;
+        white-space: nowrap;
+    }
+    .SingleDatePickerInput,
+    .SingleDatePickerInput__withBorder {
+        background-color: #1e1e2e !important;
+        border: 1px solid #3a3a4a !important;
+        border-radius: 4px !important;
+    }
+    .DateInput,
+    .DateInput_input {
+        background-color: #1e1e2e !important;
+        color: #e0e0e0 !important;
+        font-size: 12px !important;
+        border-bottom: none !important;
+        width: 90px !important;
+        padding: 4px 6px !important;
+    }
+    .DateInput_input::placeholder { color: #555 !important; }
+    .DayPicker, .DayPicker__withBorder, .DayPicker_transitionContainer,
+    .CalendarMonthGrid, .CalendarMonth, .CalendarMonthGrid_month__horizontal {
+        background-color: #1e1e2e !important;
+        color: #e0e0e0 !important;
+    }
+    .CalendarMonth_caption, .CalendarMonth_caption strong {
+        color: #d0d0e0 !important;
+    }
+    .DayPickerNavigation_button {
+        border: 1px solid #3a3a4a !important;
+        background-color: #1e1e2e !important;
+    }
+    .DayPickerNavigation_svg { fill: #aaa !important; }
+    .DayPickerNavigation_button:hover { background-color: #2e2e45 !important; }
+    .CalendarDay__default {
+        background-color: #1e1e2e !important;
+        color: #c0c0d0 !important;
+        border: 1px solid #2a2a3a !important;
+    }
+    .CalendarDay__default:hover {
+        background-color: #2e2e45 !important;
+        color: #fff !important;
+    }
+    .CalendarDay__selected, .CalendarDay__selected:hover {
+        background-color: #3a4a6a !important;
+        border-color: #6a8aba !important;
+        color: #fff !important;
+    }
+    .CalendarDay__today { color: #F4B042 !important; font-weight: bold !important; }
+    .CalendarDay__outside,
+    .CalendarDay__blocked_out_of_range,
+    .CalendarDay__blocked_out_of_range:hover {
+        background-color: #181826 !important;
+        color: #444 !important;
+        cursor: default !important;
+    }
+    .DayPickerKeyboardShortcuts_buttonReset,
+    .DayPickerKeyboardShortcuts_show { display: none !important; }
+    .date-clear-btn {
+        background-color: #2a2a3a !important;
+        border: 1px solid #3a3a4a !important;
+        color: #888 !important;
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 11px;
+        cursor: pointer;
+        white-space: nowrap;
+        line-height: 1;
+    }
+    .date-clear-btn:hover {
+        background-color: #3a3a5a !important;
+        color: #e0e0e0 !important;
+        border-color: #5a5a7a !important;
+    }
+
     /* ── Loading spinner overlay ─────────────────────────────── */
     .graph-loading-wrapper {
         height: calc(100vh - 38px);
@@ -1045,6 +1152,18 @@ _DARK_CSS = """
     }
     .cluster-stats-panel .stat-value.bad {
         color: #DC4E4E;
+    }
+    .cluster-stats-panel .stat-info {
+        display: inline-block;
+        margin-left: 4px;
+        color: #555;
+        font-size: 10px;
+        cursor: help;
+        vertical-align: middle;
+        line-height: 1;
+    }
+    .cluster-stats-panel .stat-info:hover {
+        color: #aaa;
     }
     .cluster-stats-panel .stat-warning {
         margin-top: 6px;
@@ -1290,11 +1409,20 @@ def _build_stats_panel_children() -> list:
         log.error("Cluster stats computation failed: %s", exc, exc_info=True)
         return [_html.Div(f"Stats error: {exc}", className="stat-warning")]
 
-    def _row(label: str, value, css_class: str = "") -> Any:
+    def _row(label: str, value, css_class: str = "", tooltip: str = "") -> Any:
+        label_children: list = [_html.Span(label, className="stat-label")]
+        if tooltip:
+            label_children.append(
+                _html.Span(
+                    "ⓘ",
+                    className="stat-info",
+                    title=tooltip,
+                )
+            )
         return _html.Div(
             className="stat-row",
             children=[
-                _html.Span(label, className="stat-label"),
+                _html.Span(children=label_children),
                 _html.Span(
                     str(value) if value is not None else "n/a",
                     className=f"stat-value {css_class}".strip(),
@@ -1352,20 +1480,108 @@ def _build_stats_panel_children() -> list:
 
     rows = [
         _row("Vectors", f"{stats['n_vectors']} x {stats['dimensions']}D"),
-        _row("Avg Cosine Sim", avg_sim, sim_class),
+        _row(
+            "Avg Cosine Sim",
+            avg_sim,
+            sim_class,
+            tooltip=(
+                "Average cosine similarity between all memory pairs.\n"
+                "Range: 0.0 (completely different) to 1.0 (identical).\n"
+                "Low (<0.55): diverse, well-spread memories — good for retrieval.\n"
+                "Moderate (0.55–0.70): normal for a focused project.\n"
+                "High (>0.70): memories are too similar — semantic search may\n"
+                "  struggle to discriminate; consider pruning duplicates."
+            ),
+        ),
         _row(
             "Sim Range",
             f"{stats.get('min_cosine_sim', '?')} .. {stats.get('max_cosine_sim', '?')}",
+            tooltip=(
+                "Min and max pairwise cosine similarity across all memories.\n"
+                "A wide range (e.g. 0.3 .. 0.98) means good topic diversity.\n"
+                "Values near 0.98+ indicate near-duplicate memories that may\n"
+                "  be candidates for merging or deletion.\n"
+                "Values near 1.0 = identical content stored twice."
+            ),
         ),
-        _row("Std Dev", stats.get("std_cosine_sim")),
-        _row("Hopkins Stat", hop, hop_class),
+        _row(
+            "Std Dev",
+            stats.get("std_cosine_sim"),
+            tooltip=(
+                "Standard deviation of pairwise cosine similarity.\n"
+                "High (>0.10): large spread — memories cover very different topics.\n"
+                "Low (<0.05): tight cluster — memories are all about similar things,\n"
+                "  which can hurt recall precision for unrelated queries."
+            ),
+        ),
+        _row(
+            "Hopkins Stat",
+            hop,
+            hop_class,
+            tooltip=(
+                "Hopkins statistic: measures clustering tendency of the vector space.\n"
+                "Range: 0.5 to 1.0.\n"
+                "~0.5: points are uniformly distributed (no structure).\n"
+                "0.6–0.75: moderate clustering tendency.\n"
+                ">0.75: strong clustering — memories group into distinct topics.\n"
+                "  This is GOOD: it means semantic search can isolate relevant clusters."
+            ),
+        ),
         _row(
             "Silhouette",
             f"{sil} (k={stats.get('n_clusters', '?')})" if sil is not None else None,
             sil_class,
+            tooltip=(
+                "Silhouette score: how well-separated the clusters are (k = auto-detected).\n"
+                "Range: -1.0 to 1.0.\n"
+                ">0.4: clusters are well-separated — topic boundaries are clear.\n"
+                "0.15–0.40: overlapping clusters — memories blend across topics.\n"
+                "<0.15: poor separation — the k clusters are not meaningful.\n"
+                "Low score with high Hopkins = structure exists but clusters overlap;\n"
+                "  try more specific tags or split broad memories into focused ones."
+            ),
         ),
-        _row("NN Gap Ratio", gap, gap_class),
+        _row(
+            "NN Gap Ratio",
+            gap,
+            gap_class,
+            tooltip=(
+                "Nearest-neighbour gap ratio: how isolated each memory is from its neighbours.\n"
+                "Range: 0.0 to 1.0.\n"
+                ">0.30: good separation — each memory has clear breathing room.\n"
+                "0.10–0.30: moderate — neighbours are close but still distinguishable.\n"
+                "<0.10: memories are tightly packed — top-K retrieval will return\n"
+                "  near-identical neighbours, reducing result diversity.\n"
+                "Low values often indicate duplicate or near-duplicate memories."
+            ),
+        ),
     ]
+
+    # Explained variance — how much of the full 384D structure the 3D view captures
+    pca_var = _embeddings_cache.get("pca_explained_variance")
+    if pca_var is not None:
+        if pca_var >= 50:
+            var_class = "good"
+        elif pca_var >= 25:
+            var_class = "moderate"
+        else:
+            var_class = "bad"
+        rows.append(
+            _row(
+                "3D Captures",
+                f"{pca_var:.1f}%",
+                var_class,
+                tooltip=(
+                    "How much of the full 384D variance the 3D projection captures.\n"
+                    "This tells you how much to trust the visual layout.\n"
+                    ">50%: the 3D view is a reasonable representation.\n"
+                    "25–50%: moderate — clusters are visible but distances are approximate.\n"
+                    "<25%: the 3D view is misleading — use cosine similarity (query bar)\n"
+                    "  for ground-truth distances rather than visual proximity.\n"
+                    "Low % is normal for diverse, multi-topic memory sets."
+                ),
+            )
+        )
 
     warning_text = stats.get("top_k_warning", "")
     if warning_text:
@@ -1449,6 +1665,16 @@ def _fetch_and_build(
     _projector_cache["pca"] = pca_proj
     _projector_cache["raw_min"] = raw_min
     _projector_cache["span"] = span
+
+    # Store explained variance of the 3-component projection.
+    # For PCA method, use the fitted reducer directly.
+    # For t-SNE/UMAP, use the dedicated pca_proj (always fitted on raw embeddings).
+    try:
+        _embeddings_cache["pca_explained_variance"] = float(
+            sum(pca_proj.explained_variance_ratio_) * 100
+        )
+    except Exception:
+        _embeddings_cache["pca_explained_variance"] = None
 
     # Cache raw embeddings + ids for semantic query (cosine similarity
     # in the original 384D space, not the projected 3D space).
@@ -1638,6 +1864,7 @@ def run_dash_app(
             dcc.Store(id="lines-visible", data=True, storage_type="memory"),
             dcc.Store(id="word-paths-visible", data=False, storage_type="memory"),
             dcc.Store(id="words-visible", data=True, storage_type="memory"),
+            dcc.Store(id="date-picker-active", data=False, storage_type="memory"),
             html.Div(
                 className="tag-bar",
                 children=[
@@ -1735,6 +1962,32 @@ def run_dash_app(
                         style={"color": "#444", "marginLeft": "8px"},
                     ),
                     html.Div(
+                        className="date-picker-box",
+                        children=[
+                            html.Label("Date:"),
+                            dcc.DatePickerSingle(
+                                id="date-picker",
+                                placeholder="Filter by date",
+                                display_format="YYYY-MM-DD",
+                                clearable=True,
+                                with_portal=False,
+                                first_day_of_week=1,
+                                style={"fontSize": "12px"},
+                            ),
+                            html.Button(
+                                "Clear Date",
+                                id="clear-date-btn",
+                                n_clicks=0,
+                                className="date-clear-btn",
+                                title="Clear date filter",
+                            ),
+                        ],
+                    ),
+                    html.Span(
+                        "  |  ",
+                        style={"color": "#444", "marginLeft": "8px"},
+                    ),
+                    html.Div(
                         className="method-dropdown",
                         children=[
                             dcc.Dropdown(
@@ -1791,6 +2044,19 @@ def run_dash_app(
                     html.Div("Loading...", id="cluster-stats-body"),
                 ],
             ),
+            html.Div(
+                id="sim-bar-panel",
+                className="sim-bar-panel",
+                style={"display": "none"},
+                children=[
+                    html.Div("Query Similarity (384D)", className="stats-title"),
+                    dcc.Graph(
+                        id="sim-bar-chart",
+                        config={"displayModeBar": False},
+                        style={"height": "200px"},
+                    ),
+                ],
+            ),
         ]
     )
 
@@ -1814,6 +2080,10 @@ def run_dash_app(
         Output("query-active", "data", allow_duplicate=True),
         Output("query-match-ids", "data", allow_duplicate=True),
         Output("query-expanded-ids", "data", allow_duplicate=True),
+        Output("date-picker", "min_date_allowed"),
+        Output("date-picker", "max_date_allowed"),
+        Output("date-picker", "date"),
+        Output("date-picker-active", "data", allow_duplicate=True),
         Input("url", "pathname"),
         prevent_initial_call="initial_duplicate",
     )
@@ -1858,24 +2128,91 @@ def run_dash_app(
                 meta_i = metadatas[idx] if idx < len(metadatas) else {}
                 memory_texts[mid] = str(meta_i.get("title", ""))
 
+        # ── Extract dates from metadatas for the date picker ────
+        # Build id -> ISO date string (YYYY-MM-DD) from the timestamp field.
+        # Also pre-build id_to_coords for O(1) lookup in the date-pick callback.
+        def _parse_date(ts_raw: Any) -> Optional[str]:
+            """Parse any timestamp representation to 'YYYY-MM-DD', or None."""
+            if not ts_raw:
+                return None
+            ts_str = str(ts_raw).strip()
+            if not ts_str:
+                return None
+            # Try ISO-8601 / datetime string (most common)
+            try:
+                from datetime import datetime as _dt
+
+                return (
+                    _dt.fromisoformat(ts_str.replace("Z", "+00:00")).date().isoformat()
+                )
+            except (ValueError, TypeError):
+                pass
+            # Try Unix epoch (int or float)
+            try:
+                from datetime import datetime as _dt
+
+                return _dt.utcfromtimestamp(float(ts_str)).date().isoformat()
+            except (ValueError, TypeError):
+                pass
+            # Fallback: take first 10 chars if they look like YYYY-MM-DD
+            if len(ts_str) >= 10 and ts_str[4] == "-" and ts_str[7] == "-":
+                return ts_str[:10]
+            return None
+
+        id_to_date: Dict[str, str] = {}
+        id_to_coords: Dict[str, Dict[str, Any]] = {}
+        all_dates: List[str] = []
+        for i, mid in enumerate(ids):
+            meta_i = metadatas[i] if i < len(metadatas) else {}
+            date_str = _parse_date(meta_i.get("timestamp"))
+            if date_str:
+                id_to_date[mid] = date_str
+                all_dates.append(date_str)
+
+        if all_dates:
+            sorted_dates = sorted(set(all_dates))
+            min_date = sorted_dates[0]
+            max_date = sorted_dates[-1]
+        else:
+            min_date = None
+            max_date = None
+
         meta = {
             "n_scatter": n_scatter,
             "sorted_tags": sorted_tags,
             "memory_texts": memory_texts,
+            "id_to_date": id_to_date,
         }
 
         # Compute cluster / density stats from cached 384D embeddings
         stats_children = _build_stats_panel_children()
 
         log.debug(
-            "CB1 on_page_load: done — n_scatter=%d, tags=%d, texts=%d, "
-            "fig traces=%d, expanded=[], dedup reset",
+            "CB1 on_page_load: done — n_scatter=%d, tags=%d, texts=%d, dates=%d "
+            "date_range=[%s..%s], fig traces=%d, expanded=[], dedup reset",
             n_scatter,
             len(sorted_tags),
             len(memory_texts),
+            len(id_to_date),
+            min_date,
+            max_date,
             len(fig.get("data", [])) if isinstance(fig, dict) else -1,
         )
-        return fig, tag_options, [], meta, [], stats_children, False, [], []
+        return (
+            fig,
+            tag_options,
+            [],
+            meta,
+            [],
+            stats_children,
+            False,
+            [],
+            [],
+            min_date,
+            max_date,
+            None,
+            False,
+        )
 
     # ── Callback 2: tag selection -> toggle line visibility ─────
     @app.callback(
@@ -1905,6 +2242,153 @@ def run_dash_app(
             patched["data"][i]["visible"] = tag in selected_set
 
         return patched
+
+    # ── Callback 2b: date picker -> highlight memories for that date ─
+    @app.callback(
+        Output("scatter-3d", "figure", allow_duplicate=True),
+        Output("date-picker-active", "data"),
+        Input("date-picker", "date"),
+        State("scatter-3d", "figure"),
+        State("figure-meta", "data"),
+        State("date-picker-active", "data"),
+        prevent_initial_call=True,
+    )
+    def on_date_pick(selected_date, current_fig, meta, was_active):
+        """Overlay highlight rings on all memories from the selected date."""
+        log.debug(
+            "CB2b on_date_pick: date=%s, was_active=%s, fig_traces=%d",
+            selected_date,
+            was_active,
+            len(current_fig.get("data", [])) if current_fig else 0,
+        )
+        go_mod = _require("plotly.graph_objects", "pip install plotly")
+
+        if not current_fig or not meta:
+            return no_update, no_update
+
+        fig_data = current_fig.get("data", [])
+        patched = Patch()
+
+        # Always scan and remove any existing date-highlight traces,
+        # regardless of was_active (guards against state desync on refresh).
+        existing_highlight_indices = [
+            i
+            for i, t in enumerate(fig_data)
+            if t.get("legendgroup", "") == "date-highlight"
+        ]
+        for i in reversed(existing_highlight_indices):
+            del patched["data"][i]
+
+        # If date cleared, just remove highlights
+        if not selected_date:
+            return patched, False
+
+        # Parse the selected date robustly to YYYY-MM-DD
+        try:
+            from datetime import datetime as _dt
+
+            target_date = (
+                _dt.fromisoformat(str(selected_date).replace("Z", "+00:00"))
+                .date()
+                .isoformat()
+            )
+        except (ValueError, TypeError):
+            target_date = str(selected_date)[:10]
+
+        id_to_date = meta.get("id_to_date", {})
+        n_scatter = meta.get("n_scatter", 0)
+
+        # Find memory IDs that match the selected date
+        match_ids = {mid for mid, d in id_to_date.items() if d == target_date}
+
+        if not match_ids:
+            log.info("CB2b: no memories on %s", target_date)
+            return patched, False
+
+        # Build highlight coordinate lists by scanning scatter traces.
+        # Guard n_scatter against out-of-bounds access.
+        safe_n_scatter = min(n_scatter, len(fig_data))
+        hi_x: List[float] = []
+        hi_y: List[float] = []
+        hi_z: List[float] = []
+        hi_customdata: List[List] = []
+        hi_hover: List[str] = []
+
+        for t_idx in range(safe_n_scatter):
+            trace = fig_data[t_idx]
+            xs = trace.get("x") or []
+            ys = trace.get("y") or []
+            zs = trace.get("z") or []
+            cds = trace.get("customdata") or []
+            for p_idx in range(len(xs)):
+                cd = cds[p_idx] if p_idx < len(cds) else []
+                mem_id = cd[3] if len(cd) > 3 else ""
+                if mem_id not in match_ids:
+                    continue
+                try:
+                    px = float(xs[p_idx])
+                    py = float(ys[p_idx])
+                    pz = float(zs[p_idx])
+                except (TypeError, ValueError):
+                    continue
+                title = cd[0] if len(cd) > 0 else ""
+                mtype = cd[1] if len(cd) > 1 else ""
+                imp = cd[2] if len(cd) > 2 else 5
+                hi_x.append(px)
+                hi_y.append(py)
+                hi_z.append(pz)
+                hi_customdata.append([title, mtype, imp, mem_id])
+                hi_hover.append(
+                    f"<b>{title}</b><br>"
+                    f"<span style='color:#aaa'>Date:</span> {target_date}<br>"
+                    f"<span style='color:#aaa'>Type:</span> {mtype}<br>"
+                    f"<span style='color:#aaa'>Importance:</span> {imp}<br>"
+                    f"<span style='color:#aaa'>ID:</span> {mem_id}"
+                    "<extra></extra>"
+                )
+
+        if not hi_x:
+            return patched, False
+
+        highlight_trace = go_mod.Scatter3d(
+            x=hi_x,
+            y=hi_y,
+            z=hi_z,
+            mode="markers",
+            marker=dict(
+                size=18,
+                color="rgba(0,0,0,0)",
+                symbol="circle",
+                opacity=1.0,
+                line=dict(width=2.5, color="rgb(255, 220, 50)"),
+            ),
+            customdata=hi_customdata,
+            hovertemplate=hi_hover,
+            hoverlabel=dict(
+                bgcolor="rgba(30, 25, 5, 0.95)",
+                bordercolor="rgb(220, 200, 50)",
+                font=dict(color="rgb(255, 240, 180)", size=13),
+            ),
+            name=f"date: {target_date} ({len(hi_x)})",
+            legendgroup="date-highlight",
+            showlegend=True,
+            visible=True,
+        )
+
+        patched["data"].append(highlight_trace.to_plotly_json())
+
+        log.info("CB2b: highlighted %d memories on %s", len(hi_x), target_date)
+        return patched, True
+
+    # ── Callback 2c: clear date btn -> remove date highlights ───
+    @app.callback(
+        Output("date-picker", "date", allow_duplicate=True),
+        Input("clear-date-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_clear_date(_n_clicks):
+        """Clear the date picker value (triggers on_date_pick with None)."""
+        return None
 
     # ── Callback 3: click memory point -> expand/collapse words ─
     @app.callback(
@@ -2068,6 +2552,8 @@ def run_dash_app(
         Output("scatter-3d", "figure", allow_duplicate=True),
         Output("query-active", "data"),
         Output("query-match-ids", "data"),
+        Output("sim-bar-chart", "figure"),
+        Output("sim-bar-panel", "style"),
         Input("query-input", "n_submit"),
         State("query-input", "value"),
         State("query-limit", "value"),
@@ -2095,7 +2581,7 @@ def run_dash_app(
             log.debug(
                 "CB4: early exit (meta=%s, fig=%s)", bool(meta), bool(current_fig)
             )
-            return no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update, no_update
 
         patched = Patch()
 
@@ -2113,7 +2599,7 @@ def run_dash_app(
         # If the input was cleared, just remove the old traces
         if not query_text or not query_text.strip():
             log.debug("CB4: query cleared, returning active=False, match_ids=[]")
-            return patched, False, []
+            return patched, False, [], no_update, {"display": "none"}
 
         # Sanitise limit
         try:
@@ -2123,7 +2609,7 @@ def run_dash_app(
 
         # ── Embed the query text ────────────────────────────────
         try:
-            query_traces, matched_ids = _make_query_traces(
+            query_traces, matched_ids, sim_data = _make_query_traces(
                 query_text.strip(),
                 current_fig,
                 meta,
@@ -2132,14 +2618,57 @@ def run_dash_app(
             )
         except Exception as exc:
             log.error(f"Semantic query failed: {exc}", exc_info=True)
-            return patched, False, []
+            return patched, False, [], no_update, {"display": "none"}
 
         if not query_traces:
             log.debug("CB4: no query traces returned, active=False")
-            return patched, False, []
+            return patched, False, [], no_update, {"display": "none"}
 
         for trace in query_traces:
             patched["data"].append(trace)
+
+        # ── Build the similarity bar chart (384D ground truth) ──
+        go = _require("plotly.graph_objects", "pip install plotly")
+        titles = [d["title"] for d in sim_data]
+        sims_vals = [d["sim"] for d in sim_data]
+        # Colour bars green→red based on sim value
+        bar_colours = [
+            f"rgba({max(0, int(255 * (1 - s)))}, {int(255 * s)}, 80, 0.85)"
+            for s in sims_vals
+        ]
+        bar_fig = go.Figure(
+            go.Bar(
+                x=sims_vals,
+                y=[
+                    f"#{i + 1} {t[:35]}{'…' if len(t) > 35 else ''}"
+                    for i, t in enumerate(titles)
+                ],
+                orientation="h",
+                marker_color=bar_colours,
+                hovertemplate="%{y}<br>cosine sim: %{x:.4f}<extra></extra>",
+                hoverlabel=dict(
+                    bgcolor="rgba(18,18,30,0.95)",
+                    font=dict(color="#e0e0f0", size=11),
+                ),
+            )
+        )
+        bar_fig.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=0, r=8, t=4, b=4),
+            xaxis=dict(
+                range=[0, 1],
+                tickfont=dict(color="#888", size=9),
+                gridcolor="#2a2a3a",
+                zerolinecolor="#2a2a3a",
+            ),
+            yaxis=dict(
+                tickfont=dict(color="#aaa", size=9),
+                autorange="reversed",
+            ),
+            font=dict(color="#b0b0c0"),
+            showlegend=False,
+        )
 
         log.debug(
             "CB4 DONE: %d query traces appended, %d match_ids=%s",
@@ -2147,7 +2676,7 @@ def run_dash_app(
             len(matched_ids),
             [m[:12] for m in matched_ids[:5]],
         )
-        return patched, True, matched_ids
+        return patched, True, matched_ids, bar_fig, {"display": "block"}
 
     # ── Callback 5: expand/collapse words for query matches ─────
     @app.callback(
@@ -2674,6 +3203,7 @@ def run_dash_app(
         Output("query-expanded-ids", "data", allow_duplicate=True),
         Output("expanded-memories", "data", allow_duplicate=True),
         Output("query-input", "value"),
+        Output("sim-bar-panel", "style", allow_duplicate=True),
         Input("clear-search-btn", "n_clicks"),
         State("scatter-3d", "figure"),
         State("query-active", "data"),
@@ -2701,7 +3231,7 @@ def run_dash_app(
             len(current_fig.get("data", [])) if current_fig else 0,
         )
         if not current_fig:
-            return (no_update,) * 6
+            return (no_update,) * 7
 
         patched = Patch()
 
@@ -2762,8 +3292,9 @@ def run_dash_app(
             len(new_expanded),
         )
         # Return: figure, query-active, query-match-ids, query-expanded-ids,
-        #         expanded-memories, query-input value (clear the text box)
-        return patched, False, [], [], new_expanded, ""
+        #         expanded-memories, query-input value (clear the text box),
+        #         sim-bar-panel style (hide it)
+        return patched, False, [], [], new_expanded, "", {"display": "none"}
 
     # ── Callback 11: switch reduction method (PCA / t-SNE / UMAP) ─
     @app.callback(
@@ -2818,10 +3349,31 @@ def run_dash_app(
                 meta_i = metadatas[idx] if idx < len(metadatas) else {}
                 memory_texts[mid] = str(meta_i.get("title", ""))
 
+        # Re-build id_to_date so date highlights work after method switch
+        id_to_date: Dict[str, str] = {}
+        for i, mid in enumerate(ids):
+            meta_i = metadatas[i] if i < len(metadatas) else {}
+            ts_raw = meta_i.get("timestamp")
+            if ts_raw:
+                ts_str = str(ts_raw).strip()
+                # Use same robust ISO parse as CB1
+                try:
+                    from datetime import datetime as _dt
+
+                    id_to_date[mid] = (
+                        _dt.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        .date()
+                        .isoformat()
+                    )
+                except (ValueError, TypeError):
+                    if len(ts_str) >= 10 and ts_str[4] == "-" and ts_str[7] == "-":
+                        id_to_date[mid] = ts_str[:10]
+
         meta = {
             "n_scatter": n_scatter,
             "sorted_tags": sorted_tags,
             "memory_texts": memory_texts,
+            "id_to_date": id_to_date,
         }
 
         stats_children = _build_stats_panel_children()
@@ -3495,7 +4047,7 @@ def _make_query_traces(
     meta: Dict[str, Any],
     n_results: int = 10,
     lines_visible: bool = True,
-) -> Tuple[List[Dict[str, Any]], List[str]]:
+) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, Any]]]:
     """Embed *query_text*, compute cosine similarity in the original 384D
     embedding space, project the query into 3D, and draw lines to the
     matching memories.
@@ -3509,7 +4061,9 @@ def _make_query_traces(
       3. Apply adaptive thresholding on that candidate pool.
       4. Top-1 fallback if nothing passes the threshold.
 
-    Returns (trace_dicts, matched_memory_ids).
+    Returns (trace_dicts, matched_memory_ids, sim_data).
+    sim_data is a list of {title, sim, id} dicts for the matched memories,
+    in rank order, using ground-truth 384D cosine similarity.
     """
     go = _require("plotly.graph_objects", "pip install plotly")
 
@@ -3523,7 +4077,7 @@ def _make_query_traces(
     # Check that raw embeddings are cached
     if "embeddings" not in _embeddings_cache:
         log.warning("Warning: no embeddings cache — page may need a refresh.")
-        return [], []
+        return [], [], []
 
     all_embeddings = _embeddings_cache["embeddings"]  # (N, 384)
     all_ids = _embeddings_cache["ids"]  # List[str]
@@ -3533,7 +4087,7 @@ def _make_query_traces(
             f"Warning: cache inconsistency — {len(all_ids)} ids vs "
             f"{all_embeddings.shape[0]} embeddings. Refresh the page."
         )
-        return [], []
+        return [], [], []
 
     # Embed the query — apply the same prefix the memory manager uses
     # so the resulting embedding matches what pgvector/chromadb would see.
@@ -3567,7 +4121,7 @@ def _make_query_traces(
             f"Semantic query '{query_text}': no matches above adaptive "
             f"threshold {threshold:.3f} (limit={n_results})"
         )
-        return [], []
+        return [], [], []
 
     log.info(
         f"Semantic query '{query_text}': {len(top_indices)} matches "
@@ -3605,14 +4159,14 @@ def _make_query_traces(
         mode="markers+text",
         marker=dict(
             size=10,
-            color="rgb(255, 60, 200)",
+            color="rgb(220, 40, 40)",
             symbol="cross",
             opacity=1.0,
             line=dict(width=1, color="rgba(255,255,255,0.6)"),
         ),
         text=[query_text[:40] + ("..." if len(query_text) > 40 else "")],
         textposition="top center",
-        textfont=dict(size=11, color="rgb(255, 180, 240)"),
+        textfont=dict(size=11, color="rgb(255, 140, 140)"),
         hovertemplate=(
             "<b>Query</b><br>"
             "%{text}<br>"
@@ -3621,9 +4175,9 @@ def _make_query_traces(
             "<extra></extra>"
         ),
         hoverlabel=dict(
-            bgcolor="rgba(60, 10, 40, 0.95)",
-            bordercolor="rgb(255, 100, 200)",
-            font=dict(color="rgb(255, 240, 255)", size=12),
+            bgcolor="rgba(60, 10, 10, 0.95)",
+            bordercolor="rgb(220, 60, 60)",
+            font=dict(color="rgb(255, 220, 220)", size=12),
         ),
         name=f"query: {query_text[:20]} ({len(top_indices)}/{n_results})",
         legendgroup=group_key,
@@ -3639,7 +4193,9 @@ def _make_query_traces(
     nn_y: List[float] = []
     nn_z: List[float] = []
     nn_hover: List[str] = []
+    nn_customdata: List[List] = []
     matched_ids: List[str] = []
+    sim_data: List[Dict[str, Any]] = []
 
     for rank, idx in enumerate(top_indices):
         mid = all_ids[idx]
@@ -3660,15 +4216,20 @@ def _make_query_traces(
         nn_hover.append(
             f"<b>#{rank + 1}</b> {title[:50]}<br>"
             f"cosine similarity: {sim:.4f}<br>"
+            f"Click to expand words<br>"
             f"<extra></extra>"
         )
+        # customdata format matches scatter traces: [title, type, importance, id]
+        # type/importance unknown here so use placeholders — id is what matters for click
+        nn_customdata.append([title, "", 5, mid])
+        sim_data.append({"title": title, "sim": sim, "id": mid})
 
     line_trace = go.Scatter3d(
         x=lx,
         y=ly,
         z=lz,
         mode="lines",
-        line=dict(color="rgb(255,120,220)", width=2),
+        line=dict(color="rgb(220, 60, 60)", width=2),
         opacity=0.35,
         legendgroup=group_key,
         showlegend=False,
@@ -3684,16 +4245,17 @@ def _make_query_traces(
         mode="markers",
         marker=dict(
             size=8,
-            color="rgb(255,160,230)",
+            color="rgb(220, 80, 80)",
             symbol="diamond",
             opacity=0.9,
             line=dict(width=1, color="rgba(255,255,255,0.5)"),
         ),
+        customdata=nn_customdata,
         hovertemplate=nn_hover,
         hoverlabel=dict(
-            bgcolor="rgba(60, 10, 40, 0.95)",
-            bordercolor="rgb(255, 100, 200)",
-            font=dict(color="rgb(255, 240, 255)", size=12),
+            bgcolor="rgba(60, 10, 10, 0.95)",
+            bordercolor="rgb(220, 60, 60)",
+            font=dict(color="rgb(255, 220, 220)", size=12),
         ),
         name=f"matches ({len(nn_x)})",
         legendgroup=group_key,
@@ -3707,11 +4269,15 @@ def _make_query_traces(
         len(matched_ids),
         lines_visible,
     )
-    return [
-        query_marker.to_plotly_json(),
-        line_trace.to_plotly_json(),
-        nn_markers.to_plotly_json(),
-    ], matched_ids
+    return (
+        [
+            query_marker.to_plotly_json(),
+            line_trace.to_plotly_json(),
+            nn_markers.to_plotly_json(),
+        ],
+        matched_ids,
+        sim_data,
+    )
 
 
 # ---------------------------------------------------------------------------

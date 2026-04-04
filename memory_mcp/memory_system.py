@@ -350,6 +350,10 @@ class RobustMemorySystem:
             _os.environ["HF_HUB_OFFLINE"] = "1"
             _os.environ["TRANSFORMERS_OFFLINE"] = "1"
             self.logger.info("Model '%s' found in cache — loading offline", model_name)
+            self.embedding_model = SentenceTransformer(
+                model_name,
+                local_files_only=True,
+            )
         else:
             # One-time download with SSL verification disabled.
             # Necessary on Zscaler/corporate networks where the proxy re-signs
@@ -390,30 +394,26 @@ class RobustMemorySystem:
             _httpx.Client.__init__ = _no_ssl_client_init
             _httpx.AsyncClient.__init__ = _no_ssl_async_client_init
 
-        try:
-            self.embedding_model = SentenceTransformer(
-                model_name,
-                # Pass local_files_only explicitly based on cache state,
-                # overriding any env-var that huggingface_hub might have picked up.
-                local_files_only=model_cached,
-            )
-            self.logger.info(
-                "Embedding model '%s' (preset: %s, dims: %d) loaded successfully",
-                model_name,
-                EMBEDDING_MODEL,
-                EMBEDDING_MODEL_CONFIG["dimensions"],
-            )
-        except Exception as e:
-            self.logger.error("Failed to load embedding model: %s", e)
-            raise
-        finally:
-            # Restore httpx patching if we applied it (only in the non-cached branch)
-            if not model_cached:
+            try:
+                self.embedding_model = SentenceTransformer(
+                    model_name,
+                    local_files_only=False,
+                )
+            finally:
+                # Always restore — we're in the non-cached branch, so these
+                # variables are guaranteed to exist.
                 try:
                     _httpx.Client.__init__ = _orig_client_init
                     _httpx.AsyncClient.__init__ = _orig_async_client_init
                 except Exception:
                     pass
+
+        self.logger.info(
+            "Embedding model '%s' (preset: %s, dims: %d) loaded successfully",
+            model_name,
+            EMBEDDING_MODEL,
+            EMBEDDING_MODEL_CONFIG["dimensions"],
+        )
 
     @staticmethod
     def _is_model_cached(model_name: str) -> bool:
@@ -635,32 +635,58 @@ class RobustMemorySystem:
                         "Contradiction check failed (non-fatal): %s", contra_err
                     )
 
-            # ── AST symbol enrichment ────────────────────────────────────────
-            # When file_paths are provided and memory_type is "fact", extract
-            # symbol names via ast-grep-py and append as _symbols_at_storage.
-            # Fully optional — degrades silently if ast-grep-py not installed
-            # or if files are unreadable.
+            # ── AST staleness anchor enrichment ─────────────────────────────
+            # When file_paths are provided and memory_type is "fact", extract:
+            #   _signatures_at_storage  — {func_name: param_hash} per file
+            #                             keys = symbol names (catches renames/deletions)
+            #                             values = param hashes (catches signature changes)
+            #                             supersedes _symbols_at_storage — no need to store names twice
+            #   _file_hashes_at_storage — SHA-256 per file (catches any change)
+            #   _git_commit_at_storage  — HEAD commit hash (enables git log diff)
+            # All anchors are optional — degrade silently on any failure.
             if file_paths and memory_type == "fact":
                 try:
-                    from .ast_extractor import extract_symbols_multi  # type: ignore[import]
-
-                    symbols = extract_symbols_multi(
-                        [p for p in file_paths if p and p.strip()]
+                    from .ast_extractor import (  # type: ignore[import]
+                        extract_signatures_multi,
+                        hash_files,
+                        get_git_commit,
                     )
-                    if symbols:
-                        import json as _json
 
+                    clean_paths = [p for p in file_paths if p and p.strip()]
+                    import json as _json
+
+                    # Signature hashes (keys = symbol names, values = param hashes)
+                    signatures = extract_signatures_multi(clean_paths)
+                    if signatures:
                         content = (
                             content.rstrip()
-                            + f"\n\n_symbols_at_storage: {_json.dumps(symbols)}"
+                            + f"\n\n_signatures_at_storage: {_json.dumps(signatures)}"
                         )
-                        self.logger.info(
-                            "AST enrichment: extracted symbols from %d file(s)",
-                            len(symbols),
+
+                    # File content hashes
+                    file_hashes = hash_files(clean_paths)
+                    if file_hashes:
+                        content = (
+                            content.rstrip()
+                            + f"\n_file_hashes_at_storage: {_json.dumps(file_hashes)}"
                         )
+
+                    # Git HEAD commit
+                    git_commit = get_git_commit()
+                    if git_commit:
+                        content = (
+                            content.rstrip() + f"\n_git_commit_at_storage: {git_commit}"
+                        )
+
+                    self.logger.info(
+                        "AST enrichment: sigs=%d files, hashes=%d files, git=%s",
+                        len(signatures),
+                        len(file_hashes),
+                        git_commit or "n/a",
+                    )
                 except Exception as ast_err:
                     self.logger.warning(
-                        "AST symbol enrichment failed (non-fatal): %s", ast_err
+                        "AST enrichment failed (non-fatal): %s", ast_err
                     )
 
             # Create memory record
@@ -772,6 +798,7 @@ class RobustMemorySystem:
             self.logger.info("Memory stored successfully: %s", memory_id)
             rec = asdict(record)
             rec["timestamp"] = record.timestamp.isoformat()
+            rec["token_count"] = token_count
             if contradiction_warning:
                 rec["warning"] = "potential_contradiction"
                 rec["conflicting_id"] = contradiction_warning["conflicting_id"]
@@ -830,7 +857,7 @@ class RobustMemorySystem:
 
             self.logger.info("Adaptive threshold computed: %.3f", threshold)
 
-            search_results = []
+            search_results = []  # list of (SearchResult, token_count)
             now_iso = datetime.now(timezone.utc).isoformat()
 
             # First pass: collect those meeting threshold
@@ -898,12 +925,15 @@ class RobustMemorySystem:
                 )
 
                 search_results.append(
-                    SearchResult(
-                        record=record,
-                        relevance_score=relevance,
-                        match_type="semantic"
-                        if relevance >= threshold
-                        else "semantic_fallback",
+                    (
+                        SearchResult(
+                            record=record,
+                            relevance_score=relevance,
+                            match_type="semantic"
+                            if relevance >= threshold
+                            else "semantic_fallback",
+                        ),
+                        row.get("token_count") or 0,
                     )
                 )
 
@@ -911,13 +941,14 @@ class RobustMemorySystem:
             self.db.commit()
 
             # Sort by relevance
-            search_results.sort(key=lambda x: x.relevance_score, reverse=True)
+            search_results.sort(key=lambda x: x[0].relevance_score, reverse=True)
 
             # Convert to dict format
             result_data = []
-            for sr in search_results:
+            for sr, token_count in search_results:
                 result_dict = asdict(sr.record)
                 result_dict["timestamp"] = sr.record.timestamp.isoformat()
+                result_dict["token_count"] = token_count
                 result_dict["relevance_score"] = sr.relevance_score
                 result_dict["match_type"] = sr.match_type
                 staleness = self._compute_staleness_score(result_dict)
@@ -1031,6 +1062,7 @@ class RobustMemorySystem:
 
                 result_dict = asdict(record)
                 result_dict["timestamp"] = record.timestamp.isoformat()
+                result_dict["token_count"] = row.get("token_count") or 0
                 result_dict["match_type"] = "structured"
                 staleness = self._compute_staleness_score(row)
                 result_dict["staleness_score"] = staleness
@@ -1812,11 +1844,29 @@ class RobustMemorySystem:
 
         Returns a float in [0.0, 1.0]:
           0.0 = just stored / protected / lifetime misconfigured
-          1.0 = age >= expected lifetime for this type (fully stale)
+          1.0 = fully stale
 
-        This is a STRUCTURAL signal based purely on age vs expected lifetime.
-        It is separate from importance decay, which is a usage signal.
-        Protected tags (core, identity, pinned) are never considered stale.
+        Two independent signals are combined:
+
+        1. Age signal (time-based)
+           staleness = min(1.0, days_old / expected_lifetime)
+           Always present, provides a baseline.
+
+        2. Code-change signal (anchor-based, fact memories only)
+           Parses _file_hashes_at_storage, _signatures_at_storage, and
+           _git_commit_at_storage from the memory content and compares
+           against the current state of the referenced files.
+
+           - File hash mismatch   → score raised to at least 0.85
+             (file content changed since memory was stored)
+           - Signature hash mismatch → score raised to at least 0.75
+             (function parameters changed — weaker signal, file may have
+             changed in an unrelated area)
+           - Git commits since storage → score raised proportionally,
+             capped at 0.6 (commits touch many files; used as a soft signal)
+
+        Final score = max(age_signal, code_change_signal).
+        Protected tags (core, identity, pinned) always return 0.0.
         """
         if not STALENESS_ENABLED:
             return 0.0
@@ -1846,9 +1896,167 @@ class RobustMemorySystem:
                 row.get("timestamp") if isinstance(row, dict) else row["timestamp"]
             )
             days_old = self._days_since(timestamp)
-            return round(min(1.0, days_old / lifetime), 3)
+            age_score = round(min(1.0, days_old / lifetime), 3)
+
+            # ── Code-change signal ───────────────────────────────────────────
+            # Only applies to fact memories that were stored with file anchors.
+            code_score = 0.0
+            if memory_type == "fact":
+                content = (
+                    row.get("content") if isinstance(row, dict) else row["content"]
+                )
+                if content:
+                    code_score = self._code_change_score(content)
+
+            return round(max(age_score, code_score), 3)
         except Exception:
             return 0.0
+
+    @staticmethod
+    def _safe_basename(name: str) -> str | None:
+        """
+        Validate that *name* is a plain filename with no path traversal or
+        glob metacharacters.  Returns the basename if safe, else None.
+        """
+        import re as _re
+
+        # Reject anything that looks like a path or a glob pattern
+        if not name or _re.search(r"[/\\*?\[\]]", name):
+            return None
+        # After stripping path components the result must be identical
+        import os as _os
+
+        return _os.path.basename(name) or None
+
+    def _code_change_score(self, content: str) -> float:
+        """
+        Parse staleness anchors embedded in memory content and compare
+        against the current state of the files on disk / in git.
+
+        Returns a float in [0.0, 1.0] representing code-change staleness.
+        Returns 0.0 if no anchors are found or comparisons fail.
+
+        Signal priority (highest to lowest):
+          1. File hash mismatch  → score ≥ 0.85  (any change to the file)
+          2. Signature removed   → score ≥ 0.80  (function renamed/deleted)
+          3. Signature changed   → score ≥ 0.75  (parameter change)
+          4. Git commits elapsed → score ≤ 0.50  (soft background signal,
+             always evaluated — not skipped when stronger signals already fired)
+        """
+        import re as _re
+
+        score = 0.0
+
+        # ── File hash comparison ─────────────────────────────────────────────
+        # _file_hashes_at_storage: {"filename.py": "abcdef0123456789"}
+        fh_match = _re.search(r"_file_hashes_at_storage:\s*(\{[^\n]+\})", content)
+        if fh_match:
+            try:
+                import json as _json
+                from .ast_extractor import hash_file  # type: ignore[import]
+                from pathlib import Path as _Path
+                import os as _os
+
+                stored_hashes: dict = _json.loads(fh_match.group(1))
+                cwd = _os.getcwd()
+
+                for raw_name, stored_hash in stored_hashes.items():
+                    safe_name = self._safe_basename(raw_name)
+                    if not safe_name:
+                        continue
+                    # Use next(iter(...)) to avoid materialising the full list
+                    candidate = next(iter(_Path(cwd).rglob(safe_name)), None)
+                    if candidate is None:
+                        continue
+                    current_hash = hash_file(str(candidate))
+                    if current_hash and current_hash != stored_hash:
+                        # File changed — strong signal
+                        score = max(score, 0.85)
+                        self.logger.debug(
+                            "Staleness: file hash mismatch for %s "
+                            "(stored=%s current=%s)",
+                            safe_name,
+                            stored_hash,
+                            current_hash,
+                        )
+            except Exception as exc:
+                self.logger.debug("File hash staleness check failed: %s", exc)
+
+        # ── Signature hash comparison ────────────────────────────────────────
+        # _signatures_at_storage: {"filename.py": {"func_name": "a1b2c3d4"}}
+        sig_match = _re.search(r"_signatures_at_storage:\s*(\{[^\n]+\})", content)
+        if sig_match and score < 0.75:
+            try:
+                import json as _json
+                from .ast_extractor import extract_signatures  # type: ignore[import]
+                from pathlib import Path as _Path
+                import os as _os
+
+                stored_sigs: dict = _json.loads(sig_match.group(1))
+                cwd = _os.getcwd()
+
+                for raw_name, func_sigs in stored_sigs.items():
+                    safe_name = self._safe_basename(raw_name)
+                    if not safe_name:
+                        continue
+                    candidate = next(iter(_Path(cwd).rglob(safe_name)), None)
+                    if candidate is None:
+                        continue
+                    current_sigs = extract_signatures(str(candidate))
+                    for func_name, stored_hash in func_sigs.items():
+                        current_hash = current_sigs.get(func_name)
+                        if current_hash is None:
+                            # Function removed/renamed — strong signal
+                            score = max(score, 0.80)
+                        elif current_hash != stored_hash:
+                            # Signature changed
+                            score = max(score, 0.75)
+            except Exception as exc:
+                self.logger.debug("Signature staleness check failed: %s", exc)
+
+        # ── Git commit comparison ────────────────────────────────────────────
+        # _git_commit_at_storage: abc1234
+        # Always evaluated — acts as a background signal even when file/sig
+        # checks already fired (git score is capped at 0.5, so it only raises
+        # the final score if no stronger signal has been detected).
+        git_match = _re.search(r"_git_commit_at_storage:\s*([0-9a-f]{7,})", content)
+        if git_match:
+            try:
+                from .ast_extractor import get_git_commit  # type: ignore[import]
+                import subprocess as _sp
+
+                stored_commit = git_match.group(1)
+                # Re-validate the captured commit hash before passing to git
+                if not _re.fullmatch(r"[0-9a-f]{7,40}", stored_commit):
+                    raise ValueError(
+                        f"Unexpected commit hash format: {stored_commit!r}"
+                    )
+
+                current_commit = get_git_commit()
+
+                if current_commit and current_commit != stored_commit:
+                    # Count commits since storage
+                    result = _sp.run(
+                        ["git", "rev-list", "--count", "--", f"{stored_commit}..HEAD"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0:
+                        n_commits = int(result.stdout.strip() or 0)
+                        # Soft signal: scale 0→0.5 over 1→20 commits, cap at 0.5
+                        git_score = min(0.5, n_commits / 20 * 0.5)
+                        score = max(score, git_score)
+                        self.logger.debug(
+                            "Staleness: %d commits since %s → git_score=%.2f",
+                            n_commits,
+                            stored_commit,
+                            git_score,
+                        )
+            except Exception as exc:
+                self.logger.debug("Git staleness check failed: %s", exc)
+
+        return round(score, 3)
 
     def list_source_memories(self, source_db_path: str, limit: int = 100) -> Result:
         """

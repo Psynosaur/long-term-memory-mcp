@@ -18,6 +18,7 @@ from .memory_system import RobustMemorySystem
 from .mcp_tools import register_tools, jsonify_result
 from .vector_backends.base import VectorBackend
 from .database_backends.base import DatabaseBackend
+from .audit import AuditLogger
 
 __all__ = [
     "DATA_FOLDER",
@@ -33,4 +34,5 @@ __all__ = [
     "jsonify_result",
     "VectorBackend",
     "DatabaseBackend",
+    "AuditLogger",
 ]

@@ -4,8 +4,14 @@ MCP tool handlers module.
 Contains all FastMCP tool definitions that wrap the memory system operations.
 """
 
+import time
+import traceback
+import uuid
 from datetime import datetime, timezone
+from typing import Optional
+
 from .models import Result
+from .audit import AuditLogger
 
 
 def jsonify_result(res: Result) -> dict:
@@ -50,14 +56,87 @@ def jsonify_result(res: Result) -> dict:
     return out
 
 
-def register_tools(mcp, memory_system):
+def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = None):
     """
     Register all MCP tools with the FastMCP instance.
 
     Args:
         mcp: FastMCP instance
         memory_system: RobustMemorySystem instance
+        audit_logger: Optional AuditLogger. When provided every tool call is
+            written to the daily-rotating JSONL audit file.
     """
+
+    def _audit(tool_name: str, args: dict, fn):
+        """
+        Call *fn()* and, if an audit_logger is configured, write one record.
+
+        *fn* is a zero-argument callable that performs the actual tool work
+        and returns the jsonified result dict.
+
+        Guarantees:
+        - An audit I/O failure (disk full, permission error, etc.) never
+          masks or suppresses the result of fn().
+        - A non-dict return from fn() does not crash the audit path.
+        """
+        if audit_logger is None:
+            return fn()
+
+        call_id = str(uuid.uuid4())
+        ts = datetime.now(timezone.utc).isoformat()
+        t0 = time.perf_counter()
+        error_str: str | None = None
+        result: dict = {}
+        raised = False
+
+        try:
+            result = fn()
+        except Exception:
+            error_str = traceback.format_exc()
+            result = {"success": False, "reason": error_str.splitlines()[-1]}
+            raised = True
+            raise
+        finally:
+            duration_ms = round((time.perf_counter() - t0) * 1000)
+            success = (
+                result.get("success", False)
+                if isinstance(result, dict)
+                else bool(result)
+            )
+            # Sum token_count across all result items when available.
+            # remember() stores it in data[0]; search/get tools now include
+            # it on every item. Summing gives total tokens for the call.
+            token_count: int | None = None
+            if isinstance(result, dict):
+                data = result.get("data")
+                if isinstance(data, list) and data:
+                    total = sum(
+                        item.get("token_count") or 0
+                        for item in data
+                        if isinstance(item, dict)
+                    )
+                    if total > 0:
+                        token_count = total
+            record = {
+                "call_id": call_id,
+                "timestamp": ts,
+                "tool": tool_name,
+                "token_count": token_count,
+                "args": args,
+                "success": False if raised else success,
+                "duration_ms": duration_ms,
+                "result": result,
+                "error": error_str,
+            }
+            # write() catches its own exceptions internally, but wrap here too
+            # so that any unexpected failure never suppresses the original
+            # exception from fn().
+            try:
+                audit_logger.write(record)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return result
 
     @mcp.tool
     def remember(
@@ -67,6 +146,7 @@ def register_tools(mcp, memory_system):
         importance: int = 5,
         memory_type: str = "conversation",
         shared_with: str = "",
+        file_paths: str = "",
     ) -> dict:
         """
         Store a new memory (fact, preference, event, or conversation snippet).
@@ -85,6 +165,11 @@ def register_tools(mcp, memory_system):
             Leave empty for private (default). Examples:
             "*"                         — share with all discovered peers
             "uuid1,uuid2"               — share with specific peers only
+        - file_paths (str, optional): Comma-separated absolute paths to source files.
+            When provided AND memory_type is "fact", AST symbols are automatically
+            extracted and appended as _symbols_at_storage for staleness detection.
+            Supports: Python, TypeScript, TSX, JavaScript, Go, Rust, Java, Kotlin, C/C++.
+            Example: "/abs/path/to/server.py,/abs/path/to/models.py"
 
         Returns:
             dict: Dictionary with the following keys:
@@ -93,6 +178,8 @@ def register_tools(mcp, memory_system):
                 - data (list, optional): List of memory objects. Each object includes:
                     - id, title, content, timestamp, tags, importance, memory_type,
                       shared_with, ... (additional fields as needed)
+                    - warning (str, optional): "potential_contradiction" if a similar
+                      memory already exists. Check conflicting_id / conflicting_title.
 
         Example triggers:
         - "My birthday is July 4th."
@@ -107,15 +194,34 @@ def register_tools(mcp, memory_system):
             if shared_with
             else []
         )
-        res = memory_system.remember(
-            title,
-            content,
-            tag_list,
-            importance,
-            memory_type,
-            shared_with=shared_with_list,
+        file_paths_list = (
+            [p.strip() for p in file_paths.split(",") if p.strip()]
+            if file_paths
+            else []
         )
-        return jsonify_result(res)
+        return _audit(
+            "remember",
+            {
+                "title": title,
+                "content": content,
+                "tags": tags,
+                "importance": importance,
+                "memory_type": memory_type,
+                "shared_with": shared_with,
+                "file_paths": file_paths,
+            },
+            lambda: jsonify_result(
+                memory_system.remember(
+                    title,
+                    content,
+                    tag_list,
+                    importance,
+                    memory_type,
+                    shared_with=shared_with_list,
+                    file_paths=file_paths_list,
+                )
+            ),
+        )
 
     @mcp.tool
     def search_memories(
@@ -154,10 +260,16 @@ def register_tools(mcp, memory_system):
         - "Do you remember what I said about camping?"
         """
         if search_type == "semantic":
-            res = memory_system.search_semantic(query, limit)
-        else:
-            res = memory_system.search_structured(limit=limit)
-        return jsonify_result(res)
+            return _audit(
+                "search_memories",
+                {"query": query, "search_type": search_type, "limit": limit},
+                lambda: jsonify_result(memory_system.search_semantic(query, limit)),
+            )
+        return _audit(
+            "search_memories",
+            {"query": query, "search_type": search_type, "limit": limit},
+            lambda: jsonify_result(memory_system.search_structured(limit=limit)),
+        )
 
     @mcp.tool
     def search_by_type(memory_type: str, limit: int = 20) -> dict:
@@ -192,8 +304,13 @@ def register_tools(mcp, memory_system):
         - "List the facts you know about me."
         - "What events have we discussed?"
         """
-        res = memory_system.search_structured(memory_type=memory_type, limit=limit)
-        return jsonify_result(res)
+        return _audit(
+            "search_by_type",
+            {"memory_type": memory_type, "limit": limit},
+            lambda: jsonify_result(
+                memory_system.search_structured(memory_type=memory_type, limit=limit)
+            ),
+        )
 
     @mcp.tool
     def search_by_tags(tags: str, limit: int = 20) -> dict:
@@ -223,8 +340,13 @@ def register_tools(mcp, memory_system):
         - "What do you have tagged as personal?"
         """
         tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
-        res = memory_system.search_structured(tags=tag_list, limit=limit)
-        return jsonify_result(res)
+        return _audit(
+            "search_by_tags",
+            {"tags": tags, "limit": limit},
+            lambda: jsonify_result(
+                memory_system.search_structured(tags=tag_list, limit=limit)
+            ),
+        )
 
     @mcp.tool
     def get_recent_memories(limit: int = 20, current_project: str = None) -> dict:
@@ -261,8 +383,13 @@ def register_tools(mcp, memory_system):
         - get_recent_memories(limit=10, current_project="long-term-memory-mcp")
         - Returns only memories tagged with "long-term-memory-mcp"
         """
-        res = memory_system.get_recent(limit, current_project=current_project)
-        return jsonify_result(res)
+        return _audit(
+            "get_recent_memories",
+            {"limit": limit, "current_project": current_project},
+            lambda: jsonify_result(
+                memory_system.get_recent(limit, current_project=current_project)
+            ),
+        )
 
     @mcp.tool
     def update_memory(
@@ -305,16 +432,29 @@ def register_tools(mcp, memory_system):
         shared_with_list = None
         if shared_with is not None:
             shared_with_list = [s.strip() for s in shared_with.split(",") if s.strip()]
-        res = memory_system.update_memory(
-            memory_id=memory_id,
-            title=title,
-            content=content,
-            tags=tag_list,
-            importance=importance,
-            memory_type=memory_type,
-            shared_with=shared_with_list,
+        return _audit(
+            "update_memory",
+            {
+                "memory_id": memory_id,
+                "title": title,
+                "content": content,
+                "tags": tags,
+                "importance": importance,
+                "memory_type": memory_type,
+                "shared_with": shared_with,
+            },
+            lambda: jsonify_result(
+                memory_system.update_memory(
+                    memory_id=memory_id,
+                    title=title,
+                    content=content,
+                    tags=tag_list,
+                    importance=importance,
+                    memory_type=memory_type,
+                    shared_with=shared_with_list,
+                )
+            ),
         )
-        return jsonify_result(res)
 
     @mcp.tool
     def delete_memory(memory_id: str) -> dict:
@@ -337,8 +477,11 @@ def register_tools(mcp, memory_system):
         - "Delete that memory about my ex."
         - "Erase what I told you earlier about my school."
         """
-        res = memory_system.delete_memory(memory_id)
-        return jsonify_result(res)
+        return _audit(
+            "delete_memory",
+            {"memory_id": memory_id},
+            lambda: jsonify_result(memory_system.delete_memory(memory_id)),
+        )
 
     @mcp.tool
     def get_memory_stats() -> dict:
@@ -372,8 +515,11 @@ def register_tools(mcp, memory_system):
         - "Show me your storage stats."
         - "How much have you remembered so far?"
         """
-        res = memory_system.get_statistics()
-        return jsonify_result(res)
+        return _audit(
+            "get_memory_stats",
+            {},
+            lambda: jsonify_result(memory_system.get_statistics()),
+        )
 
     @mcp.tool
     def create_backup() -> dict:
@@ -404,8 +550,11 @@ def register_tools(mcp, memory_system):
         - "Create a backup of my memories."
         - "Back up the system."
         """
-        res = memory_system.create_backup()
-        return jsonify_result(res)
+        return _audit(
+            "create_backup",
+            {},
+            lambda: jsonify_result(memory_system.create_backup()),
+        )
 
     @mcp.tool
     def search_by_date_range(
@@ -445,10 +594,15 @@ def register_tools(mcp, memory_system):
         """
         if date_to is None:
             date_to = datetime.now(timezone.utc).isoformat()
-        res = memory_system.search_structured(
-            date_from=date_from, date_to=date_to, limit=limit
+        return _audit(
+            "search_by_date_range",
+            {"date_from": date_from, "date_to": date_to, "limit": limit},
+            lambda: jsonify_result(
+                memory_system.search_structured(
+                    date_from=date_from, date_to=date_to, limit=limit
+                )
+            ),
         )
-        return jsonify_result(res)
 
     @mcp.tool
     def rebuild_vectors() -> dict:
@@ -456,8 +610,11 @@ def register_tools(mcp, memory_system):
         One-time repair: rebuild vector index from SQLite memories.
         Use if semantic search isn't working but structured search is.
         """
-        res = memory_system.rebuild_vector_index()
-        return jsonify_result(res)
+        return _audit(
+            "rebuild_vectors",
+            {},
+            lambda: jsonify_result(memory_system.rebuild_vector_index()),
+        )
 
     @mcp.tool
     def list_source_memories(source_db_path: str, limit: int = 100) -> dict:
@@ -491,8 +648,13 @@ def register_tools(mcp, memory_system):
         - "List memories from the default database location"
         - "Preview what will be migrated"
         """
-        res = memory_system.list_source_memories(source_db_path, limit)
-        return jsonify_result(res)
+        return _audit(
+            "list_source_memories",
+            {"source_db_path": source_db_path, "limit": limit},
+            lambda: jsonify_result(
+                memory_system.list_source_memories(source_db_path, limit)
+            ),
+        )
 
     @mcp.tool
     def migrate_memories(
@@ -547,10 +709,20 @@ def register_tools(mcp, memory_system):
         if memory_ids:
             memory_id_list = [mid.strip() for mid in memory_ids.split(",")]
 
-        res = memory_system.migrate_memories(
-            source_db_path=source_db_path,
-            source_chroma_path=source_chroma_path,
-            memory_ids=memory_id_list,
-            skip_duplicates=skip_duplicates,
+        return _audit(
+            "migrate_memories",
+            {
+                "source_db_path": source_db_path,
+                "source_chroma_path": source_chroma_path,
+                "memory_ids": memory_ids,
+                "skip_duplicates": skip_duplicates,
+            },
+            lambda: jsonify_result(
+                memory_system.migrate_memories(
+                    source_db_path=source_db_path,
+                    source_chroma_path=source_chroma_path,
+                    memory_ids=memory_id_list,
+                    skip_duplicates=skip_duplicates,
+                )
+            ),
         )
-        return jsonify_result(res)

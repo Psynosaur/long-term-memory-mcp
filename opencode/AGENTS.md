@@ -34,9 +34,10 @@ When launching sub-agents via the Task tool, include memory instructions in the 
 
 **Template:**
 ```
-BEFORE any other tool, call in parallel:
+BEFORE any other tool:
   long-term-memory_get_recent_memories(limit=5, current_project="<project>")
-  long-term-memory_search_by_tags(tags="<relevant,tags>")
+  If results lack project context, follow up with:
+  long-term-memory_search_by_tags(tags="<project>,preference")
 
 [task instructions]
 
@@ -48,7 +49,7 @@ Before returning results, store findings:
 
 | Tool | When to use |
 |---|---|
-| `remember` | Store new facts, preferences, decisions |
+| `remember` | Store new facts, preferences, decisions. For `memory_type="fact"`, pass ALL files from `_files_changed` as absolute paths: `file_paths="/abs/path/a.ts,/abs/path/b.py"` — the server automatically extracts and appends three staleness anchors for every file: `_signatures_at_storage` (param hashes, keys = symbol names — detects renames, deletions and signature changes), `_file_hashes_at_storage` (SHA-256 per file — detects ANY change), `_git_commit_at_storage` (HEAD commit — enables git log diff at recall time). These anchors are compared at recall time to produce a code-aware staleness score. |
 | `update_memory` | Correct or enrich an existing memory |
 | `delete_memory` | Only when user explicitly asks to forget something |
 | `search_memories` | Free-form natural language recall |

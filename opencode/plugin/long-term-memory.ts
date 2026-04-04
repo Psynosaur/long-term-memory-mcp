@@ -60,7 +60,12 @@ export const LongTermMemoryPlugin: Plugin = async ({
 
   log("Plugin initialized", { directory });
 
-  // Tools that count as "recall"
+  // The ONE tool that satisfies the recall gate — must be called first.
+  // Other search tools (search_by_tags, search_memories, etc.) are optional
+  // follow-ups; they do NOT satisfy the gate on their own.
+  const RECALL_GATE_TOOL = "long-term-memory_get_recent_memories";
+
+  // All memory read tools (used only for state tracking, not gating)
   const RECALL_TOOLS = new Set([
     "long-term-memory_get_recent_memories",
     "long-term-memory_search_memories",
@@ -89,18 +94,24 @@ export const LongTermMemoryPlugin: Plugin = async ({
 You have a persistent memory system via MCP tools prefixed \`long-term-memory_\`.
 
 ### START OF EVERY TASK (before ANY other action)
-Call BOTH in parallel — NO EXCEPTIONS:
+Call this first — NO EXCEPTIONS:
   long-term-memory_get_recent_memories(limit=5, current_project="${projectName}")
-  long-term-memory_search_by_tags(tags="preference,project")
 
 You WILL be blocked from using ANY tool (bash, read, glob, grep, edit, write, etc.) if you skip this step.
+
+Then inspect the results:
+- If the returned memories already include project-specific context (tagged "${projectName}" or "preference"), you're done — proceed with work.
+- If the results look sparse or lack project context, follow up with ONE targeted search:
+    long-term-memory_search_by_tags(tags="${projectName},preference")
+
+Do NOT call search_by_tags unconditionally on every turn — only when get_recent_memories didn't surface what you need.
 
 ### STALENESS CHECK (at session start, after recall)
 Inspect the returned memories. For any memory where:
   - memory_type is "fact" or "preference"  AND
   - staleness_score > 0.8
 Flag it mentally as potentially stale. If you act on it during the task, verify it against
-the current codebase first (use boom_slang_query_function_definitions or read the file).
+the current codebase first (read the file or use grep/glob to verify).
 Do NOT surface this check to the user — handle it silently.
 
 ### END OF EVERY TURN where files were edited
@@ -115,10 +126,17 @@ Before calling remember(), collect staleness anchors and embed them in the conte
 1. Run: bash("git log --since='30 days ago' --name-only --pretty=format: | sort -u")
    Add the result to content as: _files_changed: [<list>]
 
-2. For each source file directly referenced in your memory, run ONE of:
-   boom_slang_query_function_definitions(file_path="<abs_path>")
-   boom_slang_query_class_methods(file_path="<abs_path>")
-   Add the symbol names to content as: _symbols_at_storage: {"<file>": [<names>]}
+2. Pass ALL files from the git log output above to remember() via the file_paths parameter.
+   Do NOT cherry-pick — include every source file listed (skip config/json/yaml/md files).
+   file_paths="/abs/path/to/file1.ts,/abs/path/to/file2.py,/abs/path/to/file3.py"
+   The server will automatically extract and append three staleness anchors for every file:
+     _signatures_at_storage   — {func_name: param_hash} — keys are symbol names (detects
+                                renames/deletions), values are param hashes (detects signature
+                                changes). Supersedes _symbols_at_storage — no redundant storage.
+     _file_hashes_at_storage  — SHA-256 per file (detects ANY file change)
+     _git_commit_at_storage   — HEAD commit hash (enables git log diff at recall time)
+   These are compared at recall time to produce a code-aware staleness score.
+   Supports: Python, TypeScript, TSX, JavaScript, Go, Rust, Java, Kotlin, C/C++.
 
 Skip steps 1-2 for memory_type=preference, event, conversation — not relevant.
 
@@ -154,7 +172,11 @@ If remember() returns data[0].warning == "potential_contradiction":
       // Memory tools are always allowed — track and return
       if (input.tool.startsWith("long-term-memory_")) {
         state.toolCalls++;
-        if (RECALL_TOOLS.has(input.tool)) state.recalledThisTurn = true;
+        if (RECALL_TOOLS.has(input.tool)) {
+          // Only get_recent_memories satisfies the recall gate.
+          // search_by_tags etc. are allowed as follow-ups but don't open the gate.
+          if (input.tool === RECALL_GATE_TOOL) state.recalledThisTurn = true;
+        }
         if (STORE_TOOLS.has(input.tool)) {
           state.storedThisTurn = true;
           // Storing clears the "prev turn edited without store" gate and resets the warning
@@ -175,9 +197,10 @@ If remember() returns data[0].warning == "potential_contradiction":
         log("Blocking tool — recall not done", { tool: input.tool });
         throw new Error(
           `[long-term-memory] You must recall memories before using any tools.\n` +
-          `Call BOTH in parallel first (your very first action):\n` +
+          `Call this first (your very first action):\n` +
           `  long-term-memory_get_recent_memories(limit=5, current_project="${projectName}")\n` +
-          `  long-term-memory_search_by_tags(tags="preference,project")\n` +
+          `If the results don't include project memories, follow up with:\n` +
+          `  long-term-memory_search_by_tags(tags="${projectName},preference")\n` +
           `Then retry.`
         );
       }
@@ -268,9 +291,10 @@ Memory tool usage this session:
 - Total memory calls      : ${state.toolCalls}
 
 MANDATORY on resume after compaction:
-1. Call BOTH in parallel (first action, before anything else):
+1. Call first (before anything else):
    long-term-memory_get_recent_memories(limit=5, current_project="${projectName}")
-   long-term-memory_search_by_tags(tags="preference,project")
+   Then only if project context is sparse, follow up with:
+   long-term-memory_search_by_tags(tags="${projectName},preference")
 2. If "Prev turn edit no-store" is YES above, call long-term-memory_remember immediately after recall.
 3. NEVER create .md files for summaries — use memory tools only.
 4. ALL tools are BLOCKED until step 1 is done.
