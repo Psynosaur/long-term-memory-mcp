@@ -149,33 +149,79 @@ def load_vectors(
             password=pg_password,
             dimensions=EMBEDDING_MODEL_CONFIG["dimensions"],
         )
+
+        initialized = False
+        try:
+            backend.initialize()
+            initialized = True
+            count = backend.count()
+            if count == 0:
+                log.warning("No vectors found in the database.")
+                sys.exit(0)
+
+            log.info(f"Loading {count} vectors from {backend.backend_name}...")
+            t0 = time.perf_counter()
+
+            data = backend.get(include_embeddings=True)
+
+            ids = data["ids"]
+            metadatas = data.get("metadatas") or [{} for _ in range(len(ids))]
+            documents = data.get("documents") or ["" for _ in range(len(ids))]
+            raw_embeddings = data.get("embeddings")
+            if raw_embeddings is None or (
+                hasattr(raw_embeddings, "__len__") and len(raw_embeddings) == 0
+            ):
+                log.warning(
+                    "Backend returned no embeddings (try include_embeddings=True)."
+                )
+                sys.exit(1)
+
+            embeddings = np.array(raw_embeddings, dtype=np.float32)
+
+            if not (len(ids) == len(metadatas) == embeddings.shape[0]):
+                log.critical(
+                    f"Length mismatch: ids={len(ids)}, metadatas={len(metadatas)}, "
+                    f"embeddings={embeddings.shape[0]}"
+                )
+                sys.exit(1)
+
+            elapsed = time.perf_counter() - t0
+            log.info(
+                f"Loaded {embeddings.shape[0]} vectors ({embeddings.shape[1]}D) "
+                f"in {elapsed:.2f}s"
+            )
+
+            return embeddings, metadatas, ids, documents
+        finally:
+            if initialized:
+                backend.close()
+
     else:
+        # ChromaDB — use a lock-free read-only path that reads directly from
+        # the SQLite WAL.  This avoids Windows mandatory file locking that
+        # causes the visualizer to stall when the MCP server already holds
+        # ChromaDB's PersistentClient open.
         from memory_mcp.vector_backends.chroma import ChromaBackend
 
-        backend = ChromaBackend(db_folder=Path(DATA_FOLDER) / "memory_db")
-
-    initialized = False
-    try:
-        backend.initialize()
-        initialized = True
-        count = backend.count()
-        if count == 0:
-            log.warning("No vectors found in the database.")
-            sys.exit(0)
-
-        log.info(f"Loading {count} vectors from {backend.backend_name}...")
+        db_folder = Path(DATA_FOLDER) / "memory_db"
+        log.info("Loading vectors via ChromaDB read-only SQLite path...")
         t0 = time.perf_counter()
 
-        data = backend.get(include_embeddings=True)
+        data = ChromaBackend.get_vectors_readonly(db_folder)
 
         ids = data["ids"]
         metadatas = data.get("metadatas") or [{} for _ in range(len(ids))]
         documents = data.get("documents") or ["" for _ in range(len(ids))]
         raw_embeddings = data.get("embeddings")
+
+        if not ids:
+            log.warning("No vectors found in the database.")
+            sys.exit(0)
+
         if raw_embeddings is None or (
             hasattr(raw_embeddings, "__len__") and len(raw_embeddings) == 0
         ):
-            log.warning("Backend returned no embeddings (try include_embeddings=True).")
+            log.warning("Backend returned no embeddings.")
             sys.exit(1)
 
         embeddings = np.array(raw_embeddings, dtype=np.float32)
@@ -194,9 +240,6 @@ def load_vectors(
         )
 
         return embeddings, metadatas, ids, documents
-    finally:
-        if initialized:
-            backend.close()
 
 
 def _load_memory_texts(

@@ -5,7 +5,8 @@ import type { Plugin } from "@opencode-ai/plugin";
  *
  * Hooks into OpenCode's lifecycle to enforce memory usage:
  * 1. System prompt injection  - Adds memory instructions to every LLM call
- * 2. Universal tool gate      - Blocks ALL tools until recall has happened
+ * 2. Universal tool gate      - Blocks ALL tools until recall has happened once this session;
+ *                               also blocks next turn's tools if edits weren't stored
  * 3. End-of-turn store gate   - Blocks next turn's tools if edits weren't stored
  * 4. Idle enforcement         - Warns when store was skipped after edits
  * 5. Compaction hook          - Preserves enforcement state across compactions
@@ -14,11 +15,13 @@ export const LongTermMemoryPlugin: Plugin = async ({
   client,
   directory,
 }) => {
-  const projectName = directory.split("/").pop() || "unknown";
+  // Support both POSIX ("/") and Windows ("\") path separators.
+  const projectName =
+    directory.replace(/\\/g, "/").split("/").filter(Boolean).pop() || "unknown";
 
   /** Per-session tracking state */
   type SessionState = {
-    recalledThisTurn: boolean;      // recall happened this turn (resets each turn)
+    recalledThisSession: boolean;   // recall happened at least once this session (never resets)
     storedThisTurn: boolean;        // remember/update called during current turn
     editedThisTurn: boolean;        // write/edit called during current turn
     prevTurnEditedWithoutStore: boolean; // last turn had edits but no store
@@ -32,7 +35,7 @@ export const LongTermMemoryPlugin: Plugin = async ({
   const getState = (sessionID: string): SessionState => {
     if (!sessions.has(sessionID)) {
       sessions.set(sessionID, {
-        recalledThisTurn: false,
+        recalledThisSession: false,
         storedThisTurn: false,
         editedThisTurn: false,
         prevTurnEditedWithoutStore: false,
@@ -93,8 +96,8 @@ export const LongTermMemoryPlugin: Plugin = async ({
 
 You have a persistent memory system via MCP tools prefixed \`long-term-memory_\`.
 
-### START OF EVERY TASK (before ANY other action)
-Call this first — NO EXCEPTIONS:
+### SESSION START (first action of the entire session — once only)
+Call this exactly once at the very start of the session — NO EXCEPTIONS:
   long-term-memory_get_recent_memories(limit=5, current_project="${projectName}")
 
 You WILL be blocked from using ANY tool (bash, read, glob, grep, edit, write, etc.) if you skip this step.
@@ -104,7 +107,15 @@ Then inspect the results:
 - If the results look sparse or lack project context, follow up with ONE targeted search:
     long-term-memory_search_by_tags(tags="${projectName},preference")
 
-Do NOT call search_by_tags unconditionally on every turn — only when get_recent_memories didn't surface what you need.
+After the session-start recall, the hard gate is permanently satisfied for this session.
+Do NOT call get_recent_memories again on every subsequent turn.
+
+### PER-TURN CONTEXT CHECK (soft — LLM judgement, no hard gate)
+Before starting each new user request (turn N > 1), silently assess:
+  "Does this request touch something that is NOT already in my current context?"
+- If YES → call long-term-memory_search_memories(query="<relevant topic>", limit=3) once and proceed.
+- If NO  → proceed directly without any recall call.
+This is a judgement call, not a hard requirement. Do not recall mechanically on every turn.
 
 ### STALENESS CHECK (at session start, after recall)
 Inspect the returned memories. For any memory where:
@@ -161,7 +172,7 @@ If remember() returns data[0].warning == "potential_contradiction":
 
     // ─────────────────────────────────────────────────────────────────────────
     // HOOK 2: Universal tool gate (before every tool call)
-    // Gate 1: block ALL tools until recall has happened this session
+    // Gate 1: block ALL tools until recall has happened once this session
     // Gate 2: block ALL tools at start of new turn if prev turn had edits but no store
     // ─────────────────────────────────────────────────────────────────────────
     "tool.execute.before": async (input, _output) => {
@@ -175,7 +186,7 @@ If remember() returns data[0].warning == "potential_contradiction":
         if (RECALL_TOOLS.has(input.tool)) {
           // Only get_recent_memories satisfies the recall gate.
           // search_by_tags etc. are allowed as follow-ups but don't open the gate.
-          if (input.tool === RECALL_GATE_TOOL) state.recalledThisTurn = true;
+          if (input.tool === RECALL_GATE_TOOL) state.recalledThisSession = true;
         }
         if (STORE_TOOLS.has(input.tool)) {
           state.storedThisTurn = true;
@@ -192,16 +203,16 @@ If remember() returns data[0].warning == "potential_contradiction":
         state.filesEdited = true;
       }
 
-      // Gate 1: recall must happen this turn before any other tool use
-      if (!state.recalledThisTurn) {
-        log("Blocking tool — recall not done", { tool: input.tool });
+      // Gate 1: recall must happen once this session before any other tool use
+      if (!state.recalledThisSession) {
+        log("Blocking tool — session recall not done", { tool: input.tool });
         throw new Error(
-          `[long-term-memory] You must recall memories before using any tools.\n` +
-          `Call this first (your very first action):\n` +
+          `[long-term-memory] You must recall memories once at the start of the session before using any tools.\n` +
+          `Call this first (your very first action this session):\n` +
           `  long-term-memory_get_recent_memories(limit=5, current_project="${projectName}")\n` +
           `If the results don't include project memories, follow up with:\n` +
           `  long-term-memory_search_by_tags(tags="${projectName},preference")\n` +
-          `Then retry.`
+          `Then retry. This gate is satisfied for the rest of the session once fired.`
         );
       }
 
@@ -257,9 +268,10 @@ If remember() returns data[0].warning == "potential_contradiction":
         }
 
         // Roll over per-turn state for next turn
+        // NOTE: recalledThisSession is intentionally NOT reset — the session-start
+        // recall gate is permanently satisfied once fired.
         state.editedThisTurn = false;
         state.storedThisTurn = false;
-        state.recalledThisTurn = false; // gate re-arms every turn
       }
 
       // Clean up on session delete
@@ -284,21 +296,20 @@ If remember() returns data[0].warning == "potential_contradiction":
 Project: ${projectName} | Directory: ${directory}
 
 Memory tool usage this session:
-- Memories recalled       : ${state.recalledThisTurn ? "YES" : "NO — must recall on resume"}
-- Stored this turn        : ${state.storedThisTurn ? "YES" : "NO"}
-- Prev turn edit no-store : ${state.prevTurnEditedWithoutStore ? "YES — gate is ACTIVE" : "no"}
-- Files edited (session)  : ${state.filesEdited ? "YES" : "no"}
-- Total memory calls      : ${state.toolCalls}
+- Session recall done       : ${state.recalledThisSession ? "YES — gate permanently satisfied" : "NO — must call get_recent_memories before any tool"}
+- Stored this turn          : ${state.storedThisTurn ? "YES" : "NO"}
+- Prev turn edit no-store   : ${state.prevTurnEditedWithoutStore ? "YES — gate is ACTIVE" : "no"}
+- Files edited (session)    : ${state.filesEdited ? "YES" : "no"}
+- Total memory calls        : ${state.toolCalls}
 
 MANDATORY on resume after compaction:
-1. Call first (before anything else):
-   long-term-memory_get_recent_memories(limit=5, current_project="${projectName}")
-   Then only if project context is sparse, follow up with:
-   long-term-memory_search_by_tags(tags="${projectName},preference")
-2. If "Prev turn edit no-store" is YES above, call long-term-memory_remember immediately after recall.
+1. The session-start recall gate fires ONCE per session. Since this is a compaction (same session),
+   the gate is ${state.recalledThisSession ? "ALREADY SATISFIED — do NOT call get_recent_memories again unless you need fresh context" : "NOT YET SATISFIED — call get_recent_memories(limit=5, current_project=\"" + projectName + "\") before any other tool"}.
+2. If "Prev turn edit no-store" is YES above, call long-term-memory_remember immediately.
 3. NEVER create .md files for summaries — use memory tools only.
-4. ALL tools are BLOCKED until step 1 is done.
+4. If session recall gate is not satisfied, ALL tools are BLOCKED until it is done.
 5. If files were edited this turn, call long-term-memory_remember before finishing the response.
+6. Per-turn recall is SOFT — only call search_memories if the request touches something not in context.
 
 ## Session Summary
 Summarise the work done, decisions made, files changed, and what remains. Be concise and factual.`;

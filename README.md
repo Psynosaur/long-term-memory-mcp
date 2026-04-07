@@ -58,7 +58,8 @@ long-term-memory-mcp/
 ├── opencode/
 │   ├── plugin/long-term-memory.ts   # OpenCode enforcement plugin
 │   └── AGENTS.md                    # OpenCode global system prompt
-├── install_opencode.sh              # Installs plugin + AGENTS.md
+├── install_opencode.sh              # Installs plugin + AGENTS.md (macOS/Linux)
+├── install_opencode.ps1             # Installs plugin + AGENTS.md (Windows)
 ├── mcp-config-examples.json         # 15+ client config examples
 ├── docker-compose.yml               # pgvector Docker service
 └── pyproject.toml                   # Package config + optional extras
@@ -209,14 +210,12 @@ Sub-agents launched via the Task tool cannot call MCP tools by default. Grant th
 bash install_opencode.sh
 ```
 
-This copies the plugin and `AGENTS.md` to `~/.config/opencode/` and runs `bun add @opencode-ai/plugin`. Re-run anytime to update.
+This copies the plugin and `AGENTS.md` to `~/.config/opencode/`. Re-run anytime to update.
 
-**Manual install (Windows):**
+**Install (Windows):**
 
-```
-copy opencode\plugin\long-term-memory.ts %APPDATA%\opencode\plugins\
-copy opencode\AGENTS.md %APPDATA%\opencode\AGENTS.md
-cd %APPDATA%\opencode && bun add @opencode-ai/plugin
+```powershell
+.\install_opencode.ps1
 ```
 
 ### AGENTS.md
@@ -360,7 +359,8 @@ Auto-created every 24h or after 100 new memories; last 10 kept. Each backup incl
 **OpenCode Enforcement Plugin**
 - `opencode/plugin/long-term-memory.ts`: universal tool gate, store gate, system prompt injection, compaction hook, idle warning
 - `opencode/AGENTS.md`: condensed system prompt for what to store, tagging, sub-agent templates
-- `install_opencode.sh`: one-command install/update script
+- `install_opencode.sh`: one-command install/update script (macOS/Linux)
+- `install_opencode.ps1`: one-command install/update script (Windows)
 
 **Visualizers & Tray**
 - `vector_visualizer.py`: Plotly/Dash 3D scatter — semantic search, word vectors, Word Paths, tag dropdown, dark theme

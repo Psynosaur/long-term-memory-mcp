@@ -34,10 +34,9 @@ When launching sub-agents via the Task tool, include memory instructions in the 
 
 **Template:**
 ```
-BEFORE any other tool:
+BEFORE any other tool, call in parallel:
   long-term-memory_get_recent_memories(limit=5, current_project="<project>")
-  If results lack project context, follow up with:
-  long-term-memory_search_by_tags(tags="<project>,preference")
+  long-term-memory_search_by_tags(tags="<relevant,tags>")
 
 [task instructions]
 
@@ -52,8 +51,18 @@ Before returning results, store findings:
 | `remember` | Store new facts, preferences, decisions. For `memory_type="fact"`, pass ALL files from `_files_changed` as absolute paths: `file_paths="/abs/path/a.ts,/abs/path/b.py"` — the server automatically extracts and appends three staleness anchors for every file: `_signatures_at_storage` (param hashes, keys = symbol names — detects renames, deletions and signature changes), `_file_hashes_at_storage` (SHA-256 per file — detects ANY change), `_git_commit_at_storage` (HEAD commit — enables git log diff at recall time). These anchors are compared at recall time to produce a code-aware staleness score. |
 | `update_memory` | Correct or enrich an existing memory |
 | `delete_memory` | Only when user explicitly asks to forget something |
-| `search_memories` | Free-form natural language recall |
+| `search_memories` | Free-form natural language recall; use for per-turn soft recall when needed |
 | `search_by_tags` | Find memories by topic/tag |
 | `search_by_type` | List all memories of a type (e.g. all preferences) |
-| `get_recent_memories` | Resume context at start of turn |
+| `get_recent_memories` | Session-start recall — call ONCE at session start, not every turn |
 | `search_by_date_range` | Time-bounded recall |
+
+## Recall Gate Behaviour
+
+The enforcement plugin gates are:
+
+1. **Session-start recall gate (hard)** — `get_recent_memories` must be called once at the very start of the session. ALL tools are blocked until this fires. Once satisfied, the gate is permanently open for the rest of the session.
+
+2. **Per-turn recall (soft, LLM-driven)** — On each subsequent turn, silently assess whether the request touches something not already in context. If yes, call `search_memories(query="...", limit=3)`. If no, proceed without any recall call. No hard gate, no throw.
+
+3. **Store gate (hard, per-turn)** — If you edited files last turn without calling `remember`, ALL tools are blocked at the start of the next turn until you store.

@@ -17,6 +17,7 @@ Supported vector backends:
 from pathlib import Path
 from dataclasses import asdict
 from typing import Optional, List, Dict, Any
+import os
 import shutil
 import json
 import sqlite3
@@ -979,6 +980,7 @@ class RobustMemorySystem:
         date_from: str = None,
         date_to: str = None,
         limit: int = 50,
+        order_by: str = None,
     ) -> Result:
         """
         Structured search using SQL queries
@@ -1013,10 +1015,25 @@ class RobustMemorySystem:
 
             where_clause = " AND ".join(conditions) if conditions else "1=1"
 
+            # Allow callers to override sort order; default keeps historical behaviour.
+            # Allowlist to prevent SQL injection.
+            _allowed_orders = {
+                "importance DESC, timestamp DESC",
+                "timestamp DESC",
+                "timestamp DESC, importance DESC",
+                "timestamp ASC",
+                "importance DESC",
+            }
+            effective_order = (
+                order_by
+                if order_by in _allowed_orders
+                else "importance DESC, timestamp DESC"
+            )
+
             query = f"""
                 SELECT * FROM memories
                 WHERE {where_clause}
-                ORDER BY importance DESC, timestamp DESC
+                ORDER BY {effective_order}
                 LIMIT ?
             """
             params.append(limit)
@@ -1116,26 +1133,44 @@ class RobustMemorySystem:
             # Collect preference IDs for deduplication
             pref_ids = {item["id"] for item in pref_items}
 
-            # --- 2. Fetch regular recent memories (full limit) ---
+            # --- 2. Normalise current_project to a short tag name ---
+            # Callers often pass the full working-directory path
+            # (e.g. "C:\git\long-term-memory-mcp") but memories are tagged with
+            # only the basename ("long-term-memory-mcp"). Normalise here so the
+            # tag search actually matches what is stored.
+            project_tag = None
             if current_project:
+                project_tag = (
+                    os.path.basename(current_project.rstrip("/\\")) or current_project
+                )
+
+            # --- 3. Fetch recent memories ordered by recency first ---
+            # Use timestamp DESC so the freshest memories surface regardless of
+            # their importance score.  The search_structured helper exposes an
+            # order_by parameter; fall back to a direct SQL call when it doesn't.
+            if project_tag:
                 recent_result = self.search_structured(
-                    tags=[current_project], limit=limit
+                    tags=[project_tag], limit=limit, order_by="timestamp DESC"
                 )
             else:
-                recent_result = self.search_structured(limit=limit)
+                recent_result = self.search_structured(
+                    limit=limit, order_by="timestamp DESC"
+                )
             recent_items = (
                 recent_result.data
                 if recent_result.success and recent_result.data
                 else []
             )
 
-            # --- 3. Deduplicate: remove any recent items already in preferences ---
+            # --- 4. Deduplicate: remove any recent items already in preferences ---
             deduped_recent = [
                 item for item in recent_items if item["id"] not in pref_ids
             ]
 
-            # --- 4. Combine: all preferences first, then up to limit recent ---
-            combined = pref_items + deduped_recent[:limit]
+            # --- 5. Combine: preferences first (capped), then recent project memories ---
+            # Cap preferences to avoid swamping the result when there are many.
+            max_prefs = max(3, limit // 2)
+            combined = pref_items[:max_prefs] + deduped_recent[:limit]
 
             return Result(success=True, data=combined)
 

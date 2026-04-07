@@ -7,7 +7,10 @@ that was previously inline in memory_system.py.
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
+import struct
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -190,3 +193,93 @@ class ChromaBackend(VectorBackend):
                 self._client.persist()
         except Exception as e:
             logger.warning("ChromaDB persist warning: %s", e)
+
+    # ── read-only / lock-free access ─────────────────────────────
+
+    @classmethod
+    def get_vectors_readonly(
+        cls,
+        db_folder: Path,
+    ) -> Dict[str, Any]:
+        """Read vectors directly from ChromaDB's SQLite WAL without opening a
+        PersistentClient.
+
+        This avoids Windows mandatory file locking that causes the visualizer
+        to stall indefinitely when the MCP server already holds the DB open via
+        its own PersistentClient.
+
+        The approach:
+          - Opens ``chroma.sqlite3`` with ``?mode=ro`` (read-only, shared lock
+            only — compatible with an existing writer).
+          - Replays ``embeddings_queue``: takes the latest ``seq_id`` per ``id``
+            and excludes operation=2 (delete).  This gives the current live set
+            of embeddings without needing the HNSW index.
+
+        Returns a dict with the same shape as :meth:`get` with
+        ``include_embeddings=True``:
+            ``{"ids": [...], "documents": [...], "metadatas": [...],
+               "embeddings": [[float, ...], ...]}``
+
+        Raises:
+            FileNotFoundError: if ``chroma.sqlite3`` does not exist at the
+                expected path.
+            sqlite3.OperationalError: if the file cannot be opened (e.g.
+                exclusive lock held by another process at the OS level).
+        """
+        chroma_sqlite = Path(db_folder) / "chroma_db" / "chroma.sqlite3"
+        if not chroma_sqlite.exists():
+            raise FileNotFoundError(f"ChromaDB SQLite file not found: {chroma_sqlite}")
+
+        uri = "file:" + str(chroma_sqlite).replace("\\", "/") + "?mode=ro"
+        con = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        try:
+            sql = """
+                SELECT q.id, q.vector, q.encoding, q.metadata
+                FROM embeddings_queue q
+                INNER JOIN (
+                    SELECT id, MAX(seq_id) AS max_seq
+                    FROM embeddings_queue
+                    GROUP BY id
+                ) latest ON q.id = latest.id AND q.seq_id = latest.max_seq
+                WHERE q.operation != 2
+                ORDER BY q.seq_id
+            """
+            rows = con.execute(sql).fetchall()
+        finally:
+            con.close()
+
+        ids: List[str] = []
+        embeddings: List[List[float]] = []
+        documents: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
+
+        for mem_id, vec_bytes, encoding, meta_json in rows:
+            ids.append(mem_id)
+
+            # Decode vector bytes
+            if vec_bytes and encoding and encoding.upper() == "FLOAT32":
+                n = len(vec_bytes) // 4
+                embedding = list(struct.unpack(f"{n}f", vec_bytes))
+            else:
+                embedding = []
+            embeddings.append(embedding)
+
+            # Decode metadata JSON
+            meta: Dict[str, Any] = {}
+            document = ""
+            if meta_json:
+                try:
+                    meta = json.loads(meta_json)
+                    # ChromaDB stores the document text under "chroma:document"
+                    document = meta.pop("chroma:document", "")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            metadatas.append(meta)
+            documents.append(document)
+
+        return {
+            "ids": ids,
+            "documents": documents,
+            "metadatas": metadatas,
+            "embeddings": embeddings,
+        }

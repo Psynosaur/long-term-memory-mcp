@@ -10,9 +10,8 @@
 # Targets (macOS / Linux):
 #   Plugin  : ~/.config/opencode/plugins/long-term-memory.ts
 #   AGENTS  : ~/.config/opencode/AGENTS.md
-#   SDK dep : @opencode-ai/plugin  (installed via bun in ~/.config/opencode)
 #
-# Windows: run the equivalent copy commands manually — see README.md.
+# Windows: run install_opencode.ps1 instead.
 
 set -euo pipefail
 
@@ -45,15 +44,6 @@ cp "$PLUGIN_SRC" "$PLUGINS_DIR/long-term-memory.ts"
 
 echo "Copying AGENTS  → $OPENCODE_DIR/AGENTS.md"
 cp "$AGENTS_SRC" "$OPENCODE_DIR/AGENTS.md"
-
-# ── Install / update the OpenCode plugin SDK (requires bun) ───────────────────
-if command -v bun &>/dev/null; then
-  echo "Installing @opencode-ai/plugin SDK in $OPENCODE_DIR ..."
-  bun add @opencode-ai/plugin --cwd "$OPENCODE_DIR" 2>&1
-else
-  echo "WARNING: bun not found — skipping SDK install."
-  echo "         Run manually: cd $OPENCODE_DIR && bun add @opencode-ai/plugin"
-fi
 
 echo ""
 echo "Done. OpenCode will pick up the changes on the next session start."
