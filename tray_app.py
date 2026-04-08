@@ -2165,6 +2165,18 @@ def main():
         default=300,
         help="Seconds between peer polls when network sharing is enabled (default: 300)",
     )
+    parser.add_argument(
+        "--webui",
+        action="store_true",
+        default=False,
+        help="Start the WebUI Memory Manager alongside the MCP server",
+    )
+    parser.add_argument(
+        "--webui-port",
+        type=int,
+        default=8666,
+        help="Port for the WebUI REST API (default: 8666)",
+    )
 
     args = parser.parse_args()
 
@@ -2193,6 +2205,8 @@ def main():
         server_args += ["--network-sharing"]
     if args.sharing_poll_interval != 300:
         server_args += ["--sharing-poll-interval", str(args.sharing_poll_interval)]
+    if args.webui:
+        server_args += ["--webui", "--webui-port", str(args.webui_port)]
 
     # Pass pg-password via environment variable (not CLI arg) to avoid
     # exposing it in the process list (visible via `ps aux` on Unix /

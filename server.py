@@ -163,6 +163,37 @@ def _maybe_migrate_chromadb_to_pgvector(memory_system, args):
                 pass
 
 
+def _start_webui_server(memory_system, identity, sharing_mgr, host: str, port: int):
+    """Start the FastAPI WebUI server in a daemon thread.
+
+    The WebUI shares the already-loaded RobustMemorySystem (and its embedding
+    model) with the FastMCP server so the model is only loaded once.
+    """
+    try:
+        import uvicorn
+        from memory_mcp.webui_api import create_app
+    except ImportError as e:
+        print(f"WebUI requires fastapi. Install with: pip install fastapi\nError: {e}")
+        return
+
+    webui_app = create_app(memory_system, identity=identity, sharing_mgr=sharing_mgr)
+
+    def _run():
+        uvicorn.run(
+            webui_app,
+            host=host,
+            port=port,
+            log_level="warning",  # keep WebUI logs quiet; FastMCP is already chatty
+        )
+
+    import threading
+
+    t = threading.Thread(target=_run, name="webui-server", daemon=True)
+    t.start()
+    print(f"WebUI Memory Manager started on http://{host}:{port}")
+    print(f"  API docs: http://{host}:{port}/api/v1/docs")
+
+
 def main():
     """Main entry point for the MCP server"""
 
@@ -269,6 +300,22 @@ def main():
         default=None,
         help="Directory for audit JSONL files (default: data/audit/ relative to repo root). "
         "Pass an empty string to disable auditing.",
+    )
+
+    # ── WebUI arguments ───────────────────────────────────────────
+    parser.add_argument(
+        "--webui",
+        action="store_true",
+        default=False,
+        help="Start the WebUI Memory Manager REST API alongside the MCP server. "
+        "Both share the same RobustMemorySystem instance (model loaded once).",
+    )
+    parser.add_argument(
+        "--webui-port",
+        type=int,
+        default=8666,
+        help="Port for the WebUI REST API (default: 8666). "
+        "Requires --transport http (or stdio) and --webui.",
     )
 
     args = parser.parse_args()
@@ -397,6 +444,16 @@ def main():
                 )
 
     try:
+        # ── WebUI Memory Manager ──────────────────────────────────
+        if args.webui:
+            _start_webui_server(
+                memory_system=memory_system,
+                identity=identity,
+                sharing_mgr=sharing_mgr,
+                host=args.host,
+                port=args.webui_port,
+            )
+
         if args.transport == "http":
             print(
                 f"Starting Long-Term Memory MCP Server {backend_info} "
