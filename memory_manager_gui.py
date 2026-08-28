@@ -114,9 +114,10 @@ class MemoryManagerGUI:
         self._pg_user = os.environ.get("PGUSER", "memory_user")
         self._pg_password = os.environ.get("PGPASSWORD", "")
 
-        # Initialize RobustMemorySystem for write operations (keeps SQLite + ChromaDB in sync)
+        # RobustMemorySystem is loaded lazily on first Save — not at startup.
+        # self.memory_system stays None until the user confirms they want to embed.
         self.memory_system = None
-        self.init_memory_system()
+        self._memory_system_load_attempted = False
 
         # Initialize tokenizer
         self.tokenizer = None
@@ -271,6 +272,39 @@ class MemoryManagerGUI:
             arrowcolor=self.fg_color,
         )
 
+        # Dialog button styles (used in Toplevel dialogs where tk.Button bg is
+        # ignored by macOS Aqua — ttk with named styles is the only reliable fix)
+        self.style.configure(
+            "Dialog.TButton",
+            background=self.secondary_bg,
+            foreground=self.fg_color,
+            bordercolor=self.border_color,
+            darkcolor=self.secondary_bg,
+            lightcolor=self.secondary_bg,
+            font=("Segoe UI", 10),
+            padding=(14, 6),
+        )
+        self.style.map(
+            "Dialog.TButton",
+            background=[("active", self.hover_bg), ("pressed", self.hover_bg)],
+            foreground=[("active", self.fg_color)],
+        )
+        self.style.configure(
+            "DialogAccent.TButton",
+            background=self.button_bg,
+            foreground="#ffffff",
+            bordercolor=self.button_bg,
+            darkcolor=self.button_bg,
+            lightcolor=self.button_bg,
+            font=("Segoe UI", 10, "bold"),
+            padding=(14, 6),
+        )
+        self.style.map(
+            "DialogAccent.TButton",
+            background=[("active", "#1177bb"), ("pressed", "#0d5a8f")],
+            foreground=[("active", "#ffffff")],
+        )
+
     def connect_database(self):
         """Connect to the SQLite database with corruption protection"""
         try:
@@ -357,6 +391,34 @@ class MemoryManagerGUI:
                 "Write operations will fall back to raw SQLite (ChromaDB may get out of sync)"
             )
             self.memory_system = None
+
+    def _ensure_memory_system(self) -> bool:
+        """Lazily load RobustMemorySystem on first Save, with user confirmation.
+
+        Returns True if the memory system is ready (already loaded or just loaded).
+        Returns False if the user cancelled or loading failed.
+        """
+        if self.memory_system is not None:
+            return True
+
+        if self._memory_system_load_attempted:
+            # Already tried and failed — don't prompt again this session
+            return False
+
+        # Prompt the user before loading the embedding model
+        confirmed = messagebox.askokcancel(
+            "Load Embedding Model",
+            "Saving a memory requires the embedding model to be loaded "
+            "(BAAI/bge-small-en-v1.5, ~130 MB).\n\n"
+            "This may take a few seconds on the first save.\n\n"
+            "Proceed?",
+        )
+        if not confirmed:
+            return False
+
+        self._memory_system_load_attempted = True
+        self.init_memory_system()
+        return self.memory_system is not None
 
     def count_tokens(self, text: str) -> int:
         """Count tokens in text using tiktoken"""
@@ -977,6 +1039,7 @@ class MemoryManagerGUI:
             "event",
             "task",
             "ephemeral",
+            "summary",
         ]
         type_combo.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=2, padx=(5, 0))
         type_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_memories())
@@ -1033,7 +1096,7 @@ class MemoryManagerGUI:
         list_frame.rowconfigure(0, weight=1)
 
         # Treeview for memories
-        columns = ("ID", "Title", "Type", "Importance", "Date")
+        columns = ("ID", "Title", "Type", "Importance", "Shared", "Date")
         self.tree = ttk.Treeview(
             list_frame, columns=columns, show="tree headings", selectmode="browse"
         )
@@ -1044,6 +1107,7 @@ class MemoryManagerGUI:
         self.tree.column("Title", width=300)
         self.tree.column("Type", width=100)
         self.tree.column("Importance", width=80, anchor=tk.CENTER)
+        self.tree.column("Shared", width=70, anchor=tk.CENTER)
         self.tree.column("Date", width=150)
 
         # Configure headings
@@ -1052,6 +1116,7 @@ class MemoryManagerGUI:
             "Type", text="Type", command=lambda: self.sort_by_column("Type")
         )
         self.tree.heading("Importance", text="Importance")
+        self.tree.heading("Shared", text="Shared")
         self.tree.heading(
             "Date", text="Date", command=lambda: self.sort_by_column("Date")
         )
@@ -1112,7 +1177,7 @@ class MemoryManagerGUI:
         details_frame = ttk.LabelFrame(right_panel, text="Memory Details", padding="10")
         details_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         details_frame.columnconfigure(1, weight=1)
-        details_frame.rowconfigure(5, weight=1)
+        details_frame.rowconfigure(6, weight=1)
 
         # ID (hidden, for reference)
         self.id_var = tk.StringVar()
@@ -1145,6 +1210,7 @@ class MemoryManagerGUI:
             "event",
             "task",
             "ephemeral",
+            "summary",
         ]
         type_detail_combo.grid(row=1, column=1, sticky=tk.W, pady=5, padx=(10, 0))
 
@@ -1181,9 +1247,34 @@ class MemoryManagerGUI:
             foreground="#888888",
         ).grid(row=4, column=1, sticky=tk.W, padx=(10, 0))
 
+        # Share with
+        ttk.Label(details_frame, text="Share with:", style="Header.TLabel").grid(
+            row=5, column=0, sticky=tk.W, pady=5
+        )
+        shared_row = ttk.Frame(details_frame)
+        shared_row.grid(row=5, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
+        shared_row.columnconfigure(0, weight=1)
+
+        self.shared_with_var = tk.StringVar(value="")
+        shared_entry = ttk.Entry(
+            shared_row, textvariable=self.shared_with_var, width=28
+        )
+        shared_entry.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+        ttk.Button(
+            shared_row, text="Peers...", command=self._open_peer_picker, width=8
+        ).grid(row=0, column=1, padx=(4, 0))
+
+        ttk.Label(
+            details_frame,
+            text="UUIDs or * for everyone. Leave empty = private.",
+            font=("Segoe UI", 8),
+            foreground="#888888",
+        ).grid(row=5, column=1, sticky=(tk.W, tk.S), pady=(0, 0), padx=(10, 0))
+
         # Content
         ttk.Label(details_frame, text="Content:", style="Header.TLabel").grid(
-            row=5, column=0, sticky=(tk.W, tk.N), pady=5
+            row=6, column=0, sticky=(tk.W, tk.N), pady=5
         )
         self.content_text = scrolledtext.ScrolledText(
             details_frame,
@@ -1199,7 +1290,7 @@ class MemoryManagerGUI:
             relief=tk.SOLID,
         )
         self.content_text.grid(
-            row=5, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5, padx=(10, 0)
+            row=6, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5, padx=(10, 0)
         )
 
         # Metadata display
@@ -1330,6 +1421,10 @@ class MemoryManagerGUI:
                         row["title"][:50] + ("..." if len(row["title"]) > 50 else ""),
                         row["memory_type"],
                         row["importance"],
+                        "✓"
+                        if (row["shared_with"] if "shared_with" in row.keys() else None)
+                        not in (None, "[]", "")
+                        else "",
                         date_str,
                     ),
                     tags=("row",),
@@ -1373,6 +1468,17 @@ class MemoryManagerGUI:
                 self.content_text.delete("1.0", tk.END)
                 self.content_text.insert("1.0", row["content"])
 
+                # shared_with
+                try:
+                    raw = row["shared_with"] if "shared_with" in row.keys() else None
+                    if raw and raw not in ("[]", ""):
+                        sw_list = json.loads(raw)
+                        self.shared_with_var.set(", ".join(sw_list) if sw_list else "")
+                    else:
+                        self.shared_with_var.set("")
+                except Exception:
+                    self.shared_with_var.set("")
+
                 # Display metadata
                 try:
                     metadata = json.loads(row["metadata"]) if row["metadata"] else {}
@@ -1405,6 +1511,141 @@ class MemoryManagerGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load memory details:\n{str(e)}")
 
+    def _open_peer_picker(self):
+        """Open a dialog to pick peers to share this memory with."""
+        import logging as _logging
+
+        _log = _logging.getLogger("memory_manager_gui")
+
+        peers = []
+        try:
+            import requests as _req
+
+            _log.info("Peers button clicked — fetching http://127.0.0.1:8000/peers")
+            resp = _req.get("http://127.0.0.1:8000/peers", timeout=3)
+            _log.info("GET /peers status=%d body=%r", resp.status_code, resp.text[:200])
+            if resp.ok:
+                peers = resp.json().get("peers", [])
+                _log.info(
+                    "Peers found: %d — %s",
+                    len(peers),
+                    [(p.get("username"), p.get("node_uuid", "")[:8]) for p in peers],
+                )
+        except Exception as e:
+            _log.warning("Failed to fetch peers: %s", e)
+
+        if not peers:
+            _log.info("No peers — showing fallback messagebox")
+            messagebox.showinfo(
+                "No peers",
+                "No peers discovered yet.\n\n"
+                "Type UUIDs directly in the 'Share with' field,\n"
+                "or use '*' to share with everyone.",
+            )
+            return
+
+        _log.info("Building peer picker dialog with %d peer(s)", len(peers))
+
+        # Grab theme colors from the main app instance
+        bg = self.bg_color  # "#1e1e1e"
+        fg = self.fg_color  # "#e0e0e0"
+        sec_bg = self.secondary_bg  # "#2d2d2d"
+        border = self.border_color  # "#3e3e3e"
+        font_ui = ("Segoe UI", 10)
+
+        # Build picker dialog using Tkinter Toplevel
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Share with")
+        dlg.configure(bg=bg)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.lift()
+        dlg.focus_force()
+        dlg.attributes("-topmost", True)
+        dlg.minsize(300, 0)
+        _log.info("Peer picker dialog created and raised")
+
+        current = [
+            s.strip() for s in self.shared_with_var.get().split(",") if s.strip()
+        ]
+
+        # Outer padding frame — plain tk.Frame so bg is respected
+        outer = tk.Frame(dlg, bg=bg)
+        outer.pack(fill=tk.BOTH, expand=True, padx=20, pady=(16, 14))
+
+        tk.Label(
+            outer,
+            text="Share this memory with:",
+            bg=bg,
+            fg=fg,
+            font=font_ui,
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(0, 10))
+
+        # Checkbox area
+        check_frame = tk.Frame(outer, bg=bg)
+        check_frame.pack(fill=tk.BOTH, expand=True)
+
+        def _make_check(parent, text, variable):
+            """Create a themed checkbutton that respects the dark background."""
+            cb = tk.Checkbutton(
+                parent,
+                text=text,
+                variable=variable,
+                bg=bg,
+                fg=fg,
+                selectcolor=sec_bg,
+                activebackground=bg,
+                activeforeground=fg,
+                font=font_ui,
+                anchor=tk.W,
+                relief=tk.FLAT,
+                highlightthickness=0,
+                bd=0,
+            )
+            return cb
+
+        everyone_var = tk.BooleanVar(value="*" in current)
+        _make_check(check_frame, "Everyone", everyone_var).pack(
+            anchor=tk.W, pady=2, fill=tk.X
+        )
+
+        if peers:
+            # Thin separator using a 1px Frame — ttk.Separator is invisible on dark bg
+            tk.Frame(check_frame, bg=border, height=1).pack(fill=tk.X, pady=(8, 6))
+
+        peer_vars = {}
+        for p in peers:
+            uuid = p.get("node_uuid", p.get("node_id", ""))
+            username = p.get("username", uuid)
+            short_id = uuid[:8] if uuid else "?"
+            label = f"{username}  \u2014  {short_id}"
+            var = tk.BooleanVar(value=(uuid in current))
+            _make_check(check_frame, label, var).pack(anchor=tk.W, pady=2, fill=tk.X)
+            peer_vars[uuid] = var
+
+        def _apply():
+            if everyone_var.get():
+                self.shared_with_var.set("*")
+            else:
+                selected = [uuid for uuid, v in peer_vars.items() if v.get()]
+                self.shared_with_var.set(", ".join(selected))
+            dlg.destroy()
+
+        # Separator above buttons
+        tk.Frame(outer, bg=border, height=1).pack(fill=tk.X, pady=(14, 10))
+
+        btn_frame = tk.Frame(outer, bg=bg)
+        btn_frame.pack(fill=tk.X)
+
+        # Use ttk.Button with named styles — tk.Button bg is ignored on macOS Aqua
+        ttk.Button(
+            btn_frame, text="Apply", command=_apply, style="DialogAccent.TButton"
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        ttk.Button(
+            btn_frame, text="Cancel", command=dlg.destroy, style="Dialog.TButton"
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
+
     def new_memory(self):
         """Create a new memory"""
         self.selected_memory_id = None
@@ -1413,6 +1654,7 @@ class MemoryManagerGUI:
         self.detail_type_var.set("conversation")
         self.detail_importance_var.set("5")
         self.tags_var.set("")
+        self.shared_with_var.set("")
         self.content_text.delete("1.0", tk.END)
         self.metadata_label.config(text="New memory - fill in details and click Save")
 
@@ -1428,6 +1670,14 @@ class MemoryManagerGUI:
                 )
                 return
 
+            # For the memory_system path (SQLite + ChromaDB sync + embedding),
+            # lazily load the model with user confirmation on first use.
+            # The pgvector and raw-SQLite paths don't need the embedding model
+            # for metadata-only saves, so we only gate the memory_system branch.
+            if self.data_source not in ("pgvector",) and self.memory_system is None:
+                if not self._ensure_memory_system():
+                    return  # User cancelled or load failed
+
             memory_type = self.detail_type_var.get()
             importance = int(self.detail_importance_var.get())
 
@@ -1439,10 +1689,91 @@ class MemoryManagerGUI:
                 else []
             )
 
-            if self.memory_system:
+            # Parse shared_with
+            raw_sw = self.shared_with_var.get().strip()
+            shared_with = (
+                [s.strip() for s in raw_sw.split(",") if s.strip()] if raw_sw else []
+            )
+
+            if self.data_source == "pgvector" and self.pg_conn is not None:
+                # Write directly to Postgres — memory_system targets SQLite and
+                # would silently persist to the wrong backend when pgvector mode
+                # is active in the GUI.
+                now_iso = datetime.now(timezone.utc).isoformat()
+                try:
+                    if self.selected_memory_id:
+                        self.pg_conn.execute(
+                            """
+                            UPDATE memories
+                            SET title = %s, content = %s, memory_type = %s,
+                                importance = %s, tags = %s, updated_at = %s,
+                                token_count = %s, shared_with = %s
+                            WHERE id = %s
+                            """,
+                            (
+                                title,
+                                content,
+                                memory_type,
+                                importance,
+                                json.dumps(tags),
+                                now_iso,
+                                self.count_tokens(content),
+                                json.dumps(shared_with),
+                                self.selected_memory_id,
+                            ),
+                        )
+                        self.pg_conn.commit()
+                        messagebox.showinfo("Success", "Memory updated in Postgres!")
+                    else:
+                        import hashlib
+
+                        content_hash = hashlib.sha256(content.encode()).hexdigest()
+                        time_hash = hashlib.sha256(now_iso.encode()).hexdigest()[:8]
+                        memory_id = f"mem_{time_hash}_{content_hash[:16]}"
+                        token_count = self.count_tokens(content)
+                        self.pg_conn.execute(
+                            """
+                            INSERT INTO memories
+                                (id, title, content, timestamp, tags, importance,
+                                 memory_type, metadata, content_hash, created_at,
+                                 updated_at, last_accessed, token_count, shared_with)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            """,
+                            (
+                                memory_id,
+                                title,
+                                content,
+                                now_iso,
+                                json.dumps(tags),
+                                importance,
+                                memory_type,
+                                "{}",
+                                content_hash,
+                                now_iso,
+                                now_iso,
+                                now_iso,
+                                token_count,
+                                json.dumps(shared_with),
+                            ),
+                        )
+                        self.pg_conn.commit()
+                        self.selected_memory_id = memory_id
+                        messagebox.showinfo(
+                            "Success",
+                            "Memory created in Postgres (vectors not embedded — "
+                            "run Rebuild Vectors to add to vector index).",
+                        )
+                except Exception as pg_err:
+                    try:
+                        self.pg_conn.rollback()
+                    except Exception:
+                        pass
+                    messagebox.showerror("Error", f"Postgres save failed:\n{pg_err}")
+                    return
+
+            elif self.memory_system:
                 # Use RobustMemorySystem to keep SQLite + ChromaDB in sync
                 if self.selected_memory_id:
-                    # Update existing memory
                     result = self.memory_system.update_memory(
                         memory_id=self.selected_memory_id,
                         title=title,
@@ -1450,6 +1781,7 @@ class MemoryManagerGUI:
                         tags=tags,
                         importance=importance,
                         memory_type=memory_type,
+                        shared_with=shared_with,
                     )
                     if result.success:
                         messagebox.showinfo("Success", "Memory updated successfully!")
@@ -1459,13 +1791,13 @@ class MemoryManagerGUI:
                         )
                         return
                 else:
-                    # Create new memory
                     result = self.memory_system.remember(
                         title=title,
                         content=content,
                         tags=tags,
                         importance=importance,
                         memory_type=memory_type,
+                        shared_with=shared_with,
                     )
                     if result.success:
                         self.selected_memory_id = result.data[0]["id"]
@@ -1484,7 +1816,7 @@ class MemoryManagerGUI:
                     self.db_conn.execute(
                         """
                         UPDATE memories
-                        SET title = ?, content = ?, memory_type = ?, importance = ?, tags = ?, updated_at = ?, token_count = ?
+                        SET title = ?, content = ?, memory_type = ?, importance = ?, tags = ?, updated_at = ?, token_count = ?, shared_with = ?
                         WHERE id = ?
                     """,
                         (
@@ -1495,6 +1827,7 @@ class MemoryManagerGUI:
                             json.dumps(tags),
                             now_iso,
                             token_count,
+                            json.dumps(shared_with),
                             self.selected_memory_id,
                         ),
                     )
@@ -1512,8 +1845,8 @@ class MemoryManagerGUI:
 
                     self.db_conn.execute(
                         """
-                        INSERT INTO memories (id, title, content, timestamp, tags, importance, memory_type, metadata, content_hash, created_at, updated_at, last_accessed, token_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO memories (id, title, content, timestamp, tags, importance, memory_type, metadata, content_hash, created_at, updated_at, last_accessed, token_count, shared_with)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             memory_id,
@@ -1529,6 +1862,7 @@ class MemoryManagerGUI:
                             now_iso,
                             now_iso,
                             token_count,
+                            json.dumps(shared_with),
                         ),
                     )
                     self.db_conn.commit()
@@ -3132,6 +3466,13 @@ class MemoryManagerGUI:
 
 def main():
     """Main entry point"""
+    import logging as _logging
+
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%H:%M:%S",
+    )
     root = tk.Tk()
     app = MemoryManagerGUI(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)

@@ -4,7 +4,7 @@ Data models for the long-term memory system.
 Contains all dataclass definitions for memory records, search results, and operation results.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -21,8 +21,12 @@ class MemoryRecord:
         timestamp (datetime)
         tags (List[str])
         importance (int): 1–10 scale
-        memory_type (str): conversation, fact, preference, event, etc.
+        memory_type (str): conversation, fact, preference, event, task, ephemeral, summary
         metadata (Dict[str, Any])
+        shared_with (List[str]): Peer UUIDs this memory is visible to.
+            []        = private
+            ["*"]     = broadcast to all discovered peers
+            ["uuid1"] = specific peer(s) only
     """
 
     id: str
@@ -33,6 +37,7 @@ class MemoryRecord:
     importance: int
     memory_type: str
     metadata: Dict[str, Any]
+    shared_with: List[str] = field(default_factory=list)
 
 
 @dataclass

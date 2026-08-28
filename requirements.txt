@@ -11,6 +11,10 @@ tiktoken>=0.5.0
 uvicorn>=0.30.0
 sse-starlette>=1.6.0
 
+# WebUI Memory Manager REST API
+fastapi>=0.111.0
+python-multipart>=0.0.9  # required by fastapi for form data
+
 # Optional but recommended for better performance
 numpy>=1.24.0
 torch>=2.0.0  # For sentence-transformers (CPU version is fine)
@@ -18,6 +22,11 @@ torch>=2.0.0  # For sentence-transformers (CPU version is fine)
 # Optional: pgvector backend (for --vector-backend pgvector)
 psycopg[binary]>=3.1.0
 pgvector>=0.3.0
+
+# Optional: Kafka memory sharing (--kafka-sharing flag)
+# Both are optional — the producer/consumer gracefully degrade if neither is installed.
+confluent-kafka>=2.3.0
+kafka-python>=2.0.2
 
 # Optional: 3D vector visualizer (vector_visualizer.py)
 plotly>=5.18.0
@@ -32,6 +41,9 @@ tensorboard>=2.14.0
 pystray>=0.19.0
 Pillow>=10.0.0
 psutil>=5.9.0
+
+# Optional: AST symbol extraction for staleness detection (memory_mcp/ast_extractor.py)
+ast-grep-py>=0.38.0
 
 # Development/debugging (optional)
 pytest>=7.0.0

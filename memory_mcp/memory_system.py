@@ -17,6 +17,7 @@ Supported vector backends:
 from pathlib import Path
 from dataclasses import asdict
 from typing import Optional, List, Dict, Any
+import os
 import shutil
 import json
 import sqlite3
@@ -31,6 +32,7 @@ import tiktoken
 
 # Local imports
 from .models import MemoryRecord, SearchResult, Result
+from .knowledge_graph import KnowledgeGraph
 from .database_backends.base import DatabaseBackend, DatabaseRow
 from .database_backends.sqlite import SQLiteDatabase
 from .vector_backends.base import VectorBackend
@@ -51,6 +53,15 @@ from .config import (
     REINFORCEMENT_STEP,
     REINFORCEMENT_WRITEBACK_STEP,
     REINFORCEMENT_MAX,
+    STALENESS_ENABLED,
+    STALENESS_EXPECTED_LIFETIME_DAYS,
+    STALENESS_EXPECTED_LIFETIME_DEFAULT,
+    STALENESS_WARN_THRESHOLD,
+    STALENESS_WARN_TYPES,
+    CONTRADICTION_DETECTION_ENABLED,
+    CONTRADICTION_SIMILARITY_THRESHOLD,
+    CONTRADICTION_SIMILARITY_UPPER,
+    CONTRADICTION_CHECK_TYPES,
 )
 
 
@@ -91,9 +102,12 @@ class RobustMemorySystem:
         self.logger = None  # will be set in _setup_logging
         self.db: Optional[DatabaseBackend] = None  # will be set in _init_database
         self.vector_backend: Optional[VectorBackend] = None
+        self.kg: Optional[KnowledgeGraph] = None  # temporal knowledge graph
         self.embedding_model: Optional[object] = None
         self._query_prefix: str = ""  # set by _init_embeddings (e.g. BGE needs prefix)
         self.tokenizer: Optional[object] = None
+        self.kafka_producer: Optional[object] = None  # set externally by server.py
+        self.auto_kafka_produce: bool = True  # auto-publish to Kafka on remember/update
 
         # Setup logging
         self._setup_logging()
@@ -101,6 +115,7 @@ class RobustMemorySystem:
         # Initialize components
         self._init_database(database_backend)
         self._init_vector_backend(vector_backend)
+        self._init_knowledge_graph()
         self._init_embeddings()
         self._init_tokenizer()
 
@@ -191,7 +206,8 @@ class RobustMemorySystem:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 last_accessed TEXT DEFAULT CURRENT_TIMESTAMP,
-                token_count INTEGER DEFAULT 0
+                token_count INTEGER DEFAULT 0,
+                shared_with TEXT DEFAULT '[]'
             );
 
             CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp);
@@ -261,6 +277,26 @@ class RobustMemorySystem:
             )
             self.db.commit()
 
+        if "shared" in columns and "shared_with" not in columns:
+            self.logger.info("Migrating shared INTEGER → shared_with TEXT")
+            self.db.execute(
+                "ALTER TABLE memories ADD COLUMN shared_with TEXT DEFAULT '[]'"
+            )
+            # Migrate existing data: shared=1 → shared_with='["*"]', shared=0 → '[]'
+            self.db.execute(
+                "UPDATE memories SET shared_with = CASE WHEN shared = 1 THEN '[\"*\"]' ELSE '[]' END"
+            )
+            self.db.commit()
+        elif "shared_with" not in columns:
+            self.logger.info("Adding shared_with column to existing memories table")
+            self.db.execute(
+                "ALTER TABLE memories ADD COLUMN shared_with TEXT DEFAULT '[]'"
+            )
+            self.db.execute(
+                "UPDATE memories SET shared_with = '[]' WHERE shared_with IS NULL"
+            )
+            self.db.commit()
+
     def _init_vector_backend(self, backend: Optional[VectorBackend] = None):
         """Initialize the pluggable vector storage backend.
 
@@ -282,6 +318,16 @@ class RobustMemorySystem:
             self.logger.error("Failed to initialize vector backend: %s", e)
             raise
 
+    def _init_knowledge_graph(self):
+        """Initialize the temporal knowledge graph (SQLite-backed)."""
+        try:
+            kg_path = self.db_folder / "knowledge_graph.db"
+            self.kg = KnowledgeGraph(db_path=kg_path)
+            self.logger.info("Knowledge graph initialized at %s", kg_path)
+        except Exception as e:
+            self.logger.error("Failed to initialize knowledge graph: %s", e)
+            raise
+
     def _init_embeddings(self):
         """Initialize sentence transformer for embeddings.
 
@@ -289,58 +335,131 @@ class RobustMemorySystem:
         Override with env var MEMORY_EMBEDDING_MODEL to switch models.
         After switching, run rebuild_vector_index() to re-embed all memories.
 
-        SSL / offline notes
-        -------------------
-        When launched via macOS LaunchAgent (login autostart) the process
-        inherits a minimal environment that lacks the system certificate bundle,
-        causing huggingface_hub to fail with CERTIFICATE_VERIFY_FAILED even
-        though the model is already cached locally.
+        SSL / offline strategy
+        ----------------------
+        Zscaler and corporate proxies intercept TLS and re-sign it with their
+        own CA.  The venv's certifi bundle does not include that CA, so any
+        outbound HTTPS call (including the HuggingFace Hub update-check that
+        SentenceTransformer triggers on every load) fails with
+        CERTIFICATE_VERIFY_FAILED.
 
-        We therefore:
-        1. Point SSL_CERT_FILE / REQUESTS_CA_BUNDLE at certifi's bundle so
-           httpx/requests always have a valid CA store (needed for any network
-           call, e.g. an explicit model refresh).
-        2. Set HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1 so huggingface_hub
-           skips all network checks and loads straight from the local cache.
-           The model *must* already be cached; a fresh install still needs a
-           one-time manual download in a terminal session.
+        Strategy:
+        1. If the model is already in the HF cache → force offline mode so no
+           network call is made at all.  Fast, safe, works under launchd.
+        2. If the model is NOT cached (fresh install) → disable SSL verification
+           for the one-time download, then the next start will hit path 1.
+
+        The offline flag is set unconditionally (not via setdefault) so it
+        overrides any stale env vars that might have been inherited.
         """
         import os as _os
 
-        # --- Point SSL libraries at certifi's CA bundle ----------------------
-        try:
-            import certifi as _certifi
+        model_name = EMBEDDING_MODEL_CONFIG["model_name"]
+        self._query_prefix = EMBEDDING_MODEL_CONFIG.get("query_prefix", "").strip()
 
-            _ca = _certifi.where()
-            _os.environ.setdefault("SSL_CERT_FILE", _ca)
-            _os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca)
-        except ImportError:
-            pass  # certifi not installed; SSL env vars remain as-is
+        # --- Determine whether the model is already cached -------------------
+        model_cached = self._is_model_cached(model_name)
 
-        # --- Disable HuggingFace Hub network checks --------------------------
-        # The model is expected to be cached.  If it isn't, the user should
-        # run the server once from a terminal so it can download over a normal
-        # SSL-capable session.
-        _os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
-        try:
-            model_name = EMBEDDING_MODEL_CONFIG["model_name"]
-            # Normalise the query prefix: strip whitespace so the separator
-            # between prefix and query is always explicit and consistent.
-            self._query_prefix = EMBEDDING_MODEL_CONFIG.get("query_prefix", "").strip()
-            self.embedding_model = SentenceTransformer(model_name)
-            self.logger.info(
-                "Embedding model '%s' (preset: %s, dims: %d) loaded successfully",
+        if model_cached:
+            # Force offline — no network call whatsoever.
+            # Use direct assignment, not setdefault, to override inherited vars.
+            _os.environ["HF_HUB_OFFLINE"] = "1"
+            _os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            self.logger.info("Model '%s' found in cache — loading offline", model_name)
+            self.embedding_model = SentenceTransformer(
                 model_name,
-                EMBEDDING_MODEL,
-                EMBEDDING_MODEL_CONFIG["dimensions"],
+                local_files_only=True,
             )
+        else:
+            # One-time download with SSL verification disabled.
+            # Necessary on Zscaler/corporate networks where the proxy re-signs
+            # TLS and certifi's bundle doesn't include the corporate CA.
+            self.logger.warning(
+                "Model '%s' not in cache — downloading with SSL verification "
+                "disabled (Zscaler/corporate proxy environment). "
+                "Subsequent starts will load from cache with no network call.",
+                model_name,
+            )
+            # Disable SSL for requests and curl
+            _os.environ["CURL_CA_BUNDLE"] = ""
+            _os.environ["REQUESTS_CA_BUNDLE"] = ""
+            _os.environ["SSL_CERT_FILE"] = ""
+            # Explicitly clear ALL offline flags — some corporate environments
+            # pre-set these, which causes huggingface_hub to force local_files_only=True
+            # even when we want to download for the first time.
+            _os.environ["HF_HUB_OFFLINE"] = "0"
+            _os.environ["TRANSFORMERS_OFFLINE"] = "0"
+            _os.environ["HUGGINGFACE_HUB_OFFLINE"] = "0"
+            _os.environ["HF_DATASETS_OFFLINE"] = "0"
+            # huggingface_hub uses httpx internally. Unlike requests, httpx ignores
+            # REQUESTS_CA_BUNDLE. Monkeypatch httpx.Client to disable SSL verification
+            # for the one-time download. We restore the original __init__ afterward.
+            import httpx as _httpx
 
-        except Exception as e:
-            self.logger.error("Failed to load embedding model: %s", e)
-            # Fallback to a simpler approach if needed
-            raise
+            _orig_client_init = _httpx.Client.__init__
+            _orig_async_client_init = _httpx.AsyncClient.__init__
+
+            def _no_ssl_client_init(self, *args, **kwargs):
+                kwargs["verify"] = False
+                _orig_client_init(self, *args, **kwargs)
+
+            def _no_ssl_async_client_init(self, *args, **kwargs):
+                kwargs["verify"] = False
+                _orig_async_client_init(self, *args, **kwargs)
+
+            _httpx.Client.__init__ = _no_ssl_client_init
+            _httpx.AsyncClient.__init__ = _no_ssl_async_client_init
+
+            try:
+                self.embedding_model = SentenceTransformer(
+                    model_name,
+                    local_files_only=False,
+                )
+            finally:
+                # Always restore — we're in the non-cached branch, so these
+                # variables are guaranteed to exist.
+                try:
+                    _httpx.Client.__init__ = _orig_client_init
+                    _httpx.AsyncClient.__init__ = _orig_async_client_init
+                except Exception:
+                    pass
+
+        self.logger.info(
+            "Embedding model '%s' (preset: %s, dims: %d) loaded successfully",
+            model_name,
+            EMBEDDING_MODEL,
+            EMBEDDING_MODEL_CONFIG["dimensions"],
+        )
+
+    @staticmethod
+    def _is_model_cached(model_name: str) -> bool:
+        """Return True if the HuggingFace model is present in the local cache.
+
+        Checks for the existence of the model's snapshot directory and at
+        least one weight file (.safetensors or .bin) inside it.
+        """
+        try:
+            from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+            import os as _os
+
+            # HF stores models under <cache>/models--<org>--<name>/snapshots/
+            cache_dir = _os.path.join(
+                HUGGINGFACE_HUB_CACHE,
+                "models--" + model_name.replace("/", "--"),
+                "snapshots",
+            )
+            if not _os.path.isdir(cache_dir):
+                return False
+
+            # At least one snapshot must contain model weights
+            for root, _dirs, files in _os.walk(cache_dir):
+                for f in files:
+                    if f.endswith(".safetensors") or f.endswith(".bin"):
+                        return True
+            return False
+        except Exception:
+            # If we can't check, assume not cached — safer to attempt download
+            return False
 
     def _init_tokenizer(self):
         """Initialize tiktoken tokenizer for token counting"""
@@ -446,6 +565,8 @@ class RobustMemorySystem:
         importance: int = 5,
         memory_type: str = "conversation",
         metadata: Dict[str, Any] = None,
+        shared_with: List[str] = None,
+        file_paths: List[str] = None,
     ) -> Result:
         """
         Store a new memory with both vector and structured storage
@@ -476,6 +597,128 @@ class RobustMemorySystem:
             if cursor.fetchone():
                 return Result(success=False, reason="Duplicate content detected")
 
+            # ── Contradiction detection ──────────────────────────────────────
+            # For fact/preference types, run a semantic similarity search before
+            # writing. If an existing memory of the same type scores above the
+            # threshold, we still write but return a warning so the agent can
+            # decide whether to update the old memory instead.
+            contradiction_warning = None
+            if (
+                CONTRADICTION_DETECTION_ENABLED
+                and memory_type in CONTRADICTION_CHECK_TYPES
+                and self.embedding_model is not None
+            ):
+                try:
+                    check_embedding = self.embedding_model.encode(
+                        f"{title}\n{content}"
+                    ).tolist()
+                    candidates = self.vector_backend.query(
+                        query_embedding=check_embedding,
+                        n_results=5,
+                    )
+                    for c in candidates:
+                        similarity = 1.0 - c.distance
+                        # Skip if below lower bound (unrelated) or above upper bound
+                        # (near-identical — the exact hash check above already handles those)
+                        if not (
+                            CONTRADICTION_SIMILARITY_THRESHOLD
+                            <= similarity
+                            < CONTRADICTION_SIMILARITY_UPPER
+                        ):
+                            continue
+                        # Check it's the same memory_type (avoid cross-type false positives)
+                        cand_row = self.db.execute(
+                            "SELECT id, title, memory_type FROM memories WHERE id = ?",
+                            (c.id,),
+                        ).fetchone()
+                        if cand_row and cand_row["memory_type"] == memory_type:
+                            contradiction_warning = {
+                                "conflicting_id": cand_row["id"],
+                                "conflicting_title": cand_row["title"],
+                                "similarity": round(similarity, 3),
+                            }
+                            self.logger.info(
+                                "Contradiction candidate: new='%s' conflicts with "
+                                "existing id=%s title='%s' (similarity=%.3f)",
+                                title,
+                                cand_row["id"],
+                                cand_row["title"],
+                                similarity,
+                            )
+                            break  # report the highest-similarity conflict only
+                except Exception as contra_err:
+                    self.logger.warning(
+                        "Contradiction check failed (non-fatal): %s", contra_err
+                    )
+
+            # ── AST staleness anchor enrichment ─────────────────────────────
+            # When file_paths are provided and memory_type is "fact", extract:
+            #   _signatures_at_storage  — {func_name: param_hash} per file
+            #                             keys = symbol names (catches renames/deletions)
+            #                             values = param hashes (catches signature changes)
+            #                             supersedes _symbols_at_storage — no need to store names twice
+            #   _file_hashes_at_storage — SHA-256 per file (catches any change)
+            #   _git_commit_at_storage  — HEAD commit hash (enables git log diff)
+            # All anchors are optional — degrade silently on any failure.
+            if file_paths and memory_type == "fact":
+                try:
+                    from .ast_extractor import (  # type: ignore[import]
+                        extract_signatures_multi,
+                        hash_files,
+                        get_git_commit,
+                    )
+
+                    clean_paths = [p for p in file_paths if p and p.strip()]
+                    import json as _json
+                    from pathlib import Path as _Path
+
+                    # Absolute path map: basename → absolute path (used at recall
+                    # time to avoid rglob filesystem scans that trigger macOS TCC)
+                    abs_path_map = {
+                        _Path(p).name: str(_Path(p).resolve())
+                        for p in clean_paths
+                        if _Path(p).exists()
+                    }
+                    if abs_path_map:
+                        content = (
+                            content.rstrip()
+                            + f"\n\n_file_paths_at_storage: {_json.dumps(abs_path_map)}"
+                        )
+
+                    # Signature hashes (keys = symbol names, values = param hashes)
+                    signatures = extract_signatures_multi(clean_paths)
+                    if signatures:
+                        content = (
+                            content.rstrip()
+                            + f"\n_signatures_at_storage: {_json.dumps(signatures)}"
+                        )
+
+                    # File content hashes
+                    file_hashes = hash_files(clean_paths)
+                    if file_hashes:
+                        content = (
+                            content.rstrip()
+                            + f"\n_file_hashes_at_storage: {_json.dumps(file_hashes)}"
+                        )
+
+                    # Git HEAD commit
+                    git_commit = get_git_commit()
+                    if git_commit:
+                        content = (
+                            content.rstrip() + f"\n_git_commit_at_storage: {git_commit}"
+                        )
+
+                    self.logger.info(
+                        "AST enrichment: sigs=%d files, hashes=%d files, git=%s",
+                        len(signatures),
+                        len(file_hashes),
+                        git_commit or "n/a",
+                    )
+                except Exception as ast_err:
+                    self.logger.warning(
+                        "AST enrichment failed (non-fatal): %s", ast_err
+                    )
+
             # Create memory record
             record = MemoryRecord(
                 id=memory_id,
@@ -486,19 +729,16 @@ class RobustMemorySystem:
                 importance=importance,
                 memory_type=memory_type,
                 metadata=metadata,
+                shared_with=shared_with or [],
             )
 
             # Store in SQLite FIRST, then ChromaDB.
-            # Order matters: if we crash between the two writes, it's better
-            # to have a SQLite row with no vector (detectable via count
-            # mismatch and fixable with rebuild_vector_index) than an orphan
-            # vector with no SQLite row (invisible and unfixable).
             self.db.execute(
                 """
                 INSERT INTO memories 
                 (id, title, content, timestamp, tags, importance,
-                 memory_type, metadata, content_hash, last_accessed, token_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 memory_type, metadata, content_hash, last_accessed, token_count, shared_with)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     record.id,
@@ -510,15 +750,41 @@ class RobustMemorySystem:
                     record.memory_type,
                     json.dumps(record.metadata),
                     content_hash,
-                    record.timestamp.isoformat(),  # Set last_accessed to creation time
+                    record.timestamp.isoformat(),
                     token_count,
+                    json.dumps(record.shared_with),
                 ),
             )
+
+            # Store in SQLite FIRST, then ChromaDB.
+            # Order matters: if we crash between the two writes, it's better
+            # to have a SQLite row with no vector (detectable via count
+            # mismatch and fixable with rebuild_vector_index) than an orphan
+            # vector with no SQLite row (invisible and unfixable).
             self.db.commit()
 
             # Generate embedding and store in vector backend
             # Combine title and content for better semantic search
             text_for_embedding = f"{title}\n{content}"
+
+            if self.embedding_model is None:
+                self.logger.error(
+                    "Embedding model not loaded — memory '%s' saved to DB but "
+                    "NOT added to vector index. Run rebuild_vector_index() once "
+                    "the model is available.",
+                    title,
+                )
+                return Result(
+                    success=True,
+                    data=[
+                        {
+                            "id": record.id,
+                            "title": record.title,
+                            "warning": "Saved to database but not embedded — model unavailable",
+                        }
+                    ],
+                )
+
             embedding = self.embedding_model.encode(text_for_embedding).tolist()
 
             try:
@@ -562,6 +828,30 @@ class RobustMemorySystem:
             self.logger.info("Memory stored successfully: %s", memory_id)
             rec = asdict(record)
             rec["timestamp"] = record.timestamp.isoformat()
+            rec["token_count"] = token_count
+            if contradiction_warning:
+                rec["warning"] = "potential_contradiction"
+                rec["conflicting_id"] = contradiction_warning["conflicting_id"]
+                rec["conflicting_title"] = contradiction_warning["conflicting_title"]
+                rec["similarity"] = contradiction_warning["similarity"]
+
+            # ── Kafka produce (fire-and-forget) ─────────────────────────────
+            # Skip if this memory was ingested FROM Kafka (has kafka: tag) — prevents echo
+            _is_kafka_ingested = any(
+                isinstance(t, str) and t.startswith("kafka:")
+                for t in (tags if isinstance(tags, list) else [])
+            )
+            if self.auto_kafka_produce and self.kafka_producer and self.kafka_producer.is_ready and not _is_kafka_ingested:
+                try:
+                    self.kafka_producer.produce_memory(
+                        rec, event="remember", content_hash=content_hash,
+                    )
+                except Exception as kafka_err:
+                    self.logger.warning(
+                        "Kafka produce failed for remember %s (non-fatal): %s",
+                        memory_id, kafka_err,
+                    )
+
             return Result(success=True, data=[rec])
 
         except Exception as e:
@@ -615,7 +905,7 @@ class RobustMemorySystem:
 
             self.logger.info("Adaptive threshold computed: %.3f", threshold)
 
-            search_results = []
+            search_results = []  # list of (SearchResult, token_count)
             now_iso = datetime.now(timezone.utc).isoformat()
 
             # First pass: collect those meeting threshold
@@ -677,15 +967,21 @@ class RobustMemorySystem:
                     importance=row["importance"],
                     memory_type=row["memory_type"],
                     metadata=json.loads(row["metadata"]),
+                    shared_with=json.loads(row["shared_with"])
+                    if row.get("shared_with")
+                    else [],
                 )
 
                 search_results.append(
-                    SearchResult(
-                        record=record,
-                        relevance_score=relevance,
-                        match_type="semantic"
-                        if relevance >= threshold
-                        else "semantic_fallback",
+                    (
+                        SearchResult(
+                            record=record,
+                            relevance_score=relevance,
+                            match_type="semantic"
+                            if relevance >= threshold
+                            else "semantic_fallback",
+                        ),
+                        row.get("token_count") or 0,
                     )
                 )
 
@@ -693,15 +989,23 @@ class RobustMemorySystem:
             self.db.commit()
 
             # Sort by relevance
-            search_results.sort(key=lambda x: x.relevance_score, reverse=True)
+            search_results.sort(key=lambda x: x[0].relevance_score, reverse=True)
 
             # Convert to dict format
             result_data = []
-            for sr in search_results:
+            for sr, token_count in search_results:
                 result_dict = asdict(sr.record)
                 result_dict["timestamp"] = sr.record.timestamp.isoformat()
+                result_dict["token_count"] = token_count
                 result_dict["relevance_score"] = sr.relevance_score
                 result_dict["match_type"] = sr.match_type
+                staleness = self._compute_staleness_score(result_dict)
+                result_dict["staleness_score"] = staleness
+                if (
+                    staleness >= STALENESS_WARN_THRESHOLD
+                    and result_dict.get("memory_type") in STALENESS_WARN_TYPES
+                ):
+                    result_dict["staleness_warning"] = True
                 result_data.append(result_dict)
 
             self.logger.info(
@@ -723,6 +1027,7 @@ class RobustMemorySystem:
         date_from: str = None,
         date_to: str = None,
         limit: int = 50,
+        order_by: str = None,
     ) -> Result:
         """
         Structured search using SQL queries
@@ -757,10 +1062,25 @@ class RobustMemorySystem:
 
             where_clause = " AND ".join(conditions) if conditions else "1=1"
 
+            # Allow callers to override sort order; default keeps historical behaviour.
+            # Allowlist to prevent SQL injection.
+            _allowed_orders = {
+                "importance DESC, timestamp DESC",
+                "timestamp DESC",
+                "timestamp DESC, importance DESC",
+                "timestamp ASC",
+                "importance DESC",
+            }
+            effective_order = (
+                order_by
+                if order_by in _allowed_orders
+                else "importance DESC, timestamp DESC"
+            )
+
             query = f"""
                 SELECT * FROM memories
                 WHERE {where_clause}
-                ORDER BY importance DESC, timestamp DESC
+                ORDER BY {effective_order}
                 LIMIT ?
             """
             params.append(limit)
@@ -799,11 +1119,22 @@ class RobustMemorySystem:
                     importance=row["importance"],
                     memory_type=row["memory_type"],
                     metadata=json.loads(row["metadata"]),
+                    shared_with=json.loads(row["shared_with"])
+                    if row.get("shared_with")
+                    else [],
                 )
 
                 result_dict = asdict(record)
                 result_dict["timestamp"] = record.timestamp.isoformat()
+                result_dict["token_count"] = row.get("token_count") or 0
                 result_dict["match_type"] = "structured"
+                staleness = self._compute_staleness_score(row)
+                result_dict["staleness_score"] = staleness
+                if (
+                    staleness >= STALENESS_WARN_THRESHOLD
+                    and result_dict.get("memory_type") in STALENESS_WARN_TYPES
+                ):
+                    result_dict["staleness_warning"] = True
                 results.append(result_dict)
 
             # Batch-commit any decay/reinforcement writes from the loop above
@@ -820,7 +1151,7 @@ class RobustMemorySystem:
             self.logger.error("Structured search failed: %s", e)
             return Result(success=False, reason=f"Search error: {str(e)}")
 
-    def get_recent(self, limit: int = 20, current_project: str = None) -> Result:
+    def get_recent(self, limit: int = 20, current_project: str = None, include_summaries: bool = False) -> Result:
         """
         Get most recent memories, optionally filtered by project.
 
@@ -829,11 +1160,16 @@ class RobustMemorySystem:
         The caller asks for ``limit`` recent memories and gets all
         preferences prepended for free.
 
+        Summary memories (memory_type="summary") are excluded by default.
+        Pass include_summaries=True to include them.
+
         Args:
             limit: Maximum number of *recent* memories to return
                    (preferences are added on top of this).
             current_project: Optional project identifier to filter by.
                            If provided, only returns memories with this project tag.
+            include_summaries: If False (default), memories with
+                               memory_type="summary" are excluded from results.
         """
         try:
             # --- 1. Fetch ALL preference memories by memory_type (global, not project-scoped) ---
@@ -849,25 +1185,46 @@ class RobustMemorySystem:
             # Collect preference IDs for deduplication
             pref_ids = {item["id"] for item in pref_items}
 
-            # --- 2. Fetch regular recent memories (full limit) ---
+            # --- 2. Normalise current_project to a short tag name ---
+            # Callers often pass the full working-directory path
+            # (e.g. "C:\git\long-term-memory-mcp") but memories are tagged with
+            # only the basename ("long-term-memory-mcp"). Normalise here so the
+            # tag search actually matches what is stored.
+            project_tag = None
             if current_project:
+                project_tag = (
+                    os.path.basename(current_project.rstrip("/\\")) or current_project
+                )
+
+            # --- 3. Fetch recent memories ordered by recency first ---
+            # Use timestamp DESC so the freshest memories surface regardless of
+            # their importance score.  The search_structured helper exposes an
+            # order_by parameter; fall back to a direct SQL call when it doesn't.
+            if project_tag:
                 recent_result = self.search_structured(
-                    tags=[current_project], limit=limit
+                    tags=[project_tag], limit=limit, order_by="timestamp DESC"
                 )
             else:
-                recent_result = self.search_structured(limit=limit)
+                recent_result = self.search_structured(
+                    limit=limit, order_by="timestamp DESC"
+                )
             recent_items = (
                 recent_result.data
                 if recent_result.success and recent_result.data
                 else []
             )
 
-            # --- 3. Deduplicate: remove any recent items already in preferences ---
+            # --- 4. Deduplicate and optionally strip summaries ---
             deduped_recent = [
-                item for item in recent_items if item["id"] not in pref_ids
+                item
+                for item in recent_items
+                if item["id"] not in pref_ids
+                and (include_summaries or item.get("memory_type") != "summary")
             ]
 
-            # --- 4. Combine: all preferences first, then up to limit recent ---
+            # --- 5. Combine: ALL preferences first, then `limit` recent project memories ---
+            # Preferences are short context items always returned in full.
+            # The `limit` parameter applies only to the recent-memory slice.
             combined = pref_items + deduped_recent[:limit]
 
             return Result(success=True, data=combined)
@@ -885,6 +1242,7 @@ class RobustMemorySystem:
         importance: int = None,
         memory_type: str = None,
         metadata: Dict[str, Any] = None,
+        shared_with: List[str] = None,
     ) -> Result:
         """
         Update or modify an existing memory by its unique ID.
@@ -934,6 +1292,10 @@ class RobustMemorySystem:
                 updates.append("metadata = ?")
                 params.append(json.dumps(metadata))
 
+            if shared_with is not None:
+                updates.append("shared_with = ?")
+                params.append(json.dumps(shared_with))
+
             now_iso = datetime.now(timezone.utc).isoformat()
             updates.append("updated_at = ?")
             params.append(now_iso)
@@ -977,6 +1339,42 @@ class RobustMemorySystem:
             self.db.commit()
 
             self.logger.info("Memory updated successfully: %s", memory_id)
+
+            # ── Kafka produce (fire-and-forget) ─────────────────────────────
+            if self.auto_kafka_produce and self.kafka_producer and self.kafka_producer.is_ready:
+                try:
+                    # Fetch the final state of the updated memory for the message
+                    updated_cursor = self.db.execute(
+                        "SELECT id, title, content, timestamp, tags, importance, "
+                        "memory_type, content_hash, token_count, shared_with "
+                        "FROM memories WHERE id = ?",
+                        (memory_id,),
+                    )
+                    updated_mem = updated_cursor.fetchone()
+                    if updated_mem:
+                        mem_dict = dict(updated_mem)
+                        # Skip if this memory was ingested FROM Kafka — prevents echo
+                        _tags_raw = mem_dict.get("tags", "[]")
+                        try:
+                            _tag_list = json.loads(_tags_raw) if isinstance(_tags_raw, str) else (_tags_raw if isinstance(_tags_raw, list) else [])
+                        except (ValueError, TypeError):
+                            _tag_list = []
+                        _is_kafka_ingested = any(
+                            isinstance(t, str) and t.startswith("kafka:")
+                            for t in _tag_list
+                        )
+                        if not _is_kafka_ingested:
+                            self.kafka_producer.produce_memory(
+                                mem_dict,
+                                event="update",
+                                content_hash=mem_dict.get("content_hash", ""),
+                            )
+                except Exception as kafka_err:
+                    self.logger.warning(
+                        "Kafka produce failed for update %s (non-fatal): %s",
+                        memory_id, kafka_err,
+                    )
+
             return Result(success=True, data=[{"id": memory_id, "updated": True}])
 
         except Exception as e:
@@ -1016,6 +1414,109 @@ class RobustMemorySystem:
             self.logger.error("Failed to delete memory: %s", e)
             self.db.rollback()
             return Result(success=False, reason=f"Delete error: {str(e)}")
+
+    # ── Knowledge Graph public API ────────────────────────────────────────────
+
+    def kg_add_triple(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        valid_from: Optional[str] = None,
+        valid_to: Optional[str] = None,
+        confidence: float = 1.0,
+        source_memory_id: Optional[str] = None,
+    ) -> Result:
+        """Add a fact triple to the knowledge graph."""
+        try:
+            triple_id = self.kg.add_triple(
+                subject=subject,
+                predicate=predicate,
+                obj=obj,
+                valid_from=valid_from,
+                valid_to=valid_to,
+                confidence=confidence,
+                source_memory_id=source_memory_id,
+            )
+            return Result(
+                success=True,
+                data=[
+                    {
+                        "triple_id": triple_id,
+                        "subject": subject,
+                        "predicate": predicate,
+                        "object": obj,
+                        "valid_from": valid_from,
+                        "valid_to": valid_to,
+                        "confidence": confidence,
+                        "source_memory_id": source_memory_id,
+                    }
+                ],
+            )
+        except Exception as e:
+            self.logger.error("kg_add_triple failed: %s", e)
+            return Result(success=False, reason=str(e))
+
+    def kg_invalidate(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        ended: Optional[str] = None,
+    ) -> Result:
+        """Mark an open triple as expired."""
+        try:
+            self.kg.invalidate(
+                subject=subject, predicate=predicate, obj=obj, ended=ended
+            )
+            return Result(
+                success=True,
+                data=[
+                    {
+                        "subject": subject,
+                        "predicate": predicate,
+                        "object": obj,
+                        "ended": ended,
+                    }
+                ],
+            )
+        except Exception as e:
+            self.logger.error("kg_invalidate failed: %s", e)
+            return Result(success=False, reason=str(e))
+
+    def kg_query_entity(
+        self,
+        name: str,
+        as_of: Optional[str] = None,
+        direction: str = "outgoing",
+    ) -> Result:
+        """Query all facts for an entity, optionally at a point in time."""
+        try:
+            facts = self.kg.query_entity(name=name, as_of=as_of, direction=direction)
+            return Result(success=True, data=facts)
+        except Exception as e:
+            self.logger.error("kg_query_entity failed: %s", e)
+            return Result(success=False, reason=str(e))
+
+    def kg_timeline(
+        self, entity_name: Optional[str] = None, limit: int = 100
+    ) -> Result:
+        """Get chronological fact history, optionally filtered by entity."""
+        try:
+            facts = self.kg.timeline(entity_name=entity_name, limit=limit)
+            return Result(success=True, data=facts)
+        except Exception as e:
+            self.logger.error("kg_timeline failed: %s", e)
+            return Result(success=False, reason=str(e))
+
+    def kg_stats(self) -> Result:
+        """Return knowledge graph statistics."""
+        try:
+            s = self.kg.stats()
+            return Result(success=True, data=[s])
+        except Exception as e:
+            self.logger.error("kg_stats failed: %s", e)
+            return Result(success=False, reason=str(e))
 
     def get_statistics(self) -> Result:
         """Get memory system statistics"""
@@ -1235,6 +1736,16 @@ class RobustMemorySystem:
 
     def close(self):
         """Clean shutdown of the memory system"""
+        # Close knowledge graph
+        try:
+            if hasattr(self, "kg") and self.kg:
+                self.kg.close()
+                self.kg = None
+        except Exception as e:
+            if hasattr(self, "logger") and self.logger:
+                self.logger.warning("Error closing knowledge graph: %s", e)
+            self.kg = None
+
         # Close database backend
         try:
             if hasattr(self, "db") and self.db:
@@ -1565,6 +2076,258 @@ class RobustMemorySystem:
                 "Reinforcement skipped for id=%s: %s", row.get("id", "UNKNOWN"), e
             )
             return None
+
+    def _compute_staleness_score(self, row) -> float:
+        """
+        Compute a staleness score for a memory row.
+
+        Returns a float in [0.0, 1.0]:
+          0.0 = just stored / protected / lifetime misconfigured
+          1.0 = fully stale
+
+        Two independent signals are combined:
+
+        1. Age signal (time-based)
+           staleness = min(1.0, days_old / expected_lifetime)
+           Always present, provides a baseline.
+
+        2. Code-change signal (anchor-based, fact memories only)
+           Parses _file_hashes_at_storage, _signatures_at_storage, and
+           _git_commit_at_storage from the memory content and compares
+           against the current state of the referenced files.
+
+           - File hash mismatch   → score raised to at least 0.85
+             (file content changed since memory was stored)
+           - Signature hash mismatch → score raised to at least 0.75
+             (function parameters changed — weaker signal, file may have
+             changed in an unrelated area)
+           - Git commits since storage → score raised proportionally,
+             capped at 0.6 (commits touch many files; used as a soft signal)
+
+        Final score = max(age_signal, code_change_signal).
+        Protected tags (core, identity, pinned) always return 0.0.
+        """
+        if not STALENESS_ENABLED:
+            return 0.0
+        try:
+            tags = (
+                row["tags"]
+                if isinstance(row, dict)
+                else (row["tags"] if "tags" in row.keys() else None)
+            )
+            if self._should_protect(tags):
+                return 0.0
+            memory_type = (
+                row.get("memory_type")
+                if isinstance(row, dict)
+                else (row["memory_type"] if "memory_type" in row.keys() else None)
+            )
+            lifetime = STALENESS_EXPECTED_LIFETIME_DAYS.get(
+                memory_type, STALENESS_EXPECTED_LIFETIME_DEFAULT
+            )
+            if not lifetime:
+                self.logger.warning(
+                    "Staleness: lifetime=0 for memory_type=%r — returning 0.0",
+                    memory_type,
+                )
+                return 0.0
+            timestamp = (
+                row.get("timestamp") if isinstance(row, dict) else row["timestamp"]
+            )
+            days_old = self._days_since(timestamp)
+            age_score = round(min(1.0, days_old / lifetime), 3)
+
+            # ── Code-change signal ───────────────────────────────────────────
+            # Only applies to fact memories that were stored with file anchors.
+            code_score = 0.0
+            if memory_type == "fact":
+                content = (
+                    row.get("content") if isinstance(row, dict) else row["content"]
+                )
+                if content:
+                    code_score = self._code_change_score(content)
+
+            return round(max(age_score, code_score), 3)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _safe_basename(name: str) -> str | None:
+        """
+        Validate that *name* is a plain filename with no path traversal or
+        glob metacharacters.  Returns the basename if safe, else None.
+        """
+        import re as _re
+
+        # Reject anything that looks like a path or a glob pattern
+        if not name or _re.search(r"[/\\*?\[\]]", name):
+            return None
+        # After stripping path components the result must be identical
+        import os as _os
+
+        return _os.path.basename(name) or None
+
+    def _code_change_score(self, content: str) -> float:
+        """
+        Parse staleness anchors embedded in memory content and compare
+        against the current state of the files on disk / in git.
+
+        Returns a float in [0.0, 1.0] representing code-change staleness.
+        Returns 0.0 if no anchors are found or comparisons fail.
+
+        Signal priority (highest to lowest):
+          1. File hash mismatch  → score ≥ 0.85  (any change to the file)
+          2. Signature removed   → score ≥ 0.80  (function renamed/deleted)
+          3. Signature changed   → score ≥ 0.75  (parameter change)
+          4. Git commits elapsed → score ≤ 0.50  (soft background signal,
+             always evaluated — not skipped when stronger signals already fired)
+        """
+        import re as _re
+
+        score = 0.0
+
+        # ── Resolve absolute paths from stored anchor ────────────────────────
+        # _file_paths_at_storage: {"basename.py": "/abs/path/to/basename.py"}
+        # This avoids filesystem-wide rglob scans (which trigger macOS TCC).
+        stored_abs_paths: dict[str, str] = {}
+        fpa_match = _re.search(r"_file_paths_at_storage:\s*(\{[^\n]+\})", content)
+        if fpa_match:
+            try:
+                import json as _json
+
+                stored_abs_paths = _json.loads(fpa_match.group(1))
+            except Exception:
+                pass
+
+        def _resolve_candidate(raw_name: str):
+            """
+            Return the Path for *raw_name* without traversing the filesystem.
+
+            Priority:
+              1. Use the absolute path stored at write time (_file_paths_at_storage).
+              2. Treat raw_name itself as an absolute/relative path if it exists.
+              3. Give up — return None (never rglob).
+            """
+            from pathlib import Path as _Path
+
+            safe_name = self._safe_basename(raw_name)
+            if not safe_name:
+                return None
+
+            # 1. Stored absolute path
+            abs_path = stored_abs_paths.get(safe_name)
+            if abs_path:
+                p = _Path(abs_path)
+                if p.exists():
+                    return p
+
+            # 2. raw_name might itself be a valid path (absolute or relative)
+            p = _Path(raw_name)
+            if p.exists():
+                return p
+
+            # 3. No match — do NOT rglob
+            return None
+
+        # ── File hash comparison ─────────────────────────────────────────────
+        # _file_hashes_at_storage: {"filename.py": "abcdef0123456789"}
+        fh_match = _re.search(r"_file_hashes_at_storage:\s*(\{[^\n]+\})", content)
+        if fh_match:
+            try:
+                import json as _json
+                from .ast_extractor import hash_file  # type: ignore[import]
+
+                stored_hashes: dict = _json.loads(fh_match.group(1))
+
+                for raw_name, stored_hash in stored_hashes.items():
+                    candidate = _resolve_candidate(raw_name)
+                    if candidate is None:
+                        continue
+                    current_hash = hash_file(str(candidate))
+                    if current_hash and current_hash != stored_hash:
+                        # File changed — strong signal
+                        score = max(score, 0.85)
+                        self.logger.debug(
+                            "Staleness: file hash mismatch for %s "
+                            "(stored=%s current=%s)",
+                            raw_name,
+                            stored_hash,
+                            current_hash,
+                        )
+            except Exception as exc:
+                self.logger.debug("File hash staleness check failed: %s", exc)
+
+        # ── Signature hash comparison ────────────────────────────────────────
+        # _signatures_at_storage: {"filename.py": {"func_name": "a1b2c3d4"}}
+        sig_match = _re.search(r"_signatures_at_storage:\s*(\{[^\n]+\})", content)
+        if sig_match and score < 0.75:
+            try:
+                import json as _json
+                from .ast_extractor import extract_signatures  # type: ignore[import]
+
+                stored_sigs: dict = _json.loads(sig_match.group(1))
+
+                for raw_name, func_sigs in stored_sigs.items():
+                    candidate = _resolve_candidate(raw_name)
+                    if candidate is None:
+                        continue
+                    current_sigs = extract_signatures(str(candidate))
+                    for func_name, stored_hash in func_sigs.items():
+                        current_hash = current_sigs.get(func_name)
+                        if current_hash is None:
+                            # Function removed/renamed — strong signal
+                            score = max(score, 0.80)
+                        elif current_hash != stored_hash:
+                            # Signature changed
+                            score = max(score, 0.75)
+            except Exception as exc:
+                self.logger.debug("Signature staleness check failed: %s", exc)
+            except Exception as exc:
+                self.logger.debug("Signature staleness check failed: %s", exc)
+
+        # ── Git commit comparison ────────────────────────────────────────────
+        # _git_commit_at_storage: abc1234
+        # Always evaluated — acts as a background signal even when file/sig
+        # checks already fired (git score is capped at 0.5, so it only raises
+        # the final score if no stronger signal has been detected).
+        git_match = _re.search(r"_git_commit_at_storage:\s*([0-9a-f]{7,})", content)
+        if git_match:
+            try:
+                from .ast_extractor import get_git_commit  # type: ignore[import]
+                import subprocess as _sp
+
+                stored_commit = git_match.group(1)
+                # Re-validate the captured commit hash before passing to git
+                if not _re.fullmatch(r"[0-9a-f]{7,40}", stored_commit):
+                    raise ValueError(
+                        f"Unexpected commit hash format: {stored_commit!r}"
+                    )
+
+                current_commit = get_git_commit()
+
+                if current_commit and current_commit != stored_commit:
+                    # Count commits since storage
+                    result = _sp.run(
+                        ["git", "rev-list", "--count", "--", f"{stored_commit}..HEAD"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0:
+                        n_commits = int(result.stdout.strip() or 0)
+                        # Soft signal: scale 0→0.5 over 1→20 commits, cap at 0.5
+                        git_score = min(0.5, n_commits / 20 * 0.5)
+                        score = max(score, git_score)
+                        self.logger.debug(
+                            "Staleness: %d commits since %s → git_score=%.2f",
+                            n_commits,
+                            stored_commit,
+                            git_score,
+                        )
+            except Exception as exc:
+                self.logger.debug("Git staleness check failed: %s", exc)
+
+        return round(score, 3)
 
     def list_source_memories(self, source_db_path: str, limit: int = 100) -> Result:
         """

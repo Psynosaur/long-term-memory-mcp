@@ -195,6 +195,10 @@ class ServerManager:
         # On startup, try to reattach to an orphaned server from a prior crash
         self._reattach_orphan()
 
+    def update_args(self, server_args: list[str]) -> None:
+        """Update the server args used for the next start/restart."""
+        self._server_args = server_args
+
     # ── PID file management ──────────────────────────────────────
 
     def _write_pid(self, pid: int) -> None:
@@ -1206,6 +1210,7 @@ class TrayApp:
             threading.Lock()
         )  # protects _visualizer_proc/_tensorboard_proc/_gui_proc
         self._activity_monitor = ActivityMonitor(self, pg_cfg=pg_cfg)
+        self._pg_cfg = pg_cfg or {}
         self._autostart = AutostartManager()
         # Remember the args used to launch this tray so autostart can replay them
         self._server_args = server_args
@@ -1366,6 +1371,17 @@ class TrayApp:
                 self._on_toggle_autostart,
                 checked=lambda item: self._autostart.is_enabled(),
             ),
+            Item(
+                "Network Sharing",
+                self._on_toggle_network_sharing,
+                checked=lambda item: self._network_sharing_enabled(),
+            ),
+            Item(
+                "Kafka Sharing",
+                self._on_toggle_kafka_sharing,
+                checked=lambda item: self._kafka_sharing_enabled(),
+            ),
+            Item("Set Identity...", self._on_set_identity),
             Menu.SEPARATOR,
             Item("Quit", self._on_quit),
         )
@@ -1374,14 +1390,119 @@ class TrayApp:
 
     def _on_toggle_autostart(self, icon, item):
         """Toggle 'Start at Login' on/off."""
-        if self._autostart.is_enabled():
-            self._autostart.disable()
-        else:
-            # Always include --auto-start so the MCP server launches automatically
-            # when the tray app is started at login.
-            autostart_args = ["--auto-start"] + self._server_args
-            self._autostart.enable(extra_args=autostart_args)
-        self._refresh_icon()
+        try:
+            if self._autostart.is_enabled():
+                self._autostart.disable()
+            else:
+                autostart_args = ["--auto-start"] + self._server_args
+                self._autostart.enable(extra_args=autostart_args)
+            self._refresh_icon()
+        except Exception as e:
+            log.error("Autostart toggle failed: %s", e, exc_info=True)
+
+    # ── Network sharing toggle ───────────────────────────────────
+
+    def _network_sharing_enabled(self) -> bool:
+        """Return True if --network-sharing is present in the current server args."""
+        return "--network-sharing" in self._server_args
+
+    def _on_toggle_network_sharing(self, icon, item):
+        """Toggle LAN memory sharing on/off.
+
+        Updates _server_args, restarts the server if it was running, and
+        re-registers autostart so the plist reflects the new state.
+
+        Wrapped in a broad try/except because pystray silently kills the
+        icon if any unhandled exception escapes a menu callback.
+        """
+        try:
+            if self._network_sharing_enabled():
+                # Remove --network-sharing (and adjacent --sharing-poll-interval if present)
+                new_args = []
+                skip_next = False
+                for arg in self._server_args:
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if arg == "--network-sharing":
+                        continue
+                    if arg == "--sharing-poll-interval":
+                        skip_next = True
+                        continue
+                    new_args.append(arg)
+                self._server_args = new_args
+            else:
+                self._server_args = self._server_args + ["--network-sharing"]
+
+            # Propagate the new args to the ServerManager
+            self._server.update_args(self._server_args)
+
+            # Restart the server if it's currently running so the change takes effect
+            was_running = self._server.status == STATUS_RUNNING
+            if was_running:
+                threading.Thread(target=self._do_restart, daemon=True).start()
+
+            # Keep autostart in sync if it's enabled
+            if self._autostart.is_enabled():
+                try:
+                    self._autostart.disable()
+                    autostart_args = ["--auto-start"] + self._server_args
+                    self._autostart.enable(extra_args=autostart_args)
+                except Exception as ae:
+                    log.error(
+                        "Failed to update autostart after network sharing toggle: %s",
+                        ae,
+                    )
+
+            self._refresh_icon()
+
+        except Exception as e:
+            log.error("Network sharing toggle failed: %s", e, exc_info=True)
+
+    # ── Kafka sharing toggle ─────────────────────────────────────
+
+    def _kafka_sharing_enabled(self) -> bool:
+        """Return True if --kafka-sharing is present in the current server args."""
+        return "--kafka-sharing" in self._server_args
+
+    def _on_toggle_kafka_sharing(self, icon, item):
+        """Toggle Kafka memory sharing on/off.
+
+        Updates _server_args, restarts the server if it was running, and
+        re-registers autostart so the plist reflects the new state.
+        """
+        try:
+            if self._kafka_sharing_enabled():
+                self._server_args = [
+                    a for a in self._server_args if a != "--kafka-sharing"
+                ]
+            else:
+                self._server_args = self._server_args + ["--kafka-sharing"]
+
+            # Propagate to ServerManager
+            self._server.update_args(self._server_args)
+
+            # Restart if currently running
+            was_running = self._server.status == STATUS_RUNNING
+            if was_running:
+                threading.Thread(target=self._do_restart, daemon=True).start()
+
+            # Keep autostart in sync
+            if self._autostart.is_enabled():
+                try:
+                    self._autostart.disable()
+                    autostart_args = ["--auto-start"] + self._server_args
+                    self._autostart.enable(extra_args=autostart_args)
+                except Exception as ae:
+                    log.error(
+                        "Failed to update autostart after Kafka sharing toggle: %s",
+                        ae,
+                    )
+
+            self._refresh_icon()
+
+        except Exception as e:
+            log.error("Kafka sharing toggle failed: %s", e, exc_info=True)
 
     def _on_start(self, icon, item):
         threading.Thread(target=self._do_start, daemon=True).start()
@@ -1419,14 +1540,184 @@ class TrayApp:
             log.info("Memory Manager already running")
             return
         log.info("Launching Memory Manager GUI")
+
+        # Pass pgvector connection details via standard PG env vars —
+        # the GUI reads PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD on startup.
+        pg = self._pg_cfg
+        gui_env = None
+        if pg.get("backend_type") == "pgvector":
+            gui_env = {**os.environ}
+            if pg.get("pg_host"):
+                gui_env["PGHOST"] = str(pg["pg_host"])
+            if pg.get("pg_port"):
+                gui_env["PGPORT"] = str(pg["pg_port"])
+            if pg.get("pg_database"):
+                gui_env["PGDATABASE"] = str(pg["pg_database"])
+            if pg.get("pg_user"):
+                gui_env["PGUSER"] = str(pg["pg_user"])
+            if pg.get("pg_password"):
+                gui_env["PGPASSWORD"] = str(pg["pg_password"])
+
         proc = subprocess.Popen(
             [sys.executable, str(GUI_SCRIPT)],
             **_DETACH_KWARGS,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=gui_env,
         )
         with self._subprocess_lock:
             self._gui_proc = proc
+
+    def _on_set_identity(self, icon, item):
+        """Prompt to change the username stored in identity.json."""
+        threading.Thread(target=self._run_set_identity_dialog, daemon=True).start()
+
+    def _run_set_identity_dialog(self):
+        """Show the Set Identity dialog using osascript — no Tkinter.
+
+        Tkinter 9 (Python 3.12 on macOS) calls [NSApplication macOSVersion]
+        which crashes the process regardless of thread. Use osascript instead.
+        """
+        log.info("Set identity dialog: opening")
+        try:
+            from memory_mcp.config import DATA_FOLDER
+            from memory_mcp.identity import NodeIdentity
+
+            try:
+                identity = NodeIdentity.load_or_create(DATA_FOLDER)
+                current_username = identity.username
+                current_uuid = identity.node_uuid
+            except Exception as exc:
+                log.warning("Could not load identity: %s", exc)
+                current_username = ""
+                current_uuid = "unavailable"
+
+            log.info(
+                "Set identity dialog: current username=%s uuid=%s",
+                current_username,
+                current_uuid,
+            )
+
+            if sys.platform == "darwin":
+                # Escape any double-quotes in username for AppleScript string safety
+                safe_username = current_username.replace('"', '\\"')
+                safe_uuid = current_uuid.replace('"', '\\"')
+                script = (
+                    'tell application "System Events"\n'
+                    "  activate\n"
+                    "  set result to text returned of (display dialog "
+                    f'"Username shown to peers during memory sharing.\\n\\nNode UUID: {safe_uuid}" '
+                    f'default answer "{safe_username}" '
+                    'with title "Set Identity" '
+                    'buttons {"Cancel", "OK"} default button "OK")\n'
+                    "end tell\n"
+                    "return result"
+                )
+                import subprocess as _sp
+
+                log.info("Set identity dialog: running osascript")
+                proc = _sp.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                log.info(
+                    "Set identity dialog: osascript returncode=%d stdout=%r stderr=%r",
+                    proc.returncode,
+                    proc.stdout,
+                    proc.stderr,
+                )
+                if proc.returncode != 0:
+                    log.info("Set identity dialog: cancelled")
+                    return
+                new_name = proc.stdout.strip()
+
+            elif sys.platform == "win32":
+                # PowerShell + VB InputBox. Must run with -Sta so the
+                # dialog gets a proper STA COM context — without it the
+                # dialog silently fails and returns empty stdout (returncode 0).
+                safe_username = current_username.replace("'", "''")
+                safe_uuid = current_uuid.replace("'", "''")
+                ps_script = (
+                    "Add-Type -AssemblyName Microsoft.VisualBasic\n"
+                    "$result = [Microsoft.VisualBasic.Interaction]::InputBox("
+                    f"'Username shown to peers during memory sharing.`n`n"
+                    f"Node UUID: {safe_uuid}', "
+                    f"'Set Identity', '{safe_username}')\n"
+                    "Write-Output $result"
+                )
+                import subprocess as _sp
+
+                log.info("Set identity dialog: running PowerShell InputBox (STA)")
+                proc = _sp.run(
+                    [
+                        "powershell",
+                        "-Sta",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        ps_script,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                log.info(
+                    "Set identity dialog: powershell returncode=%d stdout=%r stderr=%r",
+                    proc.returncode,
+                    proc.stdout,
+                    proc.stderr,
+                )
+                if proc.returncode != 0:
+                    log.info("Set identity dialog: powershell failed")
+                    return
+                new_name = proc.stdout.strip()
+
+            else:
+                # Linux — try zenity then kdialog
+                import subprocess as _sp
+
+                new_name = ""
+                for cmd in [
+                    [
+                        "zenity",
+                        "--entry",
+                        "--title=Set Identity",
+                        "--text=Username shown to peers during memory sharing:",
+                        f"--entry-text={current_username}",
+                    ],
+                    [
+                        "kdialog",
+                        "--inputbox",
+                        "Username shown to peers during memory sharing:",
+                        current_username,
+                        "--title",
+                        "Set Identity",
+                    ],
+                ]:
+                    try:
+                        proc = _sp.run(cmd, capture_output=True, text=True, timeout=60)
+                        if proc.returncode == 0:
+                            new_name = proc.stdout.strip()
+                            break
+                    except FileNotFoundError:
+                        continue
+                if not new_name:
+                    log.warning(
+                        "Set identity: no dialog tool (zenity/kdialog) found. "
+                        "Edit data/identity.json manually to change username."
+                    )
+                    return
+
+            if new_name:
+                NodeIdentity.load_or_create(DATA_FOLDER, username=new_name)
+                log.info("Identity username set to '%s'", new_name)
+            else:
+                log.info("Set identity dialog: empty input, no change")
+
+        except Exception as e:
+            log.error("Set identity dialog failed: %s", e, exc_info=True)
 
     def _is_gui_running(self) -> bool:
         """Check if the Memory Manager GUI is alive (proc or cmdline scan)."""
@@ -1836,8 +2127,41 @@ def _acquire_single_instance_lock():
             fh.flush()
             return fh  # caller must keep reference alive for the lock to hold
         except BlockingIOError:
-            log.info("Another tray instance is already running — exiting")
-            sys.exit(0)
+            # Lock is held — check if the owning PID is actually alive.
+            # If not (stale lock from a crash), remove the file and retry once.
+            try:
+                stale_pid = int(lock_path.read_text().strip())
+                try:
+                    os.kill(stale_pid, 0)  # signal 0 = existence check only
+                    # Process is alive — another real instance is running
+                    log.info(
+                        "Another tray instance is already running (pid %d) — exiting",
+                        stale_pid,
+                    )
+                    sys.exit(0)
+                except ProcessLookupError:
+                    # PID is dead — stale lock from a crash, remove and retry
+                    log.warning(
+                        "Stale lock file (pid %d dead) — removing and retrying",
+                        stale_pid,
+                    )
+                    lock_path.unlink(missing_ok=True)
+                    try:
+                        fh2 = open(lock_path, "w")
+                        fcntl.flock(fh2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fh2.write(str(os.getpid()))
+                        fh2.flush()
+                        return fh2
+                    except Exception as retry_err:
+                        log.warning("Lock retry failed: %s", retry_err)
+                        return None
+                except PermissionError:
+                    # Can't check the PID (different user) — treat as live
+                    log.info("Another tray instance is already running — exiting")
+                    sys.exit(0)
+            except Exception:
+                log.info("Another tray instance is already running — exiting")
+                sys.exit(0)
         except Exception as e:
             log.warning("Single-instance lock failed: %s", e)
             return None
@@ -1868,7 +2192,7 @@ def main():
     )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--path", type=str, default="/mcp/")
+    parser.add_argument("--path", type=str, default="/mcp")
     parser.add_argument(
         "--vector-backend",
         choices=["chromadb", "pgvector"],
@@ -1879,6 +2203,37 @@ def main():
     parser.add_argument("--pg-database", type=str, default=None)
     parser.add_argument("--pg-user", type=str, default=None)
     parser.add_argument("--pg-password", type=str, default=None)
+    parser.add_argument(
+        "--network-sharing",
+        action="store_true",
+        default=False,
+        help="Enable LAN memory sharing via mDNS on startup",
+    )
+    parser.add_argument(
+        "--sharing-poll-interval",
+        type=int,
+        default=300,
+        help="Seconds between peer polls when network sharing is enabled (default: 300)",
+    )
+    parser.add_argument(
+        "--webui",
+        action="store_true",
+        default=False,
+        help="Start the WebUI Memory Manager alongside the MCP server",
+    )
+    parser.add_argument(
+        "--webui-port",
+        type=int,
+        default=8666,
+        help="Port for the WebUI REST API (default: 8666)",
+    )
+    parser.add_argument(
+        "--kafka-sharing",
+        action="store_true",
+        default=False,
+        help="Enable Kafka-based memory sharing (producer + consumer). "
+        "Requires KAFKA_* credentials in .env.",
+    )
 
     args = parser.parse_args()
 
@@ -1903,6 +2258,14 @@ def main():
         server_args += ["--pg-database", args.pg_database]
     if args.pg_user is not None:
         server_args += ["--pg-user", args.pg_user]
+    if args.network_sharing:
+        server_args += ["--network-sharing"]
+    if args.sharing_poll_interval != 300:
+        server_args += ["--sharing-poll-interval", str(args.sharing_poll_interval)]
+    if args.webui:
+        server_args += ["--webui", "--webui-port", str(args.webui_port)]
+    if args.kafka_sharing:
+        server_args += ["--kafka-sharing"]
 
     # Pass pg-password via environment variable (not CLI arg) to avoid
     # exposing it in the process list (visible via `ps aux` on Unix /

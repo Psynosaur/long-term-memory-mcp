@@ -183,7 +183,8 @@ class PostgresDatabase(DatabaseBackend):
                     created_at TEXT DEFAULT (NOW()::text),
                     updated_at TEXT DEFAULT (NOW()::text),
                     last_accessed TEXT DEFAULT (NOW()::text),
-                    token_count INTEGER DEFAULT 0
+                    token_count INTEGER DEFAULT 0,
+                    shared_with TEXT DEFAULT '[]'
                 );
             """)
 
@@ -212,6 +213,32 @@ class PostgresDatabase(DatabaseBackend):
                 );
             """)
 
+        self._conn.commit()
+
+        # Column migrations — safe to re-run
+        with self._conn.cursor() as cur:
+            # Migrate shared INTEGER → shared_with TEXT if needed
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='memories' AND column_name='shared'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='memories' AND column_name='shared_with'
+                    ) THEN
+                        ALTER TABLE memories ADD COLUMN shared_with TEXT DEFAULT '[]';
+                        UPDATE memories SET shared_with =
+                            CASE WHEN shared = 1 THEN '["*"]' ELSE '[]' END;
+                    ELSIF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='memories' AND column_name='shared_with'
+                    ) THEN
+                        ALTER TABLE memories ADD COLUMN shared_with TEXT DEFAULT '[]';
+                    END IF;
+                END $$;
+            """)
         self._conn.commit()
 
     def close(self) -> None:

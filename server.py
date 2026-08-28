@@ -1,33 +1,10 @@
 #!/usr/bin/env python3
-"""
-Main entry point for the Long-Term Memory MCP Server.
-
-This is a refactored version that uses a modular architecture with separate concerns:
-- config.py: Configuration constants
-- models.py: Data models (dataclasses)
-- memory_system.py: Core RobustMemorySystem class
-- mcp_tools.py: MCP tool handler registration
-- vector_backends/: Pluggable vector storage (chromadb, pgvector)
-
-Usage examples:
-    # Default: ChromaDB backend, stdio transport
-    python server.py
-
-    # pgvector backend (first run auto-migrates from ChromaDB)
-    python server.py --vector-backend pgvector \\
-        --pg-host localhost --pg-port 5432 \\
-        --pg-database memories --pg-user memory_user --pg-password secret
-
-    # pgvector using PG* environment variables
-    PGHOST=localhost PGDATABASE=memories python server.py --vector-backend pgvector
-
-    # HTTP transport with pgvector
-    python server.py --transport http --port 8000 --vector-backend pgvector
-"""
+"""Main entry point for the Long-Term Memory MCP Server."""
 
 import asyncio
 import atexit
 import argparse
+import logging
 import signal
 import sys
 
@@ -39,9 +16,16 @@ except ImportError as e:
     print(f"Error: {e}")
     sys.exit(1)
 
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
 # Local imports
-from memory_mcp import RobustMemorySystem, register_tools
+from memory_mcp import RobustMemorySystem, register_tools, AuditLogger
 from memory_mcp.config import EMBEDDING_MODEL_CONFIG
+from memory_mcp.identity import NodeIdentity
+from memory_mcp.kafka_producer import KafkaMemoryProducer
+from memory_mcp.kafka_consumer import KafkaMemoryConsumer
+from memory_mcp.network_sharing import NetworkSharingManager
 
 
 def _build_vector_backend(args):
@@ -181,8 +165,48 @@ def _maybe_migrate_chromadb_to_pgvector(memory_system, args):
                 pass
 
 
+def _start_webui_server(memory_system, identity, sharing_mgr, kafka_producer, kafka_consumer, host: str, port: int):
+    """Start the FastAPI WebUI server in a daemon thread.
+
+    The WebUI shares the already-loaded RobustMemorySystem (and its embedding
+    model) with the FastMCP server so the model is only loaded once.
+    """
+    try:
+        import uvicorn
+        from memory_mcp.webui_api import create_app
+    except ImportError as e:
+        print(f"WebUI requires fastapi. Install with: pip install fastapi\nError: {e}")
+        return
+
+    webui_app = create_app(
+        memory_system, identity=identity, sharing_mgr=sharing_mgr,
+        kafka_producer=kafka_producer, kafka_consumer=kafka_consumer,
+    )
+
+    def _run():
+        uvicorn.run(
+            webui_app,
+            host=host,
+            port=port,
+            log_level="warning",  # keep WebUI logs quiet; FastMCP is already chatty
+        )
+
+    import threading
+
+    t = threading.Thread(target=_run, name="webui-server", daemon=True)
+    t.start()
+    print(f"WebUI Memory Manager started on http://{host}:{port}")
+    print(f"  API docs: http://{host}:{port}/api/v1/docs")
+
+
 def main():
     """Main entry point for the MCP server"""
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     # ── Parse command-line arguments FIRST ──────────────────────
     parser = argparse.ArgumentParser(
@@ -220,8 +244,8 @@ def main():
     parser.add_argument(
         "--path",
         type=str,
-        default="/mcp/",
-        help="URL path for HTTP transport (default: /mcp/)",
+        default="/mcp",
+        help="URL path for HTTP transport (default: /mcp). No trailing slash — Streamable HTTP clients cannot follow Starlette's 307 slash redirect.",
     )
 
     # Vector backend arguments
@@ -262,8 +286,61 @@ def main():
         default=None,
         help="PostgreSQL password (default: PGPASSWORD env or 'memory_pass')",
     )
+    parser.add_argument(
+        "--network-sharing",
+        action="store_true",
+        default=False,
+        help="Enable LAN memory sharing via mDNS (Option A). "
+        "Advertises this node and polls peers for shared memories.",
+    )
+    parser.add_argument(
+        "--sharing-poll-interval",
+        type=int,
+        default=300,
+        help="Seconds between peer polls when --network-sharing is enabled (default: 300)",
+    )
+    parser.add_argument(
+        "--kafka-sharing",
+        action="store_true",
+        default=False,
+        help="Enable Kafka-based memory sharing (producer + consumer). "
+        "Requires KAFKA_* credentials in .env. "
+        "See .env.example for configuration.",
+    )
+    parser.add_argument(
+        "--audit-dir",
+        type=str,
+        default=None,
+        help="Directory for audit JSONL files (default: data/audit/ relative to repo root). "
+        "Pass an empty string to disable auditing.",
+    )
+
+    # ── WebUI arguments ───────────────────────────────────────────
+    parser.add_argument(
+        "--webui",
+        action="store_true",
+        default=False,
+        help="Start the WebUI Memory Manager REST API alongside the MCP server. "
+        "Both share the same RobustMemorySystem instance (model loaded once).",
+    )
+    parser.add_argument(
+        "--webui-port",
+        type=int,
+        default=8666,
+        help="Port for the WebUI REST API (default: 8666). "
+        "Requires --transport http (or stdio) and --webui.",
+    )
 
     args = parser.parse_args()
+
+    # ── Audit logger ─────────────────────────────────────────────
+    if args.audit_dir == "":
+        audit_logger = None  # explicitly disabled
+    else:
+        from pathlib import Path
+
+        audit_dir = Path(args.audit_dir) if args.audit_dir else None
+        audit_logger = AuditLogger(audit_dir=audit_dir)
 
     # ── Build backends ────────────────────────────────────────────
     vector_backend = _build_vector_backend(args)
@@ -282,7 +359,7 @@ def main():
     mcp = FastMCP("RobustMemory")
 
     # Register all MCP tools
-    register_tools(mcp, memory_system)
+    register_tools(mcp, memory_system, audit_logger=audit_logger)
 
     # ── Shutdown helpers ────────────────────────────────────────
     _shutting_down = False
@@ -316,12 +393,141 @@ def main():
     # ── Run the server ──────────────────────────────────────────
     backend_info = f"[{args.vector_backend}]"
 
+    # ── Identity ─────────────────────────────────────────────────
+    from memory_mcp.config import DATA_FOLDER
+
+    identity = NodeIdentity.load_or_create(DATA_FOLDER)
+    logging.info("Identity: username=%s uuid=%s", identity.username, identity.node_uuid)
+
+    # ── Kafka memory sharing (opt-in via --kafka-sharing) ────────
+    kafka_producer: KafkaMemoryProducer | None = None
+    kafka_consumer: KafkaMemoryConsumer | None = None
+
+    if args.kafka_sharing:
+        kafka_producer = KafkaMemoryProducer(identity=identity)
+        if kafka_producer.is_configured:
+            if kafka_producer.start():
+                memory_system.kafka_producer = kafka_producer
+                logging.info(
+                    "Kafka producer started (topic=%s, user=%s)",
+                    kafka_producer.topic,
+                    identity.username,
+                )
+            else:
+                logging.info("Kafka producer configured but not started (user not allowed or auth failed)")
+        else:
+            logging.info("Kafka sharing enabled but not configured — check .env")
+
+        kafka_consumer = KafkaMemoryConsumer(
+            memory_system=memory_system,
+            identity=identity,
+            kafka_producer=kafka_producer,
+        )
+        if kafka_consumer.is_configured:
+            if kafka_consumer.start():
+                logging.info(
+                    "Kafka consumer started (topic=%s)",
+                    kafka_consumer.topic,
+                )
+            else:
+                logging.info("Kafka consumer configured but failed to start")
+        else:
+            logging.info("Kafka consumer not configured — check .env")
+    else:
+        logging.info("Kafka sharing disabled (use --kafka-sharing to enable)")
+
+    # ── Network sharing (Option A) ───────────────────────────────
+    sharing_mgr: NetworkSharingManager | None = None
+
+    if args.network_sharing:
+        if args.transport != "http":
+            print(
+                "Warning: --network-sharing requires --transport http; sharing disabled."
+            )
+        else:
+            sharing_mgr = NetworkSharingManager(
+                memory_system=memory_system,
+                identity=identity,
+                http_host=args.host,
+                http_port=args.port,
+                poll_interval=args.sharing_poll_interval,
+            )
+
+            @mcp.custom_route("/identity", methods=["GET"])
+            async def identity_endpoint(request: Request) -> JSONResponse:
+                """Return this node's identity (username + UUID) for peer discovery."""
+                return JSONResponse(
+                    {
+                        "node_id": sharing_mgr.node_id,
+                        "node_uuid": identity.node_uuid,
+                        "username": identity.username,
+                    }
+                )
+
+            @mcp.custom_route("/peers", methods=["GET"])
+            async def peers_endpoint(request: Request) -> JSONResponse:
+                """Return all currently discovered LAN peers."""
+                return JSONResponse(
+                    {
+                        "peers": sharing_mgr.get_known_peers(),
+                    }
+                )
+
+            @mcp.custom_route("/shared/memories", methods=["GET"])
+            async def shared_memories_endpoint(request: Request) -> JSONResponse:
+                """Return shared memories, optionally filtered to a specific peer UUID.
+
+                Query param:
+                  ?for=<uuid>   — only return memories shared with that UUID or everyone
+                  (omit)        — return all shared memories (admin use)
+                """
+                for_uuid = request.query_params.get("for", "")
+                memories = sharing_mgr.get_shared_memories(for_uuid=for_uuid)
+                return JSONResponse(
+                    {
+                        "node_id": sharing_mgr.node_id,
+                        "node_uuid": identity.node_uuid,
+                        "username": identity.username,
+                        "count": len(memories),
+                        "memories": memories,
+                    }
+                )
+
     try:
+        # ── WebUI Memory Manager ──────────────────────────────────
+        if args.webui:
+            _start_webui_server(
+                memory_system=memory_system,
+                identity=identity,
+                sharing_mgr=sharing_mgr,
+                kafka_producer=kafka_producer,
+                kafka_consumer=kafka_consumer,
+                host=args.host,
+                port=args.webui_port,
+            )
+
         if args.transport == "http":
             print(
                 f"Starting Long-Term Memory MCP Server {backend_info} "
                 f"on http://{args.host}:{args.port}{args.path}"
             )
+            if sharing_mgr:
+                print(
+                    f"Network sharing enabled (username={identity.username}, "
+                    f"uuid={identity.node_uuid}, poll_interval={args.sharing_poll_interval}s)"
+                )
+                # Start after the HTTP server is up — run in a short-delay thread
+                # so mDNS advertisement happens once uvicorn is accepting connections.
+                import threading as _threading
+
+                def _delayed_start():
+                    import time as _time
+
+                    _time.sleep(2)
+                    sharing_mgr.start()
+
+                _threading.Thread(target=_delayed_start, daemon=True).start()
+
             # mcp.run() is synchronous in FastMCP 3.x — it calls anyio.run()
             # internally and blocks until the server stops.
             # Do NOT wrap in asyncio.run(): that expects a coroutine and would
@@ -333,9 +539,21 @@ def main():
             asyncio.run(mcp.run_stdio_async(show_banner=False))
     except KeyboardInterrupt:
         print("\nShutting down memory system...")
+        if kafka_consumer:
+            kafka_consumer.stop()
+        if kafka_producer:
+            kafka_producer.stop()
+        if sharing_mgr:
+            sharing_mgr.stop()
         memory_system.close()
     except Exception as e:
         print(f"Error running MCP server: {e}")
+        if kafka_consumer:
+            kafka_consumer.stop()
+        if kafka_producer:
+            kafka_producer.stop()
+        if sharing_mgr:
+            sharing_mgr.stop()
         memory_system.close()
 
 
