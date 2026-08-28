@@ -25,6 +25,11 @@ three event types produced by KafkaMemoryProducer on other nodes:
         (ingested peer memories get new local IDs).
       • Delete from both SQLite and the vector store.
 
+  ack — Lightweight receipt confirming a memory was ingested.
+      • Produced by this consumer after a successful ingest.
+      • Received acks are logged and counted (stats only).
+      • Does NOT require ALLOWED_KAFKA_USERS — any node can ack.
+
 Architecture:
   - Runs on a background daemon thread (non-blocking).
   - Own messages are skipped (source username == local identity username).
@@ -156,6 +161,8 @@ class KafkaMemoryConsumer:
             "ingested": 0,
             "updated": 0,
             "deleted": 0,
+            "acks_sent": 0,
+            "acks_received": 0,
             "skipped_own": 0,
             "skipped_duplicate": 0,
             "skipped_unauthorized_delete": 0,
@@ -376,6 +383,8 @@ class KafkaMemoryConsumer:
             self._handle_update(value, source_username)
         elif event == "delete":
             self._handle_delete(value, source_username)
+        elif event == "ack":
+            self._handle_ack(value, source_username)
         else:
             logger.warning(
                 "[kafka-consumer] Unknown event type: %s", event
@@ -518,6 +527,25 @@ class KafkaMemoryConsumer:
                 )
                 self._inc("errors")
 
+    def _handle_ack(
+        self, value: dict, source_username: str
+    ) -> None:
+        """Handle an ack event — a peer confirmed they ingested a memory.
+
+        This is informational only — logged and counted for stats.
+        """
+        memory_id = value.get("memory_id", "")
+        content_hash = value.get("content_hash", "")
+        title = value.get("title", "")
+        logger.info(
+            "[kafka-consumer] ACK from %s for '%s' (id=%s, hash=%s)",
+            source_username,
+            title[:50],
+            memory_id[:24],
+            content_hash[:12] if content_hash else "?",
+        )
+        self._inc("acks_received")
+
     # ── Ingest helper ────────────────────────────────────────────────────────
 
     def _ingest_memory(
@@ -556,6 +584,8 @@ class KafkaMemoryConsumer:
                     source_username,
                 )
                 self._inc("ingested")
+                # Send ack receipt back to the topic
+                self._send_ack(memory, source_username)
             elif "Duplicate" in (result.reason or ""):
                 self._inc("skipped_duplicate")
             else:
@@ -573,6 +603,39 @@ class KafkaMemoryConsumer:
                 exc_info=True,
             )
             self._inc("errors")
+
+    # ── Ack helper ────────────────────────────────────────────────────────────
+
+    def _send_ack(self, memory: dict, source_username: str) -> None:
+        """Produce a lightweight ack receipt to the topic.
+
+        Signals to the source (and all other nodes) that this node
+        successfully ingested the memory.  Does not require the local
+        node to be in ALLOWED_KAFKA_USERS — any connected producer can ack.
+        """
+        if not self._kafka_producer or not self._kafka_producer._started:
+            return
+
+        memory_id = memory.get("id", "")
+        content_hash = ""
+        content = memory.get("content", "")
+        if content:
+            import hashlib
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        title = memory.get("title", "")
+
+        try:
+            self._kafka_producer.produce_ack(
+                memory_id=memory_id,
+                content_hash=content_hash,
+                title=title,
+            )
+            self._inc("acks_sent")
+        except Exception as exc:
+            logger.debug(
+                "[kafka-consumer] Failed to send ack for %s: %s",
+                memory_id, exc,
+            )
 
     # ── Lookup helpers ───────────────────────────────────────────────────────
 

@@ -836,7 +836,12 @@ class RobustMemorySystem:
                 rec["similarity"] = contradiction_warning["similarity"]
 
             # ── Kafka produce (fire-and-forget) ─────────────────────────────
-            if self.auto_kafka_produce and self.kafka_producer and self.kafka_producer.is_ready:
+            # Skip if this memory was ingested FROM Kafka (has kafka: tag) — prevents echo
+            _is_kafka_ingested = any(
+                isinstance(t, str) and t.startswith("kafka:")
+                for t in (tags if isinstance(tags, list) else [])
+            )
+            if self.auto_kafka_produce and self.kafka_producer and self.kafka_producer.is_ready and not _is_kafka_ingested:
                 try:
                     self.kafka_producer.produce_memory(
                         rec, event="remember", content_hash=content_hash,
@@ -1348,11 +1353,22 @@ class RobustMemorySystem:
                     updated_mem = updated_cursor.fetchone()
                     if updated_mem:
                         mem_dict = dict(updated_mem)
-                        self.kafka_producer.produce_memory(
-                            mem_dict,
-                            event="update",
-                            content_hash=mem_dict.get("content_hash", ""),
+                        # Skip if this memory was ingested FROM Kafka — prevents echo
+                        _tags_raw = mem_dict.get("tags", "[]")
+                        try:
+                            _tag_list = json.loads(_tags_raw) if isinstance(_tags_raw, str) else (_tags_raw if isinstance(_tags_raw, list) else [])
+                        except (ValueError, TypeError):
+                            _tag_list = []
+                        _is_kafka_ingested = any(
+                            isinstance(t, str) and t.startswith("kafka:")
+                            for t in _tag_list
                         )
+                        if not _is_kafka_ingested:
+                            self.kafka_producer.produce_memory(
+                                mem_dict,
+                                event="update",
+                                content_hash=mem_dict.get("content_hash", ""),
+                            )
                 except Exception as kafka_err:
                     self.logger.warning(
                         "Kafka produce failed for update %s (non-fatal): %s",

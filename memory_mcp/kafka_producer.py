@@ -15,6 +15,9 @@ Event types
               key = memory_id.  The message includes both memory_id and
               content_hash so consumers can locate the memory by either
               identifier and purge it from SQLite + the vector store.
+  ack       — lightweight receipt confirming a consumer ingested a memory;
+              key = content_hash.  Does NOT require the sender to be in
+              ALLOWED_KAFKA_USERS — any connected node can acknowledge.
 
 Architecture (modeled on cbt-chat NPR Kafka patterns):
   - SCRAM-SHA-512 authentication (same as MSK clusters)
@@ -50,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 # ── Valid event types ─────────────────────────────────────────────────────────
 
-VALID_EVENTS = frozenset({"remember", "update", "delete"})
+VALID_EVENTS = frozenset({"remember", "update", "delete", "ack"})
 
 # ── Kafka library import (optional dependency) ────────────────────────────────
 
@@ -402,6 +405,40 @@ class KafkaMemoryProducer:
         }
 
         return self._send(memory_id, message, "delete", memory_id)
+
+    # ── Produce: ack (receipt) ────────────────────────────────────────────────
+
+    def produce_ack(
+        self,
+        memory_id: str,
+        content_hash: str = "",
+        title: str = "",
+    ) -> bool:
+        """Produce an ack event — a lightweight receipt confirming ingest.
+
+        Sent by the consumer pipeline after successfully ingesting a memory
+        from a peer.  Other nodes can use this to track delivery/receipt
+        without the overhead of re-publishing the full memory.
+
+        Key: content_hash (dedup — one ack per unique content).
+        """
+        if not self._started or not self._producer:
+            return False
+        # Ack does NOT require is_user_allowed — any configured node
+        # can acknowledge receipt (even consumer-only nodes).
+        # But it does require the producer to be started (connected).
+
+        message = {
+            "event": "ack",
+            "memory_id": memory_id,
+            "content_hash": content_hash,
+            "title": title,
+            "source": self._identity.username,
+            "produced_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        key = content_hash or memory_id
+        return self._send(key, message, "ack", memory_id)
 
     # ── Batch produce ────────────────────────────────────────────────────────
 
