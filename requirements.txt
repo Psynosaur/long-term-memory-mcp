@@ -23,6 +23,11 @@ torch>=2.0.0  # For sentence-transformers (CPU version is fine)
 psycopg[binary]>=3.1.0
 pgvector>=0.3.0
 
+# Optional: Kafka memory sharing (--kafka-sharing flag)
+# Both are optional — the producer/consumer gracefully degrade if neither is installed.
+confluent-kafka>=2.3.0
+kafka-python>=2.0.2
+
 # Optional: 3D vector visualizer (vector_visualizer.py)
 plotly>=5.18.0
 dash>=2.14.0

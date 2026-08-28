@@ -1376,6 +1376,11 @@ class TrayApp:
                 self._on_toggle_network_sharing,
                 checked=lambda item: self._network_sharing_enabled(),
             ),
+            Item(
+                "Kafka Sharing",
+                self._on_toggle_kafka_sharing,
+                checked=lambda item: self._kafka_sharing_enabled(),
+            ),
             Item("Set Identity...", self._on_set_identity),
             Menu.SEPARATOR,
             Item("Quit", self._on_quit),
@@ -1453,6 +1458,51 @@ class TrayApp:
 
         except Exception as e:
             log.error("Network sharing toggle failed: %s", e, exc_info=True)
+
+    # ── Kafka sharing toggle ─────────────────────────────────────
+
+    def _kafka_sharing_enabled(self) -> bool:
+        """Return True if --kafka-sharing is present in the current server args."""
+        return "--kafka-sharing" in self._server_args
+
+    def _on_toggle_kafka_sharing(self, icon, item):
+        """Toggle Kafka memory sharing on/off.
+
+        Updates _server_args, restarts the server if it was running, and
+        re-registers autostart so the plist reflects the new state.
+        """
+        try:
+            if self._kafka_sharing_enabled():
+                self._server_args = [
+                    a for a in self._server_args if a != "--kafka-sharing"
+                ]
+            else:
+                self._server_args = self._server_args + ["--kafka-sharing"]
+
+            # Propagate to ServerManager
+            self._server.update_args(self._server_args)
+
+            # Restart if currently running
+            was_running = self._server.status == STATUS_RUNNING
+            if was_running:
+                threading.Thread(target=self._do_restart, daemon=True).start()
+
+            # Keep autostart in sync
+            if self._autostart.is_enabled():
+                try:
+                    self._autostart.disable()
+                    autostart_args = ["--auto-start"] + self._server_args
+                    self._autostart.enable(extra_args=autostart_args)
+                except Exception as ae:
+                    log.error(
+                        "Failed to update autostart after Kafka sharing toggle: %s",
+                        ae,
+                    )
+
+            self._refresh_icon()
+
+        except Exception as e:
+            log.error("Kafka sharing toggle failed: %s", e, exc_info=True)
 
     def _on_start(self, icon, item):
         threading.Thread(target=self._do_start, daemon=True).start()
@@ -2142,7 +2192,7 @@ def main():
     )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--path", type=str, default="/mcp/")
+    parser.add_argument("--path", type=str, default="/mcp")
     parser.add_argument(
         "--vector-backend",
         choices=["chromadb", "pgvector"],
@@ -2177,6 +2227,13 @@ def main():
         default=8666,
         help="Port for the WebUI REST API (default: 8666)",
     )
+    parser.add_argument(
+        "--kafka-sharing",
+        action="store_true",
+        default=False,
+        help="Enable Kafka-based memory sharing (producer + consumer). "
+        "Requires KAFKA_* credentials in .env.",
+    )
 
     args = parser.parse_args()
 
@@ -2207,6 +2264,8 @@ def main():
         server_args += ["--sharing-poll-interval", str(args.sharing_poll_interval)]
     if args.webui:
         server_args += ["--webui", "--webui-port", str(args.webui_port)]
+    if args.kafka_sharing:
+        server_args += ["--kafka-sharing"]
 
     # Pass pg-password via environment variable (not CLI arg) to avoid
     # exposing it in the process list (visible via `ps aux` on Unix /

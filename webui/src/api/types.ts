@@ -175,3 +175,104 @@ export interface PgConnectionParams {
   pg_user: string
   pg_password: string
 }
+
+// ── Knowledge Graph types ─────────────────────────────────────────────────────
+
+export interface KgTriple {
+  direction?: 'outgoing' | 'incoming'
+  subject: string
+  predicate: string
+  object: string
+  valid_from: string | null
+  valid_to: string | null
+  confidence: number
+  source_memory_id: string | null
+  current: boolean
+}
+
+export interface KgStats {
+  entities: number
+  triples: number
+  current_facts: number
+  expired_facts: number
+  relationship_types: string[]
+}
+
+export interface KgTripleCreate {
+  subject: string
+  predicate: string
+  obj: string
+  valid_from?: string
+  valid_to?: string
+  confidence?: number
+  source_memory_id?: string
+}
+
+export interface KgInvalidateRequest {
+  subject: string
+  predicate: string
+  obj: string
+  ended?: string
+}
+
+// ── Kafka types ───────────────────────────────────────────────────────────────
+
+export interface KafkaStatus {
+  configured: boolean
+  started: boolean
+  ready: boolean
+  topic: string | null
+  producer: {
+    configured: boolean
+    started: boolean
+    ready: boolean
+  }
+  consumer: {
+    configured: boolean
+    running: boolean
+    stats: {
+      ingested?: number
+      updated?: number
+      deleted?: number
+      skipped_own?: number
+      skipped_duplicate?: number
+      skipped_unauthorized_delete?: number
+      errors?: number
+    }
+  }
+  allowed_users: Array<{ username: string; node_uuid: string }>
+  current_user: {
+    username: string | null
+    node_uuid: string | null
+    allowed: boolean
+  }
+}
+
+export interface KafkaProduceRequest {
+  memory_ids: string[]
+  event?: 'remember' | 'update'
+}
+
+export interface KafkaDeleteBroadcast {
+  memory_ids: string[]
+  reason?: string
+}
+
+export interface KafkaProduceResult {
+  produced: number
+  failed: number
+  not_found?: string[]
+}
+
+// ── Tool-call types ───────────────────────────────────────────────────────────
+
+export interface ToolCallRequest {
+  tool: string
+  args: Record<string, unknown>
+}
+
+export interface ToolCallResult {
+  success: boolean
+  reason?: string
+  data?: unknown[]
+}

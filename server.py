@@ -23,6 +23,8 @@ from starlette.responses import JSONResponse
 from memory_mcp import RobustMemorySystem, register_tools, AuditLogger
 from memory_mcp.config import EMBEDDING_MODEL_CONFIG
 from memory_mcp.identity import NodeIdentity
+from memory_mcp.kafka_producer import KafkaMemoryProducer
+from memory_mcp.kafka_consumer import KafkaMemoryConsumer
 from memory_mcp.network_sharing import NetworkSharingManager
 
 
@@ -163,7 +165,7 @@ def _maybe_migrate_chromadb_to_pgvector(memory_system, args):
                 pass
 
 
-def _start_webui_server(memory_system, identity, sharing_mgr, host: str, port: int):
+def _start_webui_server(memory_system, identity, sharing_mgr, kafka_producer, kafka_consumer, host: str, port: int):
     """Start the FastAPI WebUI server in a daemon thread.
 
     The WebUI shares the already-loaded RobustMemorySystem (and its embedding
@@ -176,7 +178,10 @@ def _start_webui_server(memory_system, identity, sharing_mgr, host: str, port: i
         print(f"WebUI requires fastapi. Install with: pip install fastapi\nError: {e}")
         return
 
-    webui_app = create_app(memory_system, identity=identity, sharing_mgr=sharing_mgr)
+    webui_app = create_app(
+        memory_system, identity=identity, sharing_mgr=sharing_mgr,
+        kafka_producer=kafka_producer, kafka_consumer=kafka_consumer,
+    )
 
     def _run():
         uvicorn.run(
@@ -239,8 +244,8 @@ def main():
     parser.add_argument(
         "--path",
         type=str,
-        default="/mcp/",
-        help="URL path for HTTP transport (default: /mcp/)",
+        default="/mcp",
+        help="URL path for HTTP transport (default: /mcp). No trailing slash — Streamable HTTP clients cannot follow Starlette's 307 slash redirect.",
     )
 
     # Vector backend arguments
@@ -293,6 +298,14 @@ def main():
         type=int,
         default=300,
         help="Seconds between peer polls when --network-sharing is enabled (default: 300)",
+    )
+    parser.add_argument(
+        "--kafka-sharing",
+        action="store_true",
+        default=False,
+        help="Enable Kafka-based memory sharing (producer + consumer). "
+        "Requires KAFKA_* credentials in .env. "
+        "See .env.example for configuration.",
     )
     parser.add_argument(
         "--audit-dir",
@@ -386,6 +399,43 @@ def main():
     identity = NodeIdentity.load_or_create(DATA_FOLDER)
     logging.info("Identity: username=%s uuid=%s", identity.username, identity.node_uuid)
 
+    # ── Kafka memory sharing (opt-in via --kafka-sharing) ────────
+    kafka_producer: KafkaMemoryProducer | None = None
+    kafka_consumer: KafkaMemoryConsumer | None = None
+
+    if args.kafka_sharing:
+        kafka_producer = KafkaMemoryProducer(identity=identity)
+        if kafka_producer.is_configured:
+            if kafka_producer.start():
+                memory_system.kafka_producer = kafka_producer
+                logging.info(
+                    "Kafka producer started (topic=%s, user=%s)",
+                    kafka_producer.topic,
+                    identity.username,
+                )
+            else:
+                logging.info("Kafka producer configured but not started (user not allowed or auth failed)")
+        else:
+            logging.info("Kafka sharing enabled but not configured — check .env")
+
+        kafka_consumer = KafkaMemoryConsumer(
+            memory_system=memory_system,
+            identity=identity,
+            kafka_producer=kafka_producer,
+        )
+        if kafka_consumer.is_configured:
+            if kafka_consumer.start():
+                logging.info(
+                    "Kafka consumer started (topic=%s)",
+                    kafka_consumer.topic,
+                )
+            else:
+                logging.info("Kafka consumer configured but failed to start")
+        else:
+            logging.info("Kafka consumer not configured — check .env")
+    else:
+        logging.info("Kafka sharing disabled (use --kafka-sharing to enable)")
+
     # ── Network sharing (Option A) ───────────────────────────────
     sharing_mgr: NetworkSharingManager | None = None
 
@@ -450,6 +500,8 @@ def main():
                 memory_system=memory_system,
                 identity=identity,
                 sharing_mgr=sharing_mgr,
+                kafka_producer=kafka_producer,
+                kafka_consumer=kafka_consumer,
                 host=args.host,
                 port=args.webui_port,
             )
@@ -487,11 +539,19 @@ def main():
             asyncio.run(mcp.run_stdio_async(show_banner=False))
     except KeyboardInterrupt:
         print("\nShutting down memory system...")
+        if kafka_consumer:
+            kafka_consumer.stop()
+        if kafka_producer:
+            kafka_producer.stop()
         if sharing_mgr:
             sharing_mgr.stop()
         memory_system.close()
     except Exception as e:
         print(f"Error running MCP server: {e}")
+        if kafka_consumer:
+            kafka_consumer.stop()
+        if kafka_producer:
+            kafka_producer.stop()
         if sharing_mgr:
             sharing_mgr.stop()
         memory_system.close()

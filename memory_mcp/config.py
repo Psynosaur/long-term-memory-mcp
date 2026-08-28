@@ -144,6 +144,7 @@ DECAY_HALF_LIFE_DAYS_BY_TYPE = {
     "preference": 90,
     "task": 30,
     "ephemeral": 10,
+    "summary": 90,
 }
 DECAY_HALF_LIFE_DAYS_DEFAULT = 60
 
@@ -154,6 +155,7 @@ DECAY_MIN_IMPORTANCE_BY_TYPE = {
     "preference": 2,
     "task": 1,
     "ephemeral": 1,
+    "summary": 2,
 }
 DECAY_MIN_IMPORTANCE_DEFAULT = 1
 
@@ -194,6 +196,7 @@ STALENESS_EXPECTED_LIFETIME_DAYS = {
     "task": 14,
     "event": 365,
     "ephemeral": 3,
+    "summary": 30,  # session recaps age as the project moves on
 }
 STALENESS_EXPECTED_LIFETIME_DEFAULT = 60  # fallback for unknown types
 

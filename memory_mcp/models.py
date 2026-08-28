@@ -21,7 +21,7 @@ class MemoryRecord:
         timestamp (datetime)
         tags (List[str])
         importance (int): 1–10 scale
-        memory_type (str): conversation, fact, preference, event, etc.
+        memory_type (str): conversation, fact, preference, event, task, ephemeral, summary
         metadata (Dict[str, Any])
         shared_with (List[str]): Peer UUIDs this memory is visible to.
             []        = private

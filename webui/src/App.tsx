@@ -11,9 +11,34 @@ import { VectorsModal } from '@/components/VectorsModal'
 import { MigrateModal } from '@/components/MigrateModal'
 import { CompareModal } from '@/components/CompareModal'
 import { PeerPicker } from '@/components/PeerPicker'
+import { KnowledgeGraphTab } from '@/components/KnowledgeGraphTab'
+import { ToolsTab } from '@/components/ToolsTab'
 import type { Memory } from '@/api/types'
 
 type ModalType = 'vectors' | 'migrate' | 'compare' | 'peers' | null
+type TabType = 'memories' | 'kg' | 'tools'
+
+function TabButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        padding: '6px 18px',
+        border: 'none',
+        borderBottom: active ? '2px solid var(--accent)' : '2px solid transparent',
+        background: 'transparent',
+        color: active ? 'var(--accent)' : 'var(--text-muted)',
+        fontWeight: active ? 700 : 400,
+        fontSize: 14,
+        cursor: 'pointer',
+        borderRadius: 0,
+        transition: 'color 0.15s',
+      }}
+    >
+      {label}
+    </button>
+  )
+}
 
 export default function App() {
   const {
@@ -24,6 +49,7 @@ export default function App() {
     setCurrentQueryKey,
   } = useMemoryStore()
 
+  const [tab, setTab] = useState<TabType>('memories')
   const [modal, setModal] = useState<ModalType>(null)
   const [backupMsg, setBackupMsg] = useState<string | null>(null)
   const qc = useQueryClient()
@@ -34,8 +60,7 @@ export default function App() {
     page, pageSize,
   )
 
-  // Keep the store in sync so MemoryDetail can invalidate the right key
-  useEffect(() => { setCurrentQueryKey(queryKey) }, [queryKey.join(',')])  // eslint-disable-line
+  useEffect(() => { setCurrentQueryKey(queryKey) }, [queryKey.join(',')]) // eslint-disable-line
 
   const memoriesQ = useQuery({
     queryKey,
@@ -49,13 +74,12 @@ export default function App() {
       limit: pageSize,
       offset: page * pageSize,
     }),
+    enabled: tab === 'memories',
   })
 
   const memories: Memory[] = memoriesQ.data?.data ?? []
   const total: number = memoriesQ.data?.total ?? 0
 
-  // Manual refresh: reset to page 0 and invalidate only the current key.
-  // Other cached pages (different filters / page numbers) stay intact.
   function refresh() {
     setPage(0)
     qc.invalidateQueries({ queryKey: ['memories', searchText, filterType, filterMinImportance, filterTags, sortOrder, searchMode, 0, pageSize] })
@@ -92,16 +116,31 @@ export default function App() {
         </div>
 
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-          <button onClick={refresh}>Refresh</button>
-          <button onClick={() => backupMut.mutate()} disabled={backupMut.isPending}>
-            {backupMut.isPending ? 'Backing up…' : 'Backup'}
-          </button>
-          <button onClick={downloadExport}>Export</button>
-          <button onClick={() => setModal('vectors')}>Vectors</button>
-          <button onClick={() => setModal('migrate')}>Migrate</button>
-          <button onClick={() => setModal('compare')}>Compare</button>
+          {tab === 'memories' && (
+            <>
+              <button onClick={refresh}>Refresh</button>
+              <button onClick={() => backupMut.mutate()} disabled={backupMut.isPending}>
+                {backupMut.isPending ? 'Backing up…' : 'Backup'}
+              </button>
+              <button onClick={downloadExport}>Export</button>
+              <button onClick={() => setModal('vectors')}>Vectors</button>
+              <button onClick={() => setModal('migrate')}>Migrate</button>
+              <button onClick={() => setModal('compare')}>Compare</button>
+            </>
+          )}
         </div>
       </header>
+
+      {/* Tab bar */}
+      <div style={{
+        display: 'flex', alignItems: 'flex-end',
+        background: 'var(--surface)', borderBottom: '1px solid var(--border)',
+        padding: '0 12px', flexShrink: 0,
+      }}>
+        <TabButton label="Memories" active={tab === 'memories'} onClick={() => setTab('memories')} />
+        <TabButton label="Knowledge Graph" active={tab === 'kg'} onClick={() => setTab('kg')} />
+        <TabButton label="Tools" active={tab === 'tools'} onClick={() => setTab('tools')} />
+      </div>
 
       {/* Backup message banner */}
       {backupMsg && (
@@ -114,35 +153,51 @@ export default function App() {
         </div>
       )}
 
-      {/* Main layout */}
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
-        {/* Left sidebar: search + stats */}
-        <aside style={{
-          width: 260, flexShrink: 0,
-          display: 'flex', flexDirection: 'column', gap: 8,
-          padding: 8, borderRight: '1px solid var(--border)',
-          overflow: 'auto',
-        }}>
-          <SearchPanel onSearch={refresh} />
-          <StatsPanel />
-        </aside>
+      {/* Tab content */}
+      <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        {/* ── Memories tab ── */}
+        {tab === 'memories' && (
+          <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
+            <aside style={{
+              width: 260, flexShrink: 0,
+              display: 'flex', flexDirection: 'column', gap: 8,
+              padding: 8, borderRight: '1px solid var(--border)',
+              overflow: 'auto',
+            }}>
+              <SearchPanel onSearch={refresh} />
+              <StatsPanel />
+            </aside>
 
-        {/* Center: sortable memory list */}
-        <div style={{ flex: 3, display: 'flex', flexDirection: 'column', padding: 8, overflow: 'hidden', minWidth: 0 }}>
-          <MemoryList
-            memories={memories}
-            isLoading={memoriesQ.isLoading}
-            total={total}
-          />
-        </div>
+            <div style={{ flex: 3, display: 'flex', flexDirection: 'column', padding: 8, overflow: 'hidden', minWidth: 0 }}>
+              <MemoryList
+                memories={memories}
+                isLoading={memoriesQ.isLoading}
+                total={total}
+              />
+            </div>
 
-        {/* Right: detail / editor — flex:2 gives ~40% of the center+right area */}
-        <div style={{ flex: 2, minWidth: 380, flexShrink: 0, padding: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column', borderLeft: '1px solid var(--border)' }}>
-          <MemoryDetail onPeersClick={() => setModal('peers')} />
-        </div>
+            <div style={{ flex: 2, minWidth: 380, flexShrink: 0, padding: 8, overflow: 'hidden', display: 'flex', flexDirection: 'column', borderLeft: '1px solid var(--border)' }}>
+              <MemoryDetail onPeersClick={() => setModal('peers')} />
+            </div>
+          </div>
+        )}
+
+        {/* ── Knowledge Graph tab ── */}
+        {tab === 'kg' && (
+          <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
+            <KnowledgeGraphTab />
+          </div>
+        )}
+
+        {/* ── Tools tab ── */}
+        {tab === 'tools' && (
+          <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
+            <ToolsTab />
+          </div>
+        )}
       </div>
 
-      {/* Modals */}
+      {/* Modals (only available from memories tab) */}
       {modal === 'vectors' && <VectorsModal onClose={() => setModal(null)} />}
       {modal === 'migrate' && <MigrateModal onClose={() => setModal(null)} />}
       {modal === 'compare' && <CompareModal onClose={() => setModal(null)} />}

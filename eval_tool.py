@@ -90,7 +90,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "memory_type",
                 "str",
                 "conversation",
-                "conversation/fact/preference/event",
+                "conversation/fact/preference/event/summary",
             ),
             ("shared_with", "str", "", "Comma-separated UUIDs or *"),
             ("file_paths", "str", "", "Comma-separated absolute paths"),
@@ -109,7 +109,7 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "search_by_type",
         "description": "Retrieve memories by type",
         "params": [
-            ("memory_type", "str", _REQUIRED, "conversation/fact/preference/event"),
+            ("memory_type", "str", _REQUIRED, "conversation/fact/preference/event/summary"),
             ("limit", "int", 20, "Max results"),
         ],
     },

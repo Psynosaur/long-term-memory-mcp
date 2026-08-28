@@ -32,6 +32,7 @@ import tiktoken
 
 # Local imports
 from .models import MemoryRecord, SearchResult, Result
+from .knowledge_graph import KnowledgeGraph
 from .database_backends.base import DatabaseBackend, DatabaseRow
 from .database_backends.sqlite import SQLiteDatabase
 from .vector_backends.base import VectorBackend
@@ -101,9 +102,11 @@ class RobustMemorySystem:
         self.logger = None  # will be set in _setup_logging
         self.db: Optional[DatabaseBackend] = None  # will be set in _init_database
         self.vector_backend: Optional[VectorBackend] = None
+        self.kg: Optional[KnowledgeGraph] = None  # temporal knowledge graph
         self.embedding_model: Optional[object] = None
         self._query_prefix: str = ""  # set by _init_embeddings (e.g. BGE needs prefix)
         self.tokenizer: Optional[object] = None
+        self.kafka_producer: Optional[object] = None  # set externally by server.py
 
         # Setup logging
         self._setup_logging()
@@ -111,6 +114,7 @@ class RobustMemorySystem:
         # Initialize components
         self._init_database(database_backend)
         self._init_vector_backend(vector_backend)
+        self._init_knowledge_graph()
         self._init_embeddings()
         self._init_tokenizer()
 
@@ -311,6 +315,16 @@ class RobustMemorySystem:
 
         except Exception as e:
             self.logger.error("Failed to initialize vector backend: %s", e)
+            raise
+
+    def _init_knowledge_graph(self):
+        """Initialize the temporal knowledge graph (SQLite-backed)."""
+        try:
+            kg_path = self.db_folder / "knowledge_graph.db"
+            self.kg = KnowledgeGraph(db_path=kg_path)
+            self.logger.info("Knowledge graph initialized at %s", kg_path)
+        except Exception as e:
+            self.logger.error("Failed to initialize knowledge graph: %s", e)
             raise
 
     def _init_embeddings(self):
@@ -655,13 +669,27 @@ class RobustMemorySystem:
 
                     clean_paths = [p for p in file_paths if p and p.strip()]
                     import json as _json
+                    from pathlib import Path as _Path
+
+                    # Absolute path map: basename → absolute path (used at recall
+                    # time to avoid rglob filesystem scans that trigger macOS TCC)
+                    abs_path_map = {
+                        _Path(p).name: str(_Path(p).resolve())
+                        for p in clean_paths
+                        if _Path(p).exists()
+                    }
+                    if abs_path_map:
+                        content = (
+                            content.rstrip()
+                            + f"\n\n_file_paths_at_storage: {_json.dumps(abs_path_map)}"
+                        )
 
                     # Signature hashes (keys = symbol names, values = param hashes)
                     signatures = extract_signatures_multi(clean_paths)
                     if signatures:
                         content = (
                             content.rstrip()
-                            + f"\n\n_signatures_at_storage: {_json.dumps(signatures)}"
+                            + f"\n_signatures_at_storage: {_json.dumps(signatures)}"
                         )
 
                     # File content hashes
@@ -805,6 +833,19 @@ class RobustMemorySystem:
                 rec["conflicting_id"] = contradiction_warning["conflicting_id"]
                 rec["conflicting_title"] = contradiction_warning["conflicting_title"]
                 rec["similarity"] = contradiction_warning["similarity"]
+
+            # ── Kafka produce (fire-and-forget) ─────────────────────────────
+            if self.kafka_producer and self.kafka_producer.is_ready:
+                try:
+                    self.kafka_producer.produce_memory(
+                        rec, event="remember", content_hash=content_hash,
+                    )
+                except Exception as kafka_err:
+                    self.logger.warning(
+                        "Kafka produce failed for remember %s (non-fatal): %s",
+                        memory_id, kafka_err,
+                    )
+
             return Result(success=True, data=[rec])
 
         except Exception as e:
@@ -1104,7 +1145,7 @@ class RobustMemorySystem:
             self.logger.error("Structured search failed: %s", e)
             return Result(success=False, reason=f"Search error: {str(e)}")
 
-    def get_recent(self, limit: int = 20, current_project: str = None) -> Result:
+    def get_recent(self, limit: int = 20, current_project: str = None, include_summaries: bool = False) -> Result:
         """
         Get most recent memories, optionally filtered by project.
 
@@ -1113,11 +1154,16 @@ class RobustMemorySystem:
         The caller asks for ``limit`` recent memories and gets all
         preferences prepended for free.
 
+        Summary memories (memory_type="summary") are excluded by default.
+        Pass include_summaries=True to include them.
+
         Args:
             limit: Maximum number of *recent* memories to return
                    (preferences are added on top of this).
             current_project: Optional project identifier to filter by.
                            If provided, only returns memories with this project tag.
+            include_summaries: If False (default), memories with
+                               memory_type="summary" are excluded from results.
         """
         try:
             # --- 1. Fetch ALL preference memories by memory_type (global, not project-scoped) ---
@@ -1162,15 +1208,18 @@ class RobustMemorySystem:
                 else []
             )
 
-            # --- 4. Deduplicate: remove any recent items already in preferences ---
+            # --- 4. Deduplicate and optionally strip summaries ---
             deduped_recent = [
-                item for item in recent_items if item["id"] not in pref_ids
+                item
+                for item in recent_items
+                if item["id"] not in pref_ids
+                and (include_summaries or item.get("memory_type") != "summary")
             ]
 
-            # --- 5. Combine: preferences first (capped), then recent project memories ---
-            # Cap preferences to avoid swamping the result when there are many.
-            max_prefs = max(3, limit // 2)
-            combined = pref_items[:max_prefs] + deduped_recent[:limit]
+            # --- 5. Combine: ALL preferences first, then `limit` recent project memories ---
+            # Preferences are short context items always returned in full.
+            # The `limit` parameter applies only to the recent-memory slice.
+            combined = pref_items + deduped_recent[:limit]
 
             return Result(success=True, data=combined)
 
@@ -1284,6 +1333,31 @@ class RobustMemorySystem:
             self.db.commit()
 
             self.logger.info("Memory updated successfully: %s", memory_id)
+
+            # ── Kafka produce (fire-and-forget) ─────────────────────────────
+            if self.kafka_producer and self.kafka_producer.is_ready:
+                try:
+                    # Fetch the final state of the updated memory for the message
+                    updated_cursor = self.db.execute(
+                        "SELECT id, title, content, timestamp, tags, importance, "
+                        "memory_type, content_hash, token_count, shared_with "
+                        "FROM memories WHERE id = ?",
+                        (memory_id,),
+                    )
+                    updated_mem = updated_cursor.fetchone()
+                    if updated_mem:
+                        mem_dict = dict(updated_mem)
+                        self.kafka_producer.produce_memory(
+                            mem_dict,
+                            event="update",
+                            content_hash=mem_dict.get("content_hash", ""),
+                        )
+                except Exception as kafka_err:
+                    self.logger.warning(
+                        "Kafka produce failed for update %s (non-fatal): %s",
+                        memory_id, kafka_err,
+                    )
+
             return Result(success=True, data=[{"id": memory_id, "updated": True}])
 
         except Exception as e:
@@ -1323,6 +1397,109 @@ class RobustMemorySystem:
             self.logger.error("Failed to delete memory: %s", e)
             self.db.rollback()
             return Result(success=False, reason=f"Delete error: {str(e)}")
+
+    # ── Knowledge Graph public API ────────────────────────────────────────────
+
+    def kg_add_triple(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        valid_from: Optional[str] = None,
+        valid_to: Optional[str] = None,
+        confidence: float = 1.0,
+        source_memory_id: Optional[str] = None,
+    ) -> Result:
+        """Add a fact triple to the knowledge graph."""
+        try:
+            triple_id = self.kg.add_triple(
+                subject=subject,
+                predicate=predicate,
+                obj=obj,
+                valid_from=valid_from,
+                valid_to=valid_to,
+                confidence=confidence,
+                source_memory_id=source_memory_id,
+            )
+            return Result(
+                success=True,
+                data=[
+                    {
+                        "triple_id": triple_id,
+                        "subject": subject,
+                        "predicate": predicate,
+                        "object": obj,
+                        "valid_from": valid_from,
+                        "valid_to": valid_to,
+                        "confidence": confidence,
+                        "source_memory_id": source_memory_id,
+                    }
+                ],
+            )
+        except Exception as e:
+            self.logger.error("kg_add_triple failed: %s", e)
+            return Result(success=False, reason=str(e))
+
+    def kg_invalidate(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        ended: Optional[str] = None,
+    ) -> Result:
+        """Mark an open triple as expired."""
+        try:
+            self.kg.invalidate(
+                subject=subject, predicate=predicate, obj=obj, ended=ended
+            )
+            return Result(
+                success=True,
+                data=[
+                    {
+                        "subject": subject,
+                        "predicate": predicate,
+                        "object": obj,
+                        "ended": ended,
+                    }
+                ],
+            )
+        except Exception as e:
+            self.logger.error("kg_invalidate failed: %s", e)
+            return Result(success=False, reason=str(e))
+
+    def kg_query_entity(
+        self,
+        name: str,
+        as_of: Optional[str] = None,
+        direction: str = "outgoing",
+    ) -> Result:
+        """Query all facts for an entity, optionally at a point in time."""
+        try:
+            facts = self.kg.query_entity(name=name, as_of=as_of, direction=direction)
+            return Result(success=True, data=facts)
+        except Exception as e:
+            self.logger.error("kg_query_entity failed: %s", e)
+            return Result(success=False, reason=str(e))
+
+    def kg_timeline(
+        self, entity_name: Optional[str] = None, limit: int = 100
+    ) -> Result:
+        """Get chronological fact history, optionally filtered by entity."""
+        try:
+            facts = self.kg.timeline(entity_name=entity_name, limit=limit)
+            return Result(success=True, data=facts)
+        except Exception as e:
+            self.logger.error("kg_timeline failed: %s", e)
+            return Result(success=False, reason=str(e))
+
+    def kg_stats(self) -> Result:
+        """Return knowledge graph statistics."""
+        try:
+            s = self.kg.stats()
+            return Result(success=True, data=[s])
+        except Exception as e:
+            self.logger.error("kg_stats failed: %s", e)
+            return Result(success=False, reason=str(e))
 
     def get_statistics(self) -> Result:
         """Get memory system statistics"""
@@ -1542,6 +1719,16 @@ class RobustMemorySystem:
 
     def close(self):
         """Clean shutdown of the memory system"""
+        # Close knowledge graph
+        try:
+            if hasattr(self, "kg") and self.kg:
+                self.kg.close()
+                self.kg = None
+        except Exception as e:
+            if hasattr(self, "logger") and self.logger:
+                self.logger.warning("Error closing knowledge graph: %s", e)
+            self.kg = None
+
         # Close database backend
         try:
             if hasattr(self, "db") and self.db:
@@ -1982,6 +2169,49 @@ class RobustMemorySystem:
 
         score = 0.0
 
+        # ── Resolve absolute paths from stored anchor ────────────────────────
+        # _file_paths_at_storage: {"basename.py": "/abs/path/to/basename.py"}
+        # This avoids filesystem-wide rglob scans (which trigger macOS TCC).
+        stored_abs_paths: dict[str, str] = {}
+        fpa_match = _re.search(r"_file_paths_at_storage:\s*(\{[^\n]+\})", content)
+        if fpa_match:
+            try:
+                import json as _json
+
+                stored_abs_paths = _json.loads(fpa_match.group(1))
+            except Exception:
+                pass
+
+        def _resolve_candidate(raw_name: str):
+            """
+            Return the Path for *raw_name* without traversing the filesystem.
+
+            Priority:
+              1. Use the absolute path stored at write time (_file_paths_at_storage).
+              2. Treat raw_name itself as an absolute/relative path if it exists.
+              3. Give up — return None (never rglob).
+            """
+            from pathlib import Path as _Path
+
+            safe_name = self._safe_basename(raw_name)
+            if not safe_name:
+                return None
+
+            # 1. Stored absolute path
+            abs_path = stored_abs_paths.get(safe_name)
+            if abs_path:
+                p = _Path(abs_path)
+                if p.exists():
+                    return p
+
+            # 2. raw_name might itself be a valid path (absolute or relative)
+            p = _Path(raw_name)
+            if p.exists():
+                return p
+
+            # 3. No match — do NOT rglob
+            return None
+
         # ── File hash comparison ─────────────────────────────────────────────
         # _file_hashes_at_storage: {"filename.py": "abcdef0123456789"}
         fh_match = _re.search(r"_file_hashes_at_storage:\s*(\{[^\n]+\})", content)
@@ -1989,18 +2219,11 @@ class RobustMemorySystem:
             try:
                 import json as _json
                 from .ast_extractor import hash_file  # type: ignore[import]
-                from pathlib import Path as _Path
-                import os as _os
 
                 stored_hashes: dict = _json.loads(fh_match.group(1))
-                cwd = _os.getcwd()
 
                 for raw_name, stored_hash in stored_hashes.items():
-                    safe_name = self._safe_basename(raw_name)
-                    if not safe_name:
-                        continue
-                    # Use next(iter(...)) to avoid materialising the full list
-                    candidate = next(iter(_Path(cwd).rglob(safe_name)), None)
+                    candidate = _resolve_candidate(raw_name)
                     if candidate is None:
                         continue
                     current_hash = hash_file(str(candidate))
@@ -2010,7 +2233,7 @@ class RobustMemorySystem:
                         self.logger.debug(
                             "Staleness: file hash mismatch for %s "
                             "(stored=%s current=%s)",
-                            safe_name,
+                            raw_name,
                             stored_hash,
                             current_hash,
                         )
@@ -2024,17 +2247,11 @@ class RobustMemorySystem:
             try:
                 import json as _json
                 from .ast_extractor import extract_signatures  # type: ignore[import]
-                from pathlib import Path as _Path
-                import os as _os
 
                 stored_sigs: dict = _json.loads(sig_match.group(1))
-                cwd = _os.getcwd()
 
                 for raw_name, func_sigs in stored_sigs.items():
-                    safe_name = self._safe_basename(raw_name)
-                    if not safe_name:
-                        continue
-                    candidate = next(iter(_Path(cwd).rglob(safe_name)), None)
+                    candidate = _resolve_candidate(raw_name)
                     if candidate is None:
                         continue
                     current_sigs = extract_signatures(str(candidate))
@@ -2046,6 +2263,8 @@ class RobustMemorySystem:
                         elif current_hash != stored_hash:
                             # Signature changed
                             score = max(score, 0.75)
+            except Exception as exc:
+                self.logger.debug("Signature staleness check failed: %s", exc)
             except Exception as exc:
                 self.logger.debug("Signature staleness check failed: %s", exc)
 

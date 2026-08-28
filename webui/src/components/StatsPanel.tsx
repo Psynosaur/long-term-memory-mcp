@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { getStats } from '@/api/client'
+import { getStats, getKafkaStatus } from '@/api/client'
 
 export function StatsPanel() {
   const { data, isLoading } = useQuery({
@@ -53,7 +53,108 @@ export function StatsPanel() {
               <span style={{ color: 'var(--text-muted)' }}>{count}</span>
             </div>
           ))}
+
+      <KafkaStatusSection />
     </div>
+  )
+}
+
+function KafkaStatusSection() {
+  const { data: kafka } = useQuery({
+    queryKey: ['kafka-status'],
+    queryFn: getKafkaStatus,
+    staleTime: 10_000,
+    refetchInterval: 10_000,
+  })
+
+  if (!kafka || !kafka.configured) return null
+
+  const cs = kafka.consumer?.stats ?? {}
+  const hasConsumerActivity = (cs.ingested ?? 0) + (cs.updated ?? 0) + (cs.deleted ?? 0) + (cs.skipped_duplicate ?? 0) > 0
+
+  return (
+    <>
+      <div style={{ borderTop: '1px solid var(--border)', margin: '8px 0' }} />
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
+        Kafka Sharing:
+      </div>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 2 }}>
+        <span style={{ color: 'var(--text-muted)' }}>Topic:</span>
+        <span style={{ color: 'var(--text)', fontFamily: 'monospace', fontSize: 10 }}>{kafka.topic}</span>
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 2 }}>
+        <span style={{ color: 'var(--text-muted)' }}>Producer:</span>
+        <span style={{ color: kafka.producer?.ready ? 'var(--success)' : 'var(--text-muted)' }}>
+          {kafka.producer?.ready ? '● Ready' : kafka.producer?.started ? '○ Started' : '○ Off'}
+        </span>
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 2 }}>
+        <span style={{ color: 'var(--text-muted)' }}>Consumer:</span>
+        <span style={{ color: kafka.consumer?.running ? 'var(--success)' : 'var(--text-muted)' }}>
+          {kafka.consumer?.running ? '● Listening' : '○ Off'}
+        </span>
+      </div>
+
+      {kafka.current_user?.username && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 2 }}>
+          <span style={{ color: 'var(--text-muted)' }}>User:</span>
+          <span style={{ color: kafka.current_user.allowed ? 'var(--success)' : 'var(--warning)' }}>
+            {kafka.current_user.username}
+            {kafka.current_user.allowed ? ' ✓' : ' (not allowed)'}
+          </span>
+        </div>
+      )}
+
+      {kafka.allowed_users.length > 0 && (
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+          Allowed: {kafka.allowed_users.map(u => u.username).join(', ')}
+        </div>
+      )}
+
+      {hasConsumerActivity && (
+        <>
+          <div style={{ borderTop: '1px solid var(--border)', margin: '6px 0' }} />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 2 }}>Consumer stats:</div>
+          {(cs.ingested ?? 0) > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 1 }}>
+              <span style={{ color: 'var(--success)' }}>Ingested</span>
+              <span style={{ color: 'var(--text)' }}>{cs.ingested}</span>
+            </div>
+          )}
+          {(cs.updated ?? 0) > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 1 }}>
+              <span style={{ color: 'var(--accent)' }}>Updated</span>
+              <span style={{ color: 'var(--text)' }}>{cs.updated}</span>
+            </div>
+          )}
+          {(cs.deleted ?? 0) > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 1 }}>
+              <span style={{ color: 'var(--danger)' }}>Deleted (by admin)</span>
+              <span style={{ color: 'var(--text)' }}>{cs.deleted}</span>
+            </div>
+          )}
+          {(cs.skipped_duplicate ?? 0) > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 1 }}>
+              <span style={{ color: 'var(--text-muted)' }}>Skipped (dup)</span>
+              <span style={{ color: 'var(--text)' }}>{cs.skipped_duplicate}</span>
+            </div>
+          )}
+          {(cs.skipped_unauthorized_delete ?? 0) > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 1 }}>
+              <span style={{ color: 'var(--warning)' }}>Refused deletes</span>
+              <span style={{ color: 'var(--text)' }}>{cs.skipped_unauthorized_delete}</span>
+            </div>
+          )}
+          {(cs.errors ?? 0) > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 1 }}>
+              <span style={{ color: 'var(--danger)' }}>Errors</span>
+              <span style={{ color: 'var(--text)' }}>{cs.errors}</span>
+            </div>
+          )}
+        </>
+      )}
+    </>
   )
 }
 

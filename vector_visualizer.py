@@ -98,6 +98,7 @@ TYPE_COLOURS: Dict[str, str] = {
     "event": "#DC4E4E",  # red
     "task": "#A85ED6",  # purple
     "ephemeral": "#999999",  # grey
+    "summary": "#2BB3C0",  # teal
 }
 DEFAULT_COLOUR = "#808080"
 

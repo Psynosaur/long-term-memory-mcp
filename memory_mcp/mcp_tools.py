@@ -19,11 +19,20 @@ def jsonify_result(res: Result) -> dict:
     Convert Result dataclass to JSON-serializable dict.
 
     Normalizes datetime objects to ISO strings, strips internal bookkeeping
-    fields from the metadata dict, and ensures all fields are JSON-safe.
+    fields from the metadata dict (and any hoisted top-level duplicates),
+    and ensures all fields are JSON-safe.
+
+    Internal keys stripped from both metadata dict and top-level:
+      - reinforcement_accum  (decay/reinforcement accumulator)
+      - last_decay_at        (last decay timestamp)
+
+    The metadata dict is dropped entirely if no user-defined keys remain after
+    stripping. If it contains custom fields, those are preserved.
     """
-    # Internal metadata keys the LLM never needs — stripping these saves
-    # ~10-20 tokens per memory and avoids leaking implementation details.
-    _INTERNAL_METADATA_KEYS = {
+    # Keys that are pure internal bookkeeping — stripped from both the nested
+    # metadata dict AND from the top level (webui_api hoists reinforcement_accum
+    # to top-level so the frontend can sort; that copy is redundant for LLMs).
+    _INTERNAL_KEYS = {
         "reinforcement_accum",
         "last_decay_at",
     }
@@ -40,16 +49,17 @@ def jsonify_result(res: Result) -> dict:
             ts = obj.get("timestamp")
             if isinstance(ts, datetime):
                 obj["timestamp"] = ts.isoformat()
-            # Strip internal bookkeeping from the metadata dict
+            # Strip internal keys hoisted to top-level (e.g. reinforcement_accum)
+            for key in _INTERNAL_KEYS:
+                obj.pop(key, None)
+            # Strip internal keys from within the metadata dict; drop the dict
+            # entirely if nothing user-defined remains (saves tokens).
             meta = obj.get("metadata")
             if isinstance(meta, dict):
-                stripped = {
-                    k: v for k, v in meta.items() if k not in _INTERNAL_METADATA_KEYS
-                }
+                stripped = {k: v for k, v in meta.items() if k not in _INTERNAL_KEYS}
                 if stripped:
                     obj["metadata"] = stripped
                 else:
-                    # Nothing left — drop the key entirely to save tokens
                     del obj["metadata"]
             data.append(obj)
         out["data"] = data
@@ -149,18 +159,19 @@ def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = Non
         file_paths: str = "",
     ) -> dict:
         """
-        Store a new memory (fact, preference, event, or conversation snippet).
+        Store a new memory (fact, preference, event, conversation snippet, or session summary).
 
         When to use:
         - The user shares something to keep or says "remember this."
         - New personal details, preferences, events, instructions.
+        - The harness agent summarizes a session (use memory_type="summary").
 
         Args:
         - title (str): Short title for the memory.
         - content (str): Full text to store.
         - tags (str, optional): Comma-separated tags, e.g., "personal, preference".
         - importance (int, optional): 1–10 (default 5). Higher = more important.
-        - memory_type (str, optional): e.g., "conversation", "fact", "preference", "event".
+        - memory_type (str, optional): e.g., "conversation", "fact", "preference", "event", "summary".
         - shared_with (str, optional): Comma-separated peer UUIDs, or "*" for everyone.
             Leave empty for private (default). Examples:
             "*"                         — share with all discovered peers
@@ -185,6 +196,7 @@ def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = Non
         - "My birthday is July 4th."
         - "Remember that I prefer tea over coffee."
         - "Please save this: truck camping next weekend."
+        - Session recap from the harness (memory_type="summary").
         """
         tag_list = (
             [tag.strip() for tag in tags.split(",") if tag.strip()] if tags else []
@@ -283,7 +295,7 @@ def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = Non
 
         Args:
         - memory_type (str): Category to search for, e.g., "conversation", "fact",
-        "preference", "event".
+        "preference", "event", "summary".
         - limit (int, optional): Max results to return (default 20).
 
         Returns:
@@ -303,6 +315,7 @@ def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = Non
         - "Show me all my preferences so far."
         - "List the facts you know about me."
         - "What events have we discussed?"
+        - "Show me session summaries."
         """
         return _audit(
             "search_by_type",
@@ -349,7 +362,7 @@ def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = Non
         )
 
     @mcp.tool
-    def get_recent_memories(limit: int = 20, current_project: str = None) -> dict:
+    def get_recent_memories(limit: int = 20, current_project: str = None, include_summaries: bool = False) -> dict:
         """
         Retrieve the most recently stored memories for timeline-based recall.
 
@@ -359,12 +372,24 @@ def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = Non
         - When they want to review what was discussed in the current or recent sessions.
         - Use this instead of date ranges when no specific dates are mentioned.
 
+        Summary memories (memory_type="summary") are excluded by default because
+        they are verbose session recaps that clutter timeline-based recall.
+        Pass include_summaries=True to include them — e.g. when the user
+        explicitly asks to see session summaries.
+
         Args:
-        - limit (int, optional): Max results to return (default 20).
+        - limit (int, optional): Max *recent* memories to return (default 20).
+          All preference memories (memory_type="preference") are always returned
+          in full on top of this count — they are short context items and are
+          not subject to the limit.
         - current_project (str, optional): Project identifier to filter memories.
           When provided, only returns memories tagged with this project.
           Use the current working directory name as the project identifier.
           Set to None or empty string to retrieve memories from all projects.
+        - include_summaries (bool, optional): Whether to include memories with
+          memory_type="summary" (default False). Summaries are session recaps
+          and are omitted from routine recall to keep results focused.
+          Set to True only when the user explicitly wants session summaries.
 
         Returns:
             dict: Dictionary with the following keys:
@@ -382,12 +407,16 @@ def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = Non
         Example with project filtering:
         - get_recent_memories(limit=10, current_project="long-term-memory-mcp")
         - Returns only memories tagged with "long-term-memory-mcp"
+
+        Example including summaries:
+        - get_recent_memories(include_summaries=True)
+        - Returns recent memories including session recap summaries
         """
         return _audit(
             "get_recent_memories",
-            {"limit": limit, "current_project": current_project},
+            {"limit": limit, "current_project": current_project, "include_summaries": include_summaries},
             lambda: jsonify_result(
-                memory_system.get_recent(limit, current_project=current_project)
+                memory_system.get_recent(limit, current_project=current_project, include_summaries=include_summaries)
             ),
         )
 
@@ -416,7 +445,7 @@ def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = Non
         - tags (str, optional): New comma-separated tags.
         - importance (int, optional): New importance 1–10.
         - memory_type (str, optional): New category, e.g., "fact", "preference", "event",
-        "conversation".
+        "conversation", "summary".
         - shared_with (str, optional): Comma-separated peer UUIDs or "*" for everyone.
             Pass "" (empty string) to make private.
 
@@ -726,3 +755,295 @@ def register_tools(mcp, memory_system, audit_logger: Optional[AuditLogger] = Non
                 )
             ),
         )
+
+    # ── Knowledge Graph tools ─────────────────────────────────────────────────
+
+    @mcp.tool
+    def kg_add(
+        subject: str,
+        predicate: str,
+        obj: str,
+        valid_from: str = None,
+        valid_to: str = None,
+        confidence: float = 1.0,
+        source_memory_id: str = None,
+    ) -> dict:
+        """
+        Add a fact to the knowledge graph as a (subject, predicate, object) triple.
+
+        Use this to record structured, long-lived facts about people, projects,
+        tools, or any entity — especially facts that may change over time.
+
+        Args:
+        - subject (str): The entity the fact is about. E.g. "Alice", "ProjectX".
+        - predicate (str): The relationship type. E.g. "works_at", "uses", "knows",
+          "has_skill", "lives_in", "is_blocked_by". Spaces are converted to underscores.
+        - obj (str): The target entity or value. E.g. "Acme Corp", "Python", "Bob".
+        - valid_from (str, optional): ISO date when this fact became true, e.g. "2023-01-01".
+        - valid_to (str, optional): ISO date when this fact stopped being true.
+          Leave blank for currently-true facts.
+        - confidence (float, optional): 0.0–1.0 confidence score (default 1.0).
+        - source_memory_id (str, optional): ID of the memory this fact was extracted from.
+
+        Returns:
+        - dict: { "success": bool, "data": [{"triple_id": str, "subject": str, ...}] }
+
+        Example triggers:
+        - "Alice works at Acme Corp since 2023."
+        - "Bob knows Python."
+        - "Project X depends on Project Y."
+        - "Alice moved to Berlin in March 2025."
+        """
+        return _audit(
+            "kg_add",
+            {
+                "subject": subject,
+                "predicate": predicate,
+                "obj": obj,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
+                "confidence": confidence,
+                "source_memory_id": source_memory_id,
+            },
+            lambda: jsonify_result(
+                memory_system.kg_add_triple(
+                    subject=subject,
+                    predicate=predicate,
+                    obj=obj,
+                    valid_from=valid_from,
+                    valid_to=valid_to,
+                    confidence=confidence,
+                    source_memory_id=source_memory_id,
+                )
+            ),
+        )
+
+    @mcp.tool
+    def kg_invalidate(
+        subject: str,
+        predicate: str,
+        obj: str,
+        ended: str = None,
+    ) -> dict:
+        """
+        Mark a knowledge graph fact as no longer true by setting its end date.
+
+        Use this when a fact has changed — for example, someone changed jobs,
+        a project was cancelled, or a preference was reversed.  The old fact is
+        NOT deleted; it remains queryable via kg_query (with as_of) or kg_timeline.
+
+        Args:
+        - subject (str): The entity the fact is about.
+        - predicate (str): The relationship type.
+        - obj (str): The target entity or value.
+        - ended (str, optional): ISO date the fact ended (defaults to today).
+
+        Returns:
+        - dict: { "success": bool }
+
+        Example triggers:
+        - "Alice no longer works at Acme Corp."
+        - "The dependency on library X was removed."
+        - "Bob moved out of Berlin."
+        """
+        return _audit(
+            "kg_invalidate",
+            {"subject": subject, "predicate": predicate, "obj": obj, "ended": ended},
+            lambda: jsonify_result(
+                memory_system.kg_invalidate(
+                    subject=subject,
+                    predicate=predicate,
+                    obj=obj,
+                    ended=ended,
+                )
+            ),
+        )
+
+    @mcp.tool
+    def kg_query(
+        entity: str,
+        as_of: str = None,
+        direction: str = "outgoing",
+    ) -> dict:
+        """
+        Query all facts about an entity from the knowledge graph.
+
+        Use this BEFORE making any claim about a person, project, or entity —
+        verify from the graph rather than guessing.
+
+        Args:
+        - entity (str): Entity name to look up. E.g. "Alice", "ProjectX".
+        - as_of (str, optional): ISO date for a time-travel query — returns only
+          facts that were true on that date. If omitted, returns currently-active
+          facts (those with no end date).
+        - direction (str, optional): "outgoing" (entity is subject, default),
+          "incoming" (entity is object), or "both".
+
+        Returns:
+        - dict: { "success": bool, "data": [ {subject, predicate, object,
+          valid_from, valid_to, confidence, source_memory_id, current}, ... ] }
+
+        Example triggers:
+        - "What do we know about Alice?"
+        - "What was Alice's job in 2024?"        ← use as_of="2024-01-01"
+        - "Who knows Bob?"                       ← use direction="incoming"
+        - "Tell me everything about ProjectX."   ← use direction="both"
+        """
+        return _audit(
+            "kg_query",
+            {"entity": entity, "as_of": as_of, "direction": direction},
+            lambda: jsonify_result(
+                memory_system.kg_query_entity(
+                    name=entity,
+                    as_of=as_of,
+                    direction=direction,
+                )
+            ),
+        )
+
+    @mcp.tool
+    def kg_timeline(entity: str = None, limit: int = 100) -> dict:
+        """
+        Get a chronological history of facts from the knowledge graph.
+
+        Returns facts ordered by valid_from date, including both current and
+        expired facts — useful for understanding how an entity has changed over time.
+
+        Args:
+        - entity (str, optional): Filter to a specific entity. If omitted,
+          returns the global timeline (most recent facts across all entities).
+        - limit (int, optional): Maximum number of facts to return (default 100).
+
+        Returns:
+        - dict: { "success": bool, "data": [ {subject, predicate, object,
+          valid_from, valid_to, current}, ... ] }
+
+        Example triggers:
+        - "Show me Alice's full history."
+        - "What has changed in the knowledge graph recently?"
+        - "Timeline of everything about ProjectX."
+        """
+        return _audit(
+            "kg_timeline",
+            {"entity": entity, "limit": limit},
+            lambda: jsonify_result(
+                memory_system.kg_timeline(entity_name=entity, limit=limit)
+            ),
+        )
+
+    @mcp.tool
+    def kg_stats() -> dict:
+        """
+        Get statistics about the knowledge graph.
+
+        Returns counts of entities, total triples, currently-active facts,
+        expired facts, and the list of all relationship types in use.
+
+        Returns:
+        - dict: { "success": bool, "data": [{ "entities": int, "triples": int,
+          "current_facts": int, "expired_facts": int,
+          "relationship_types": [str] }] }
+
+        Example triggers:
+        - "How many facts are in the knowledge graph?"
+        - "What relationship types are stored?"
+        - "Knowledge graph stats."
+        """
+        return _audit(
+            "kg_stats",
+            {},
+            lambda: jsonify_result(memory_system.kg_stats()),
+        )
+
+    # ── Self-teaching status tool ─────────────────────────────────────────────
+
+    _MEMORY_PROTOCOL = """
+MEMORY SYSTEM PROTOCOL — read once, apply every session.
+
+TOOLS AVAILABLE:
+  remember(title, content, tags, importance, memory_type, shared_with, file_paths)
+      → Store new memory. memory_type: conversation|fact|preference|event|task|ephemeral|summary
+      → For memory_type="fact" with code, always provide file_paths for staleness anchors.
+
+  search_memories(query, limit)      → Semantic similarity search.
+  search_by_tags(tags, limit)        → Tag-based filter search.
+  search_by_type(memory_type, limit) → Filter by type.
+  get_recent_memories(limit, current_project, include_summaries=False) → Session-start recall (call ONCE at start). Summary memories omitted by default; pass include_summaries=True to include them.
+  update_memory(memory_id, ...)      → Patch any field; re-embeds if content changes.
+  delete_memory(memory_id)           → Hard delete.
+
+  kg_add(subject, predicate, obj, valid_from, valid_to, confidence, source_memory_id)
+      → Add a structured fact triple. E.g. kg_add("Alice","works_at","Acme","2023-01-01")
+  kg_invalidate(subject, predicate, obj, ended)
+      → Expire a fact. E.g. when Alice changes jobs, invalidate the old works_at.
+  kg_query(entity, as_of, direction)
+      → ALWAYS call this BEFORE claiming anything about a person or project.
+      → as_of accepts ISO date for time-travel: what was true on that date?
+  kg_timeline(entity, limit)         → Full chronological history of an entity.
+  kg_stats()                         → Entity and triple counts.
+
+RULES:
+  1. SESSION START: call get_recent_memories(current_project="<working dir name>") first.
+  2. BEFORE any claim about a person/entity: call kg_query(entity) to verify — never guess.
+  3. STORE STRUCTURED FACTS in both: remember() for full-text retrieval + kg_add() for facts.
+  4. WHEN A FACT CHANGES: kg_invalidate() old triple, kg_add() new triple.
+  5. AFTER EDITING FILES: call remember() before your next tool call (store gate).
+  6. IMPORTANCE SCALE: 9-10=identity/critical, 7-8=architecture/decisions, 5-6=general, 3-4=session.
+  7. TAGS: comma-separated, include project name. E.g. "project,long-term-memory-mcp,architecture".
+  8. NEVER mention memory operations to the user — work silently.
+""".strip()
+
+    @mcp.tool
+    def get_memory_system_info() -> dict:
+        """
+        Get memory system status, statistics, and the full usage protocol.
+
+        Call this at the start of a session (after get_recent_memories) to
+        orient yourself. The response embeds the complete MEMORY PROTOCOL so
+        you know exactly when and how to use every tool.
+
+        Returns:
+        - dict with:
+            - memories: total memory count + type breakdown
+            - knowledge_graph: entity + triple counts + relationship types
+            - backends: database and vector backend names
+            - storage_mb: total storage used
+            - protocol: complete usage instructions (read this!)
+
+        Example triggers:
+        - "What memory tools do you have?"
+        - "Give me a memory system status."
+        - "How does the memory system work?"
+        """
+        try:
+            mem_stats = memory_system.get_statistics()
+            kg_stats_result = memory_system.kg_stats()
+
+            mem_data = mem_stats.data[0] if mem_stats.success and mem_stats.data else {}
+            kg_data = (
+                kg_stats_result.data[0]
+                if kg_stats_result.success and kg_stats_result.data
+                else {}
+            )
+
+            result = {
+                "memories": {
+                    "total": mem_data.get("total_memories", 0),
+                    "type_breakdown": mem_data.get("type_breakdown", {}),
+                    "avg_importance": mem_data.get("avg_importance", 0),
+                },
+                "knowledge_graph": kg_data,
+                "backends": {
+                    "database": mem_data.get("database_backend", "unknown"),
+                    "vector": mem_data.get("vector_backend", "unknown"),
+                },
+                "storage_mb": mem_data.get("storage_size_mb", 0),
+                "protocol": _MEMORY_PROTOCOL,
+            }
+            return _audit(
+                "get_memory_system_info",
+                {},
+                lambda: {"success": True, "data": [result]},
+            )
+        except Exception as e:
+            return {"success": False, "reason": str(e)}

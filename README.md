@@ -1,4 +1,4 @@
-# Robust Long-Term Memory MCP
+# Robust Long-Term Memory MCP <!-- gate2 test -->
 
 A persistent memory system for AI companions with pluggable storage backends, human-like decay/reinforcement dynamics, and seamless cross-session recall.
 
@@ -15,6 +15,7 @@ Detached fork of [Rotoslider/long-term-memory-mcp](https://github.com/Rotoslider
 - **Desktop GUI** (`memory_manager_gui.py`): browse, search, migrate, compare databases
 - **3D Vector Visualizer** (`vector_visualizer.py`): interactive Plotly/Dash scatter of embeddings (PCA/t-SNE/UMAP)
 - **System Tray App** (`tray_app.py`): dock/taskbar icon to manage the MCP server
+- **Kafka memory sharing** (`--kafka-sharing`): team-wide memory governance via Kafka — produce, sync, and centrally delete memories across LTM nodes
 - **OpenCode enforcement plugin**: gates all tools until recall and storage rules are met
 
 ---
@@ -36,6 +37,7 @@ pip install '.[pgvector]'       # PostgreSQL + pgvector
 pip install '.[visualizer]'     # Plotly/Dash 3D visualizer
 pip install '.[tray]'           # System tray app
 pip install '.[tensorboard]'    # TensorBoard projector
+pip install '.[kafka]'          # Kafka sharing (confluent-kafka)
 pip install "huggingface_hub[hf_xet]"  # faster model downloads
 ```
 
@@ -53,6 +55,8 @@ long-term-memory-mcp/
 ├── memory_mcp/                      # Core package
 │   ├── memory_system.py             # RobustMemorySystem
 │   ├── mcp_tools.py                 # MCP tool registration
+│   ├── kafka_producer.py            # Kafka producer (--kafka-sharing)
+│   ├── kafka_consumer.py            # Kafka consumer (--kafka-sharing)
 │   ├── database_backends/           # SQLite / PostgreSQL
 │   └── vector_backends/             # ChromaDB / pgvector
 ├── opencode/
@@ -60,6 +64,8 @@ long-term-memory-mcp/
 │   └── AGENTS.md                    # OpenCode global system prompt
 ├── install_opencode.sh              # Installs plugin + AGENTS.md (macOS/Linux)
 ├── install_opencode.ps1             # Installs plugin + AGENTS.md (Windows)
+├── install_kafka.sh                 # Kafka sharing setup (macOS/Linux)
+├── install_kafka.ps1                # Kafka sharing setup (Windows)
 ├── mcp-config-examples.json         # 15+ client config examples
 ├── docker-compose.yml               # pgvector Docker service
 └── pyproject.toml                   # Package config + optional extras
@@ -146,6 +152,8 @@ See `mcp-config-examples.json` for 15+ client config examples.
 | `--pg-database` | `PGDATABASE` / `memories` | Database name |
 | `--pg-user` | `PGUSER` / `memory_user` | User |
 | `--pg-password` | `PGPASSWORD` / `memory_pass` | Password |
+| `--kafka-sharing` | off | Enable Kafka memory sharing (producer + consumer) |
+| `--network-sharing` | off | Enable LAN memory sharing via mDNS |
 
 All `--pg-*` args fall back to the corresponding `PG*` env vars.
 
@@ -255,7 +263,7 @@ python vector_visualizer.py --vector-backend pgvector
 
 **Features:** semantic search with similarity highlighting, click-to-expand word vectors, Word Paths (shared vocabulary lines), searchable tag dropdown, hover labels, dark theme, camera preservation across updates.
 
-**Colour legend (by type):** blue=conversation, green=fact, amber=preference, red=event, purple=task, grey=ephemeral.
+**Colour legend (by type):** blue=conversation, green=fact, amber=preference, red=event, purple=task, grey=ephemeral, teal=summary.
 
 ---
 
@@ -281,6 +289,59 @@ python tensorboard_visualizer.py --vector-backend pgvector
 ```
 
 Exports `tensors.tsv`, `metadata.tsv`, `projector_config.pbtxt`. Metadata: title, type, importance, tags, timestamp, ID. Supports both backends.
+
+---
+
+## Kafka Memory Sharing
+
+Team-wide memory governance over Kafka. Opt-in via `--kafka-sharing` (CLI, tray app toggle, or `.env`).
+
+### Setup
+
+Run the install script (installs deps, creates `.env`, shows your identity):
+
+```bash
+bash install_kafka.sh           # macOS / Linux
+.\install_kafka.ps1             # Windows
+```
+
+Or manually:
+
+```bash
+pip install '.[kafka]'          # or: pip install confluent-kafka
+cp .env.example .env            # fill in KAFKA_* credentials
+# Add yourself to ALLOWED_KAFKA_USERS (username:node_uuid from data/identity.json)
+```
+
+Start with Kafka enabled:
+
+```bash
+python server.py --transport http --kafka-sharing
+python tray_app.py --kafka-sharing          # or toggle "Kafka Sharing" in the tray menu
+```
+
+### How it works
+
+| Event | Key | Consumer action |
+|---|---|---|
+| `remember` | `memory_id` | Check `content_hash` — skip if already in vector store, otherwise ingest |
+| `update` | `content_hash` | Check new hash — skip if exists, otherwise update local copy or ingest |
+| `delete` | `memory_id` | Validate source user is in `ALLOWED_KAFKA_USERS`, then remove from SQLite + vectors |
+
+- **No re-embedding**: every message includes `content_hash` — consumers skip content they already have
+- **Governance**: only users in `ALLOWED_KAFKA_USERS` can produce; delete events are only honoured from trusted sources
+- **Hot-reload**: update `ALLOWED_KAFKA_USERS` in `.env` and hit `POST /api/v1/kafka/reload-users` — no restart needed
+
+### WebUI
+
+When Kafka is active, the WebUI shows:
+- **StatsPanel**: producer/consumer status, topic, allowed users, live consumer stats
+- **MemoryDetail**: 📡 Produce and 🗑️ Remove from Network buttons
+- **MemoryList**: checkbox selection for batch produce/remove operations
+
+### Tray App
+
+The system tray menu includes a **Kafka Sharing** toggle (same pattern as Network Sharing). Toggling it adds/removes `--kafka-sharing` from the server args and restarts automatically.
 
 ---
 
@@ -355,6 +416,15 @@ Auto-created every 24h or after 100 new memories; last 10 kept. Each backup incl
 ---
 
 ## What's New
+
+**Kafka Memory Sharing**
+- `kafka_producer.py` + `kafka_consumer.py`: SCRAM-SHA-512 Kafka producer/consumer for team memory governance
+- Three event types: remember, update, delete (RPC)
+- `ALLOWED_KAFKA_USERS` access control in `.env`
+- Consumer-side content_hash dedup (no re-embedding)
+- WebUI: produce/remove-from-network buttons (single + batch), live consumer stats
+- Tray app: "Kafka Sharing" toggle menu item
+- Opt-in via `--kafka-sharing` flag
 
 **OpenCode Enforcement Plugin**
 - `opencode/plugin/long-term-memory.ts`: universal tool gate, store gate, system prompt injection, compaction hook, idle warning

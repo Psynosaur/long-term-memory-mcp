@@ -97,15 +97,17 @@ export const LongTermMemoryPlugin: Plugin = async ({
 You have a persistent memory system via MCP tools prefixed \`long-term-memory_\`.
 
 ### SESSION START (first action of the entire session — once only)
-Call this exactly once at the very start of the session — NO EXCEPTIONS:
+Call ALL THREE in parallel — NO EXCEPTIONS:
   long-term-memory_get_recent_memories(limit=5, current_project="${projectName}")
+  long-term-memory_search_by_tags(tags="preference,${projectName}")
+  long-term-memory_search_by_tags(tags="preference,all-projects")
 
 You WILL be blocked from using ANY tool (bash, read, glob, grep, edit, write, etc.) if you skip this step.
 
-Then inspect the results:
-- If the returned memories already include project-specific context (tagged "${projectName}" or "preference"), you're done — proceed with work.
-- If the results look sparse or lack project context, follow up with ONE targeted search:
-    long-term-memory_search_by_tags(tags="${projectName},preference")
+The two tag queries cover different scopes:
+- \`"preference,${projectName}"\` — preferences and facts scoped to THIS project
+- \`"preference,all-projects"\` — global critical preferences (never-commit, etc.) that apply everywhere
+Never use \`search_by_tags(tags="preference,project")\` — "project" matches ALL projects and produces a response too large to read.
 
 After the session-start recall, the hard gate is permanently satisfied for this session.
 Do NOT call get_recent_memories again on every subsequent turn.
@@ -149,7 +151,7 @@ Before calling remember(), collect staleness anchors and embed them in the conte
    These are compared at recall time to produce a code-aware staleness score.
    Supports: Python, TypeScript, TSX, JavaScript, Go, Rust, Java, Kotlin, C/C++.
 
-Skip steps 1-2 for memory_type=preference, event, conversation — not relevant.
+Skip steps 1-2 for memory_type=preference, event, conversation, summary — not relevant.
 
 ### CONTRADICTION WARNING
 If remember() returns data[0].warning == "potential_contradiction":
@@ -163,6 +165,7 @@ If remember() returns data[0].warning == "potential_contradiction":
 - Architecture decisions (importance 7, type "fact")
 - Bug fixes and solutions (importance 6, type "fact")
 - Project structure insights (importance 7, type "fact")
+- Session summaries from the harness (importance 5-7, type "summary")
 
 ### ABSOLUTE RULES
 - NEVER create .md files for summaries — use memory tools instead
@@ -208,10 +211,10 @@ If remember() returns data[0].warning == "potential_contradiction":
         log("Blocking tool — session recall not done", { tool: input.tool });
         throw new Error(
           `[long-term-memory] You must recall memories once at the start of the session before using any tools.\n` +
-          `Call this first (your very first action this session):\n` +
+          `Call ALL THREE in parallel first (your very first action this session):\n` +
           `  long-term-memory_get_recent_memories(limit=5, current_project="${projectName}")\n` +
-          `If the results don't include project memories, follow up with:\n` +
-          `  long-term-memory_search_by_tags(tags="${projectName},preference")\n` +
+          `  long-term-memory_search_by_tags(tags="preference,${projectName}")\n` +
+          `  long-term-memory_search_by_tags(tags="preference,all-projects")\n` +
           `Then retry. This gate is satisfied for the rest of the session once fired.`
         );
       }
@@ -304,7 +307,7 @@ Memory tool usage this session:
 
 MANDATORY on resume after compaction:
 1. The session-start recall gate fires ONCE per session. Since this is a compaction (same session),
-   the gate is ${state.recalledThisSession ? "ALREADY SATISFIED — do NOT call get_recent_memories again unless you need fresh context" : "NOT YET SATISFIED — call get_recent_memories(limit=5, current_project=\"" + projectName + "\") before any other tool"}.
+   the gate is ${state.recalledThisSession ? "ALREADY SATISFIED — do NOT call get_recent_memories again unless you need fresh context" : "NOT YET SATISFIED — call ALL THREE in parallel before any other tool:\n   long-term-memory_get_recent_memories(limit=5, current_project=\"" + projectName + "\")\n   long-term-memory_search_by_tags(tags=\"preference," + projectName + "\")\n   long-term-memory_search_by_tags(tags=\"preference,all-projects\")"}.
 2. If "Prev turn edit no-store" is YES above, call long-term-memory_remember immediately.
 3. NEVER create .md files for summaries — use memory tools only.
 4. If session recall gate is not satisfied, ALL tools are BLOCKED until it is done.

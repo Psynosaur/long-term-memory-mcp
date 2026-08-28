@@ -2,7 +2,7 @@ import { useRef } from 'react'
 import { useMemoryStore } from '@/store/memoryStore'
 import { Search } from 'lucide-react'
 
-const TYPES = ['', 'conversation', 'fact', 'preference', 'event', 'task', 'ephemeral']
+const TYPES = ['', 'conversation', 'fact', 'preference', 'event', 'task', 'ephemeral', 'summary']
 const SORT_OPTIONS = [
   { value: 'importance DESC, timestamp DESC', label: 'Importance ↓ / Date ↓' },
   { value: 'timestamp DESC', label: 'Date ↓' },

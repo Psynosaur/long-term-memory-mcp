@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   useReactTable,
   getCoreRowModel,
@@ -7,11 +7,12 @@ import {
   flexRender,
   createColumnHelper,
   type SortingState,
+  type RowSelectionState,
 } from '@tanstack/react-table'
 import { ArrowUp, ArrowDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react'
 import type { Memory } from '@/api/types'
 import { useMemoryStore, PAGE_SIZES } from '@/store/memoryStore'
-import { getMemory } from '@/api/client'
+import { getMemory, kafkaProduce, kafkaDeleteBroadcast, getKafkaStatus } from '@/api/client'
 
 const col = createColumnHelper<Memory>()
 
@@ -37,11 +38,68 @@ export function MemoryList({ memories, isLoading, total }: MemoryListProps) {
   const { selectedId, setSelectedId, setDraft, setIsNewMemory, page, setPage, pageSize, setPageSize } = useMemoryStore()
   const qc = useQueryClient()
   const [sorting, setSorting] = useState<SortingState>([])
+  const [rowSelection, setRowSelection] = useState<RowSelectionState>({})
+  const [batchMsg, setBatchMsg] = useState<string | null>(null)
+
+  const { data: kafkaStatus } = useQuery({
+    queryKey: ['kafka-status'],
+    queryFn: getKafkaStatus,
+    staleTime: 30_000,
+  })
+
+  const batchProduceMut = useMutation({
+    mutationFn: (ids: string[]) => kafkaProduce({ memory_ids: ids, event: 'remember' }),
+    onSuccess: (res) => {
+      setBatchMsg(`✓ Produced ${res.produced} memor${res.produced === 1 ? 'y' : 'ies'}`)
+      setRowSelection({})
+      setTimeout(() => setBatchMsg(null), 3000)
+    },
+    onError: (e: Error) => { setBatchMsg(`✗ ${e.message}`); setTimeout(() => setBatchMsg(null), 5000) },
+  })
+
+  const batchDeleteNetworkMut = useMutation({
+    mutationFn: (ids: string[]) => kafkaDeleteBroadcast({ memory_ids: ids, reason: 'Batch removal by admin via WebUI' }),
+    onSuccess: (res) => {
+      setBatchMsg(`✓ Delete broadcast sent for ${res.produced} memor${res.produced === 1 ? 'y' : 'ies'}`)
+      setRowSelection({})
+      setTimeout(() => setBatchMsg(null), 3000)
+    },
+    onError: (e: Error) => { setBatchMsg(`✗ ${e.message}`); setTimeout(() => setBatchMsg(null), 5000) },
+  })
+
+  const selectedIds = Object.keys(rowSelection)
+    .filter((k) => rowSelection[k])
+    .map((idx) => memories[Number(idx)]?.id)
+    .filter(Boolean)
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   const columns = useMemo(
     () => [
+      ...(kafkaStatus?.ready
+        ? [
+            col.display({
+              id: 'select',
+              size: 32,
+              header: ({ table }) => (
+                <input
+                  type="checkbox"
+                  checked={table.getIsAllPageRowsSelected()}
+                  onChange={table.getToggleAllPageRowsSelectedHandler()}
+                  title="Select all"
+                />
+              ),
+              cell: ({ row }) => (
+                <input
+                  type="checkbox"
+                  checked={row.getIsSelected()}
+                  onChange={row.getToggleSelectedHandler()}
+                  onClick={(e) => e.stopPropagation()}
+                />
+              ),
+            }),
+          ]
+        : []),
       col.accessor('title', {
         header: 'Title',
         size: 320,
@@ -93,16 +151,18 @@ export function MemoryList({ memories, isLoading, total }: MemoryListProps) {
         },
       }),
     ],
-    [],
+    [kafkaStatus?.ready],
   )
 
   const table = useReactTable({
     data: memories,
     columns,
-    state: { sorting },
+    state: { sorting, rowSelection },
     onSortingChange: setSorting,
+    onRowSelectionChange: setRowSelection,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
+    enableRowSelection: !!kafkaStatus?.ready,
   })
 
   // Fetch the full row (with updated_at, last_accessed) when a memory is clicked.
@@ -152,6 +212,37 @@ export function MemoryList({ memories, isLoading, total }: MemoryListProps) {
             </span>
           )}
         </span>
+
+        {/* Batch Kafka actions */}
+        {kafkaStatus?.ready && selectedIds.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+            <span style={{ color: 'var(--text-muted)' }}>{selectedIds.length} selected</span>
+            <button
+              onClick={() => batchProduceMut.mutate(selectedIds)}
+              disabled={batchProduceMut.isPending}
+              style={{ fontSize: 11 }}
+            >
+              {batchProduceMut.isPending ? '📡…' : '📡 Produce'}
+            </button>
+            <button
+              className="btn-danger"
+              onClick={() => {
+                if (window.confirm(`Broadcast DELETE for ${selectedIds.length} memor${selectedIds.length === 1 ? 'y' : 'ies'} to all team nodes?`)) {
+                  batchDeleteNetworkMut.mutate(selectedIds)
+                }
+              }}
+              disabled={batchDeleteNetworkMut.isPending}
+              style={{ fontSize: 11 }}
+            >
+              {batchDeleteNetworkMut.isPending ? '🗑️…' : '🗑️ Remove from Network'}
+            </button>
+          </div>
+        )}
+        {batchMsg && (
+          <span style={{ fontSize: 11, color: batchMsg.startsWith('✓') ? 'var(--success)' : 'var(--danger)' }}>
+            {batchMsg}
+          </span>
+        )}
 
         {/* Page controls */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>

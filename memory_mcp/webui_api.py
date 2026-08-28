@@ -64,6 +64,18 @@ class MemoryUpdate(BaseModel):
     shared_with: Optional[List[str]] = None
 
 
+class KafkaProduceRequest(BaseModel):
+    """Request to produce one or more memories to Kafka."""
+    memory_ids: List[str]
+    event: str = "remember"  # "remember" | "update"
+
+
+class KafkaDeleteBroadcast(BaseModel):
+    """Request to broadcast delete instructions to all consuming LTM nodes."""
+    memory_ids: List[str]
+    reason: str = ""
+
+
 class MigrateRequest(BaseModel):
     direction: str  # "sqlite_to_sqlite" | "sqlite_to_pg" | "pg_to_sqlite"
     # Used for sqlite_to_sqlite direction
@@ -97,6 +109,28 @@ class TestConnectionRequest(BaseModel):
     pg_database: str = "memories"
     pg_user: str = "memory_user"
     pg_password: str = ""
+
+
+class KgTripleCreate(BaseModel):
+    subject: str
+    predicate: str
+    obj: str
+    valid_from: Optional[str] = None
+    valid_to: Optional[str] = None
+    confidence: float = 1.0
+    source_memory_id: Optional[str] = None
+
+
+class KgInvalidateRequest(BaseModel):
+    subject: str
+    predicate: str
+    obj: str
+    ended: Optional[str] = None
+
+
+class ToolCallRequest(BaseModel):
+    tool: str
+    args: Dict[str, Any] = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -165,6 +199,8 @@ def create_app(
     memory_system,
     identity=None,
     sharing_mgr=None,
+    kafka_producer=None,
+    kafka_consumer=None,
 ) -> FastAPI:
     """
     Create and configure the FastAPI WebUI application.
@@ -173,6 +209,8 @@ def create_app(
         memory_system: Shared RobustMemorySystem instance (embedding model already loaded).
         identity: Optional NodeIdentity instance for /api/v1/identity.
         sharing_mgr: Optional NetworkSharingManager for /api/v1/peers.
+        kafka_producer: Optional KafkaMemoryProducer for topic-based memory sharing.
+        kafka_consumer: Optional KafkaMemoryConsumer for ingesting shared memories.
 
     Returns:
         Configured FastAPI application ready to be served by uvicorn.
@@ -438,6 +476,139 @@ def create_app(
             raise HTTPException(status_code=status, detail=result.reason)
         return _result_to_response(result)
 
+    # ── /api/v1/kafka — Topic-based memory sharing ────────────────────────────
+
+    @app.get("/api/v1/kafka/status")
+    def kafka_status():
+        """Return Kafka producer and consumer status."""
+        producer_status = {
+            "configured": False,
+            "started": False,
+            "ready": False,
+        }
+        if kafka_producer is not None:
+            producer_status = {
+                "configured": kafka_producer.is_configured,
+                "started": kafka_producer._started,
+                "ready": kafka_producer.is_ready,
+            }
+
+        consumer_status = {
+            "configured": False,
+            "running": False,
+            "stats": {},
+        }
+        if kafka_consumer is not None:
+            consumer_status = {
+                "configured": kafka_consumer.is_configured,
+                "running": kafka_consumer.is_running,
+                "stats": kafka_consumer.stats,
+            }
+
+        return {
+            "configured": (producer_status["configured"] or consumer_status["configured"]),
+            "producer": producer_status,
+            "consumer": consumer_status,
+            "topic": kafka_producer.topic if kafka_producer else (
+                kafka_consumer.topic if kafka_consumer else None
+            ),
+            "allowed_users": [
+                {"username": u, "node_uuid": n}
+                for u, n in (kafka_producer.allowed_users if kafka_producer else [])
+            ],
+            "current_user": {
+                "username": identity.username if identity else None,
+                "node_uuid": identity.node_uuid if identity else None,
+                "allowed": kafka_producer.is_user_allowed() if kafka_producer else False,
+            },
+            # Backward compat: keep these top-level for the frontend
+            "started": producer_status.get("started", False),
+            "ready": producer_status.get("ready", False),
+        }
+
+    @app.post("/api/v1/kafka/produce")
+    def kafka_produce(body: KafkaProduceRequest):
+        """Produce selected memories to the Kafka topic.
+
+        Fetches each memory by ID, then produces it with the appropriate
+        key strategy (mem_id for remember, content_hash for update).
+        """
+        if kafka_producer is None or not kafka_producer.is_ready:
+            raise HTTPException(
+                status_code=503,
+                detail="Kafka producer not available or user not authorized",
+            )
+
+        memories = []
+        not_found = []
+        for mid in body.memory_ids:
+            cursor = memory_system.db.execute(
+                "SELECT id, title, content, timestamp, tags, importance, "
+                "memory_type, content_hash, token_count, shared_with "
+                "FROM memories WHERE id = ?",
+                (mid,),
+            )
+            row = cursor.fetchone()
+            if row:
+                memories.append(dict(row))
+            else:
+                not_found.append(mid)
+
+        if not memories:
+            raise HTTPException(status_code=404, detail="No matching memories found")
+
+        result = kafka_producer.produce_batch(memories, event=body.event)
+        result["not_found"] = not_found
+        return result
+
+    @app.post("/api/v1/kafka/delete-broadcast")
+    def kafka_delete_broadcast(body: KafkaDeleteBroadcast):
+        """Broadcast delete instructions to all consuming LTM nodes.
+
+        This is an RPC-style event: every consumer that receives it will
+        remove the specified memories from their local store, provided
+        the source user is in their ALLOWED_KAFKA_USERS list.
+        """
+        if kafka_producer is None or not kafka_producer.is_ready:
+            raise HTTPException(
+                status_code=503,
+                detail="Kafka producer not available or user not authorized",
+            )
+
+        items = []
+        not_found = []
+        for mid in body.memory_ids:
+            cursor = memory_system.db.execute(
+                "SELECT id, title, content_hash FROM memories WHERE id = ?",
+                (mid,),
+            )
+            row = cursor.fetchone()
+            if row:
+                items.append(dict(row))
+            else:
+                not_found.append(mid)
+
+        if not items:
+            raise HTTPException(status_code=404, detail="No matching memories found")
+
+        result = kafka_producer.produce_delete_batch(items, reason=body.reason)
+        result["not_found"] = not_found
+        return result
+
+    @app.post("/api/v1/kafka/reload-users")
+    def kafka_reload_users():
+        """Hot-reload ALLOWED_KAFKA_USERS from .env without restarting."""
+        if kafka_producer is None:
+            raise HTTPException(status_code=503, detail="Kafka producer not configured")
+        kafka_producer.reload_allowed_users()
+        return {
+            "reloaded": True,
+            "allowed_users": [
+                {"username": u, "node_uuid": n}
+                for u, n in kafka_producer.allowed_users
+            ],
+        }
+
     # ── /api/v1/backup ────────────────────────────────────────────────────────
 
     @app.post("/api/v1/backup")
@@ -574,6 +745,43 @@ def create_app(
         result = memory_system.rebuild_vector_index()
         return _require_success(result)
 
+    class EmbedRequest(BaseModel):
+        texts: List[str] = Field(..., description="One or more texts to embed")
+        query: bool = Field(False, description="Apply query prefix if the model uses one")
+
+    @app.post("/api/v1/embed")
+    def embed_texts(body: EmbedRequest):
+        """Embed one or more texts using the loaded embedding model.
+
+        Returns a list of float32 vectors, one per input text.
+        Uses the same model and query prefix as the memory system.
+        Intended for external tools (e.g. CKE) to reuse the already-loaded model.
+        """
+        try:
+            model = memory_system.embedding_model
+            if model is None:
+                raise HTTPException(status_code=503, detail="Embedding model not loaded")
+
+            from memory_mcp.config import EMBEDDING_MODEL_CONFIG
+            query_prefix = EMBEDDING_MODEL_CONFIG.get("query_prefix", "").strip() if body.query else ""
+
+            texts = [query_prefix + t if query_prefix else t for t in body.texts]
+            embeddings = model.encode(texts, normalize_embeddings=True).tolist()
+
+            return {
+                "success": True,
+                "data": {
+                    "embeddings": embeddings,
+                    "model": EMBEDDING_MODEL_CONFIG["model_name"],
+                    "dimensions": EMBEDDING_MODEL_CONFIG["dimensions"],
+                    "count": len(embeddings),
+                },
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     # ── /api/v1/migrate ───────────────────────────────────────────────────────
 
     @app.post("/api/v1/migrate/test-connection")
@@ -693,6 +901,229 @@ def create_app(
         except HTTPException:
             raise
         except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ── /api/v1/kg — Knowledge Graph ─────────────────────────────────────────
+
+    @app.get("/api/v1/kg/stats")
+    def kg_stats():
+        """Knowledge graph statistics: entity/triple counts and relationship types."""
+        result = memory_system.kg_stats()
+        return _require_success(result)
+
+    @app.get("/api/v1/kg/timeline")
+    def kg_timeline(
+        entity: Optional[str] = None, limit: int = Query(default=100, ge=1, le=500)
+    ):
+        """Chronological fact history, optionally filtered to one entity."""
+        result = memory_system.kg_timeline(entity_name=entity, limit=limit)
+        return _require_success(result)
+
+    @app.get("/api/v1/kg/query")
+    def kg_query(
+        entity: str,
+        as_of: Optional[str] = None,
+        direction: str = Query(
+            default="outgoing", pattern="^(outgoing|incoming|both)$"
+        ),
+    ):
+        """Query all facts for an entity, with optional time-travel via as_of."""
+        result = memory_system.kg_query_entity(
+            name=entity, as_of=as_of, direction=direction
+        )
+        return _require_success(result)
+
+    @app.post("/api/v1/kg/triples", status_code=201)
+    def kg_add_triple(body: KgTripleCreate):
+        """Add a new fact triple to the knowledge graph."""
+        result = memory_system.kg_add_triple(
+            subject=body.subject,
+            predicate=body.predicate,
+            obj=body.obj,
+            valid_from=body.valid_from,
+            valid_to=body.valid_to,
+            confidence=body.confidence,
+            source_memory_id=body.source_memory_id,
+        )
+        return _require_success(result, status_code=422)
+
+    @app.post("/api/v1/kg/invalidate")
+    def kg_invalidate(body: KgInvalidateRequest):
+        """Mark an open triple as expired."""
+        result = memory_system.kg_invalidate(
+            subject=body.subject,
+            predicate=body.predicate,
+            obj=body.obj,
+            ended=body.ended,
+        )
+        return _require_success(result)
+
+    # ── /api/v1/tools — direct MCP tool invocation ───────────────────────────
+
+    def _invoke_tool(tool: str, args: Dict[str, Any]) -> Any:
+        """Dispatch a named tool call to the memory system."""
+        ms = memory_system
+        t = tool.lower()
+
+        if t == "remember":
+            tags = [x.strip() for x in args.get("tags", "").split(",") if x.strip()]
+            sw = [
+                x.strip() for x in args.get("shared_with", "").split(",") if x.strip()
+            ]
+            fp = [x.strip() for x in args.get("file_paths", "").split(",") if x.strip()]
+            return ms.remember(
+                title=args["title"],
+                content=args["content"],
+                tags=tags,
+                importance=int(args.get("importance", 5)),
+                memory_type=args.get("memory_type", "conversation"),
+                shared_with=sw,
+                file_paths=fp,
+            )
+        elif t == "search_memories":
+            return ms.search_semantic(args.get("query", ""), int(args.get("limit", 10)))
+        elif t == "search_by_type":
+            return ms.search_structured(
+                memory_type=args.get("memory_type"), limit=int(args.get("limit", 20))
+            )
+        elif t == "search_by_tags":
+            tags = [x.strip() for x in args.get("tags", "").split(",") if x.strip()]
+            return ms.search_structured(tags=tags, limit=int(args.get("limit", 20)))
+        elif t == "get_recent_memories":
+            return ms.get_recent(
+                int(args.get("limit", 20)), current_project=args.get("current_project")
+            )
+        elif t == "update_memory":
+            tags = (
+                [x.strip() for x in args["tags"].split(",") if x.strip()]
+                if "tags" in args and args["tags"] is not None
+                else None
+            )
+            sw = (
+                [x.strip() for x in args["shared_with"].split(",") if x.strip()]
+                if "shared_with" in args and args["shared_with"] is not None
+                else None
+            )
+            return ms.update_memory(
+                memory_id=args["memory_id"],
+                title=args.get("title"),
+                content=args.get("content"),
+                tags=tags,
+                importance=args.get("importance"),
+                memory_type=args.get("memory_type"),
+                shared_with=sw,
+            )
+        elif t == "delete_memory":
+            return ms.delete_memory(args["memory_id"])
+        elif t == "get_memory_stats":
+            return ms.get_statistics()
+        elif t == "create_backup":
+            return ms.create_backup()
+        elif t == "search_by_date_range":
+            return ms.search_structured(
+                date_from=args.get("date_from"),
+                date_to=args.get("date_to"),
+                limit=int(args.get("limit", 50)),
+            )
+        elif t == "rebuild_vectors":
+            return ms.rebuild_vector_index()
+        elif t == "kg_add":
+            return ms.kg_add_triple(
+                subject=args["subject"],
+                predicate=args["predicate"],
+                obj=args["obj"],
+                valid_from=args.get("valid_from"),
+                valid_to=args.get("valid_to"),
+                confidence=float(args.get("confidence", 1.0)),
+                source_memory_id=args.get("source_memory_id"),
+            )
+        elif t == "kg_invalidate":
+            return ms.kg_invalidate(
+                subject=args["subject"],
+                predicate=args["predicate"],
+                obj=args["obj"],
+                ended=args.get("ended"),
+            )
+        elif t == "kg_query":
+            return ms.kg_query_entity(
+                name=args["entity"],
+                as_of=args.get("as_of"),
+                direction=args.get("direction", "outgoing"),
+            )
+        elif t == "kg_timeline":
+            return ms.kg_timeline(
+                entity_name=args.get("entity"), limit=int(args.get("limit", 100))
+            )
+        elif t == "kg_stats":
+            return ms.kg_stats()
+        elif t == "get_memory_system_info":
+            stats = ms.get_statistics()
+            kg = ms.kg_stats()
+            mem_data = stats.data[0] if stats.success and stats.data else {}
+            kg_data = kg.data[0] if kg.success and kg.data else {}
+            from .models import Result
+
+            return Result(
+                success=True,
+                data=[
+                    {
+                        "memories": {
+                            "total": mem_data.get("total_memories", 0),
+                            "type_breakdown": mem_data.get("type_breakdown", {}),
+                            "avg_importance": mem_data.get("avg_importance", 0),
+                        },
+                        "knowledge_graph": kg_data,
+                        "backends": {
+                            "database": mem_data.get("database_backend", "unknown"),
+                            "vector": mem_data.get("vector_backend", "unknown"),
+                        },
+                        "storage_mb": mem_data.get("storage_size_mb", 0),
+                    }
+                ],
+            )
+        else:
+            from .models import Result
+
+            return Result(success=False, reason=f"Unknown tool: {tool!r}")
+
+    @app.get("/api/v1/tools")
+    def list_tools():
+        """List all available tool names."""
+        return {
+            "tools": [
+                "remember",
+                "search_memories",
+                "search_by_type",
+                "search_by_tags",
+                "get_recent_memories",
+                "update_memory",
+                "delete_memory",
+                "get_memory_stats",
+                "create_backup",
+                "search_by_date_range",
+                "rebuild_vectors",
+                "kg_add",
+                "kg_invalidate",
+                "kg_query",
+                "kg_timeline",
+                "kg_stats",
+                "get_memory_system_info",
+            ]
+        }
+
+    @app.post("/api/v1/tools/call")
+    def call_tool(body: ToolCallRequest):
+        """
+        Invoke any MCP tool by name with arbitrary args.
+        Returns the same Result structure as the MCP tool itself.
+        """
+        try:
+            result = _invoke_tool(body.tool, body.args)
+            return _result_to_response(result)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Tool call failed: tool=%s error=%s", body.tool, e)
             raise HTTPException(status_code=500, detail=str(e))
 
     # ── Static files (React SPA) ───────────────────────────────────────────────

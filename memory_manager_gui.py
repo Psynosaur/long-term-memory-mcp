@@ -1039,6 +1039,7 @@ class MemoryManagerGUI:
             "event",
             "task",
             "ephemeral",
+            "summary",
         ]
         type_combo.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=2, padx=(5, 0))
         type_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_memories())
@@ -1209,6 +1210,7 @@ class MemoryManagerGUI:
             "event",
             "task",
             "ephemeral",
+            "summary",
         ]
         type_detail_combo.grid(row=1, column=1, sticky=tk.W, pady=5, padx=(10, 0))
 

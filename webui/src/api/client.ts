@@ -18,6 +18,16 @@ import type {
   MemoryCreate,
   MemoryUpdate,
   PgConnectionParams,
+  KgTriple,
+  KgStats,
+  KgTripleCreate,
+  KgInvalidateRequest,
+  KafkaStatus,
+  KafkaProduceRequest,
+  KafkaDeleteBroadcast,
+  KafkaProduceResult,
+  ToolCallRequest,
+  ToolCallResult,
 } from './types'
 
 const BASE = '/api/v1'
@@ -186,3 +196,59 @@ export const compareBackends = (
   params: PgConnectionParams,
 ): Promise<CompareResult> =>
   request(`/compare${buildQuery(params as unknown as Record<string, unknown>)}`)
+
+// ── Knowledge Graph ───────────────────────────────────────────────────────────
+
+export const getKgStats = (): Promise<{ success: boolean; data: KgStats[] }> =>
+  request('/kg/stats')
+
+export const getKgTimeline = (
+  entity?: string,
+  limit = 100,
+): Promise<{ success: boolean; data: KgTriple[] }> =>
+  request(`/kg/timeline${buildQuery({ entity, limit })}`)
+
+export const queryKgEntity = (
+  entity: string,
+  as_of?: string,
+  direction = 'outgoing',
+): Promise<{ success: boolean; data: KgTriple[] }> =>
+  request(`/kg/query${buildQuery({ entity, as_of, direction })}`)
+
+export const addKgTriple = (
+  body: KgTripleCreate,
+): Promise<{ success: boolean; data: KgTriple[] }> =>
+  request('/kg/triples', { method: 'POST', body: JSON.stringify(body) })
+
+export const invalidateKgTriple = (
+  body: KgInvalidateRequest,
+): Promise<{ success: boolean; data: unknown[] }> =>
+  request('/kg/invalidate', { method: 'POST', body: JSON.stringify(body) })
+
+// ── Kafka ─────────────────────────────────────────────────────────────────────
+
+export const getKafkaStatus = (): Promise<KafkaStatus> =>
+  request('/kafka/status')
+
+export const kafkaProduce = (
+  body: KafkaProduceRequest,
+): Promise<KafkaProduceResult> =>
+  request('/kafka/produce', { method: 'POST', body: JSON.stringify(body) })
+
+export const kafkaDeleteBroadcast = (
+  body: KafkaDeleteBroadcast,
+): Promise<KafkaProduceResult> =>
+  request('/kafka/delete-broadcast', { method: 'POST', body: JSON.stringify(body) })
+
+export const kafkaReloadUsers = (): Promise<{
+  reloaded: boolean
+  allowed_users: Array<{ username: string; node_uuid: string }>
+}> => request('/kafka/reload-users', { method: 'POST' })
+
+// ── Tool calls ────────────────────────────────────────────────────────────────
+
+export const listTools = (): Promise<{ tools: string[] }> =>
+  request('/tools')
+
+export const callTool = (body: ToolCallRequest): Promise<ToolCallResult> =>
+  request('/tools/call', { method: 'POST', body: JSON.stringify(body) })

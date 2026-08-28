@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { createMemory, updateMemory, deleteMemory } from '@/api/client'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { createMemory, updateMemory, deleteMemory, kafkaProduce, kafkaDeleteBroadcast, getKafkaStatus } from '@/api/client'
 import { useMemoryStore } from '@/store/memoryStore'
 import type { Memory } from '@/api/types'
 
-const TYPES = ['conversation', 'fact', 'preference', 'event', 'task', 'ephemeral']
+const TYPES = ['conversation', 'fact', 'preference', 'event', 'task', 'ephemeral', 'summary']
 
 interface MemoryDetailProps {
   onPeersClick: () => void
@@ -46,6 +46,24 @@ export function MemoryDetail({ onPeersClick }: MemoryDetailProps) {
       qc.invalidateQueries({ queryKey: currentQueryKey })
       flashSaved()
     },
+    onError: (e: Error) => setError(e.message),
+  })
+
+  const { data: kafkaStatus } = useQuery({
+    queryKey: ['kafka-status'],
+    queryFn: getKafkaStatus,
+    staleTime: 30_000,
+  })
+
+  const produceMut = useMutation({
+    mutationFn: (ids: string[]) => kafkaProduce({ memory_ids: ids, event: 'remember' }),
+    onSuccess: () => flashSaved(),
+    onError: (e: Error) => setError(e.message),
+  })
+
+  const deleteNetworkMut = useMutation({
+    mutationFn: (ids: string[]) => kafkaDeleteBroadcast({ memory_ids: ids, reason: 'Removed by admin via WebUI' }),
+    onSuccess: () => flashSaved(),
     onError: (e: Error) => setError(e.message),
   })
 
@@ -111,6 +129,17 @@ export function MemoryDetail({ onPeersClick }: MemoryDetailProps) {
     deleteMut.mutate(selectedId)
   }
 
+  function handleProduce() {
+    if (!selectedId) return
+    produceMut.mutate([selectedId])
+  }
+
+  function handleDeleteFromNetwork() {
+    if (!selectedId || !draft?.title) return
+    if (!window.confirm(`Broadcast DELETE for "${draft.title}" to all team nodes?\n\nThis will remove this memory from every consuming LTM instance.`)) return
+    deleteNetworkMut.mutate([selectedId])
+  }
+
   function handleNew() {
     setSelectedId(null)
     setIsNewMemory(true)
@@ -155,6 +184,28 @@ export function MemoryDetail({ onPeersClick }: MemoryDetailProps) {
         <button className="btn-danger" onClick={handleDelete} disabled={!selectedId || isLoading}>
           Delete
         </button>
+        {kafkaStatus?.ready && selectedId && !isNewMemory && (
+          <>
+            <span style={{ borderLeft: '1px solid var(--border)', height: 18, margin: '0 2px' }} />
+            <button
+              onClick={handleProduce}
+              disabled={isLoading || produceMut.isPending}
+              title={`Produce to ${kafkaStatus.topic}`}
+              style={{ fontSize: 11 }}
+            >
+              {produceMut.isPending ? '📡…' : '📡 Produce'}
+            </button>
+            <button
+              className="btn-danger"
+              onClick={handleDeleteFromNetwork}
+              disabled={isLoading || deleteNetworkMut.isPending}
+              title="Broadcast delete to all team LTM nodes"
+              style={{ fontSize: 11 }}
+            >
+              {deleteNetworkMut.isPending ? '🗑️…' : '🗑️ Remove from Network'}
+            </button>
+          </>
+        )}
         {error && <span style={{ color: 'var(--danger)', fontSize: 11, marginLeft: 2 }}>{error}</span>}
       </div>
 
