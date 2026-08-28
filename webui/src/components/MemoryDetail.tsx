@@ -154,6 +154,18 @@ export function MemoryDetail({ onPeersClick }: MemoryDetailProps) {
     setError(null)
   }
 
+  // Kafka availability logic
+  const kafkaConfigured = !!kafkaStatus?.configured
+  const kafkaNoAllowed = kafkaConfigured && (!kafkaStatus?.allowed_users?.length)
+  const kafkaNotReady = kafkaConfigured && !kafkaStatus?.ready
+  const kafkaDisableReason = kafkaNoAllowed
+    ? 'ALLOWED_KAFKA_USERS is empty — add username:node_uuid pairs to .env'
+    : kafkaStatus && !kafkaStatus.current_user?.allowed
+      ? 'Current user is not in ALLOWED_KAFKA_USERS'
+      : kafkaStatus && !kafkaStatus.producer?.ready
+        ? 'Kafka producer is not connected'
+        : undefined
+
   const isLoading = createMut.isPending || updateMut.isPending || deleteMut.isPending
   const tagsStr = Array.isArray(draft?.tags) ? draft!.tags.join(', ') : (draft?.tags ?? '')
   const sharedStr = Array.isArray(draft?.shared_with) ? draft!.shared_with.join(', ') : (draft?.shared_with ?? '')
@@ -184,26 +196,31 @@ export function MemoryDetail({ onPeersClick }: MemoryDetailProps) {
         <button className="btn-danger" onClick={handleDelete} disabled={!selectedId || isLoading}>
           Delete
         </button>
-        {kafkaStatus?.ready && selectedId && !isNewMemory && (
+        {kafkaConfigured && selectedId && !isNewMemory && (
           <>
             <span style={{ borderLeft: '1px solid var(--border)', height: 18, margin: '0 2px' }} />
             <button
               onClick={handleProduce}
-              disabled={isLoading || produceMut.isPending}
-              title={`Produce to ${kafkaStatus.topic}`}
-              style={{ fontSize: 11 }}
+              disabled={isLoading || produceMut.isPending || kafkaNotReady}
+              title={kafkaDisableReason ?? `Produce to ${kafkaStatus?.topic}`}
+              style={{ fontSize: 11, opacity: kafkaNotReady ? 0.5 : 1 }}
             >
               {produceMut.isPending ? '📡…' : '📡 Produce'}
             </button>
             <button
               className="btn-danger"
               onClick={handleDeleteFromNetwork}
-              disabled={isLoading || deleteNetworkMut.isPending}
-              title="Broadcast delete to all team LTM nodes"
-              style={{ fontSize: 11 }}
+              disabled={isLoading || deleteNetworkMut.isPending || kafkaNotReady}
+              title={kafkaDisableReason ?? 'Broadcast delete to all team LTM nodes'}
+              style={{ fontSize: 11, opacity: kafkaNotReady ? 0.5 : 1 }}
             >
               {deleteNetworkMut.isPending ? '🗑️…' : '🗑️ Remove from Network'}
             </button>
+            {kafkaNoAllowed && (
+              <span style={{ color: 'var(--warning)', fontSize: 10, marginLeft: 2 }}>
+                ⚠ No allowed users
+              </span>
+            )}
           </>
         )}
         {error && <span style={{ color: 'var(--danger)', fontSize: 11, marginLeft: 2 }}>{error}</span>}

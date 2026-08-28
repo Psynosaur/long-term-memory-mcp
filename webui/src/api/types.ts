@@ -276,3 +276,39 @@ export interface ToolCallResult {
   reason?: string
   data?: unknown[]
 }
+
+// ── Settings types ────────────────────────────────────────────────────────────
+
+export interface Settings {
+  // Kafka
+  auto_kafka_produce: boolean
+  kafka_sharing_active: boolean
+  network_sharing_active: boolean
+  // Memory system behaviour
+  decay_enabled: boolean
+  reinforcement_enabled: boolean
+  staleness_enabled: boolean
+  contradiction_detection_enabled: boolean
+  // Decay tunables (read-only)
+  decay_half_life_days: Record<string, number>
+  decay_min_importance: Record<string, number>
+  decay_protect_tags: string[]
+  // Staleness tunables (read-only)
+  staleness_expected_lifetime_days: Record<string, number>
+  staleness_warn_threshold: number
+  staleness_warn_types: string[]
+  // Contradiction tunables (read-only)
+  contradiction_similarity_threshold: number
+  contradiction_check_types: string[]
+  // Identity
+  node_uuid: string | null
+  username: string | null
+}
+
+export interface SettingsUpdate {
+  auto_kafka_produce?: boolean
+  decay_enabled?: boolean
+  reinforcement_enabled?: boolean
+  staleness_enabled?: boolean
+  contradiction_detection_enabled?: boolean
+}

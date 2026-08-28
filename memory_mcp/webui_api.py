@@ -128,6 +128,15 @@ class KgInvalidateRequest(BaseModel):
     ended: Optional[str] = None
 
 
+class SettingsUpdate(BaseModel):
+    """Partial update for runtime settings."""
+    auto_kafka_produce: Optional[bool] = None
+    decay_enabled: Optional[bool] = None
+    reinforcement_enabled: Optional[bool] = None
+    staleness_enabled: Optional[bool] = None
+    contradiction_detection_enabled: Optional[bool] = None
+
+
 class ToolCallRequest(BaseModel):
     tool: str
     args: Dict[str, Any] = {}
@@ -249,6 +258,79 @@ def create_app(
             ),
             "data_folder": str(DATA_FOLDER),
         }
+
+    # ── /api/v1/settings ─────────────────────────────────────────────────────
+
+    @app.get("/api/v1/settings")
+    def get_settings():
+        """Return runtime-tunable settings.
+
+        These reflect in-memory state that can be toggled without restarting
+        the server.  Read-only values like the active backends, data folder,
+        and embedding model come from GET /config instead.
+        """
+        from . import config as cfg
+
+        return {
+            # Kafka auto-produce (only meaningful when kafka_producer is set)
+            "auto_kafka_produce": memory_system.auto_kafka_produce,
+            "kafka_sharing_active": kafka_producer is not None and kafka_producer.is_configured,
+            "network_sharing_active": sharing_mgr is not None,
+            # Memory system behaviour flags
+            "decay_enabled": cfg.DECAY_ENABLED,
+            "reinforcement_enabled": cfg.REINFORCEMENT_ENABLED,
+            "staleness_enabled": cfg.STALENESS_ENABLED,
+            "contradiction_detection_enabled": cfg.CONTRADICTION_DETECTION_ENABLED,
+            # Decay tunables (read-only from settings — edit config.py to change)
+            "decay_half_life_days": cfg.DECAY_HALF_LIFE_DAYS_BY_TYPE,
+            "decay_min_importance": cfg.DECAY_MIN_IMPORTANCE_BY_TYPE,
+            "decay_protect_tags": list(cfg.DECAY_PROTECT_TAGS),
+            # Staleness tunables
+            "staleness_expected_lifetime_days": cfg.STALENESS_EXPECTED_LIFETIME_DAYS,
+            "staleness_warn_threshold": cfg.STALENESS_WARN_THRESHOLD,
+            "staleness_warn_types": list(cfg.STALENESS_WARN_TYPES),
+            # Contradiction tunables
+            "contradiction_similarity_threshold": cfg.CONTRADICTION_SIMILARITY_THRESHOLD,
+            "contradiction_check_types": list(cfg.CONTRADICTION_CHECK_TYPES),
+            # Identity
+            "node_uuid": identity.node_uuid if identity else None,
+            "username": identity.username if identity else None,
+        }
+
+    @app.patch("/api/v1/settings")
+    def update_settings(body: SettingsUpdate):
+        """Update runtime-tunable settings.
+
+        Only non-null fields in the request body are applied. Changes take
+        effect immediately in the running process but do NOT persist across
+        restarts (they are in-memory overrides of the config.py defaults).
+        """
+        from . import config as cfg
+
+        changed: Dict[str, Any] = {}
+
+        if body.auto_kafka_produce is not None:
+            memory_system.auto_kafka_produce = body.auto_kafka_produce
+            changed["auto_kafka_produce"] = body.auto_kafka_produce
+
+        if body.decay_enabled is not None:
+            cfg.DECAY_ENABLED = body.decay_enabled
+            changed["decay_enabled"] = body.decay_enabled
+
+        if body.reinforcement_enabled is not None:
+            cfg.REINFORCEMENT_ENABLED = body.reinforcement_enabled
+            changed["reinforcement_enabled"] = body.reinforcement_enabled
+
+        if body.staleness_enabled is not None:
+            cfg.STALENESS_ENABLED = body.staleness_enabled
+            changed["staleness_enabled"] = body.staleness_enabled
+
+        if body.contradiction_detection_enabled is not None:
+            cfg.CONTRADICTION_DETECTION_ENABLED = body.contradiction_detection_enabled
+            changed["contradiction_detection_enabled"] = body.contradiction_detection_enabled
+
+        logger.info("Settings updated: %s", changed)
+        return {"success": True, "changed": changed}
 
     # ── /api/v1/identity ──────────────────────────────────────────────────────
 

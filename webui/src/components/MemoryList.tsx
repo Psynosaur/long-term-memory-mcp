@@ -76,7 +76,7 @@ export function MemoryList({ memories, isLoading, total }: MemoryListProps) {
 
   const columns = useMemo(
     () => [
-      ...(kafkaStatus?.ready
+      ...(kafkaStatus?.configured
         ? [
             col.display({
               id: 'select',
@@ -151,7 +151,7 @@ export function MemoryList({ memories, isLoading, total }: MemoryListProps) {
         },
       }),
     ],
-    [kafkaStatus?.ready],
+    [kafkaStatus?.configured],
   )
 
   const table = useReactTable({
@@ -162,7 +162,7 @@ export function MemoryList({ memories, isLoading, total }: MemoryListProps) {
     onRowSelectionChange: setRowSelection,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
-    enableRowSelection: !!kafkaStatus?.ready,
+    enableRowSelection: !!kafkaStatus?.configured,
   })
 
   // Fetch the full row (with updated_at, last_accessed) when a memory is clicked.
@@ -214,30 +214,46 @@ export function MemoryList({ memories, isLoading, total }: MemoryListProps) {
         </span>
 
         {/* Batch Kafka actions */}
-        {kafkaStatus?.ready && selectedIds.length > 0 && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
-            <span style={{ color: 'var(--text-muted)' }}>{selectedIds.length} selected</span>
-            <button
-              onClick={() => batchProduceMut.mutate(selectedIds)}
-              disabled={batchProduceMut.isPending}
-              style={{ fontSize: 11 }}
-            >
-              {batchProduceMut.isPending ? '📡…' : '📡 Produce'}
-            </button>
-            <button
-              className="btn-danger"
-              onClick={() => {
-                if (window.confirm(`Broadcast DELETE for ${selectedIds.length} memor${selectedIds.length === 1 ? 'y' : 'ies'} to all team nodes?`)) {
-                  batchDeleteNetworkMut.mutate(selectedIds)
-                }
-              }}
-              disabled={batchDeleteNetworkMut.isPending}
-              style={{ fontSize: 11 }}
-            >
-              {batchDeleteNetworkMut.isPending ? '🗑️…' : '🗑️ Remove from Network'}
-            </button>
-          </div>
-        )}
+        {kafkaStatus?.configured && selectedIds.length > 0 && (() => {
+          const notReady = !kafkaStatus?.ready
+          const noAllowed = !kafkaStatus?.allowed_users?.length
+          const disableReason = noAllowed
+            ? 'ALLOWED_KAFKA_USERS is empty — consumer-only mode'
+            : !kafkaStatus?.current_user?.allowed
+              ? 'Current user is not in ALLOWED_KAFKA_USERS'
+              : !kafkaStatus?.producer?.ready
+                ? 'Kafka producer is not connected'
+                : undefined
+          return (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+              <span style={{ color: 'var(--text-muted)' }}>{selectedIds.length} selected</span>
+              <button
+                onClick={() => batchProduceMut.mutate(selectedIds)}
+                disabled={batchProduceMut.isPending || notReady}
+                title={disableReason ?? 'Produce selected memories to Kafka'}
+                style={{ fontSize: 11, opacity: notReady ? 0.5 : 1 }}
+              >
+                {batchProduceMut.isPending ? '📡…' : '📡 Produce'}
+              </button>
+              <button
+                className="btn-danger"
+                onClick={() => {
+                  if (window.confirm(`Broadcast DELETE for ${selectedIds.length} memor${selectedIds.length === 1 ? 'y' : 'ies'} to all team nodes?`)) {
+                    batchDeleteNetworkMut.mutate(selectedIds)
+                  }
+                }}
+                disabled={batchDeleteNetworkMut.isPending || notReady}
+                title={disableReason ?? 'Broadcast delete to all team LTM nodes'}
+                style={{ fontSize: 11, opacity: notReady ? 0.5 : 1 }}
+              >
+                {batchDeleteNetworkMut.isPending ? '🗑️…' : '🗑️ Remove from Network'}
+              </button>
+              {noAllowed && (
+                <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>consumer-only</span>
+              )}
+            </div>
+          )
+        })()}
         {batchMsg && (
           <span style={{ fontSize: 11, color: batchMsg.startsWith('✓') ? 'var(--success)' : 'var(--danger)' }}>
             {batchMsg}

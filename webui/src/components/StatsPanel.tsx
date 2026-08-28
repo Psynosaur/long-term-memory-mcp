@@ -84,9 +84,13 @@ function KafkaStatusSection() {
         <span style={{ color: 'var(--text)', fontFamily: 'monospace', fontSize: 10 }}>{kafka.topic}</span>
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 2 }}>
-        <span style={{ color: 'var(--text-muted)' }}>Producer:</span>
-        <span style={{ color: kafka.producer?.ready ? 'var(--success)' : 'var(--text-muted)' }}>
-          {kafka.producer?.ready ? '● Ready' : kafka.producer?.started ? '○ Started' : '○ Off'}
+        <span style={{ color: 'var(--text-muted)' }}>Mode:</span>
+        <span style={{ color: kafka.allowed_users.length > 0 && kafka.producer?.ready ? 'var(--success)' : 'var(--accent)' }}>
+          {kafka.allowed_users.length > 0 && kafka.producer?.ready
+            ? '● Producer + Consumer'
+            : kafka.consumer?.running
+              ? '● Consumer only'
+              : '○ Off'}
         </span>
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 2 }}>
@@ -99,16 +103,19 @@ function KafkaStatusSection() {
       {kafka.current_user?.username && (
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 2 }}>
           <span style={{ color: 'var(--text-muted)' }}>User:</span>
-          <span style={{ color: kafka.current_user.allowed ? 'var(--success)' : 'var(--warning)' }}>
+          <span style={{ color: 'var(--text)' }}>
             {kafka.current_user.username}
-            {kafka.current_user.allowed ? ' ✓' : ' (not allowed)'}
           </span>
         </div>
       )}
 
-      {kafka.allowed_users.length > 0 && (
+      {kafka.allowed_users.length > 0 ? (
         <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
-          Allowed: {kafka.allowed_users.map(u => u.username).join(', ')}
+          Producers: {kafka.allowed_users.map(u => u.username).join(', ')}
+        </div>
+      ) : (
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+          No producers configured — receiving only
         </div>
       )}
 

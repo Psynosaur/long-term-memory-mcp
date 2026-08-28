@@ -6,7 +6,7 @@ three event types produced by KafkaMemoryProducer on other nodes:
 
   remember — A senior shared a new memory.
       • Check content_hash against local DB — skip if already exists (no re-embed).
-      • Otherwise ingest via memory_system.remember() with a "kafka:<source_uuid>"
+      • Otherwise ingest via memory_system.remember() with a "kafka:<username>"
         tag so the origin is traceable.
 
   update — A senior updated a shared memory.
@@ -19,16 +19,18 @@ three event types produced by KafkaMemoryProducer on other nodes:
         already exists locally, skip entirely (already up-to-date).
 
   delete — RPC instruction from a senior to remove a memory from every node.
-      • Validate that the source user (username:node_uuid) appears in the
-        local ALLOWED_KAFKA_USERS list — refuse the delete if not.
+      • Validate that the source username appears in the local
+        ALLOWED_KAFKA_USERS list — refuse the delete if not.
       • Locate the memory by original memory_id first, then by content_hash
         (ingested peer memories get new local IDs).
       • Delete from both SQLite and the vector store.
 
 Architecture:
   - Runs on a background daemon thread (non-blocking).
-  - Own messages are skipped (source.node_uuid == local identity.node_uuid).
+  - Own messages are skipped (source username == local identity username).
   - Uses the same KAFKA_* and ALLOWED_KAFKA_USERS config from .env.
+  - Source on the wire is a plain username string (sparse — no node_uuid
+    leaked to the topic).
   - Consumer group: "{KAFKA_CLIENT_ID}-consumer" (each LTM instance in its
     own group so every node sees every message).
 
@@ -347,29 +349,33 @@ class KafkaMemoryConsumer:
     def _handle_message(self, key: Optional[str], value: dict) -> None:
         """Route a message to the appropriate handler."""
         event = value.get("event")
-        source = value.get("source", {})
-        source_uuid = source.get("node_uuid", "")
-        source_username = source.get("username", "")
+
+        # source is a plain username string (sparse — no node_uuid on the wire)
+        raw_source = value.get("source", "")
+        if isinstance(raw_source, dict):
+            # Backward compat with old {username, node_uuid} format
+            source_username = raw_source.get("username", "")
+        else:
+            source_username = str(raw_source)
 
         # Skip own messages — don't re-ingest what we produced
-        if source_uuid == self._identity.node_uuid:
+        if source_username == self._identity.username:
             self._inc("skipped_own")
             return
 
         logger.info(
-            "[kafka-consumer] Received %s event from %s (%s) key=%s",
+            "[kafka-consumer] Received %s event from %s key=%s",
             event,
             source_username,
-            source_uuid[:8] if source_uuid else "?",
             (key or "")[:24],
         )
 
         if event == "remember":
-            self._handle_remember(value, source_username, source_uuid)
+            self._handle_remember(value, source_username)
         elif event == "update":
-            self._handle_update(value, source_username, source_uuid)
+            self._handle_update(value, source_username)
         elif event == "delete":
-            self._handle_delete(value, source_username, source_uuid)
+            self._handle_delete(value, source_username)
         else:
             logger.warning(
                 "[kafka-consumer] Unknown event type: %s", event
@@ -378,7 +384,7 @@ class KafkaMemoryConsumer:
     # ── Event handlers ───────────────────────────────────────────────────────
 
     def _handle_remember(
-        self, value: dict, source_username: str, source_uuid: str
+        self, value: dict, source_username: str
     ) -> None:
         """Ingest a new shared memory, skipping if content_hash already exists."""
         memory = value.get("memory", {})
@@ -393,10 +399,10 @@ class KafkaMemoryConsumer:
             self._inc("skipped_duplicate")
             return
 
-        self._ingest_memory(memory, source_username, source_uuid)
+        self._ingest_memory(memory, source_username)
 
     def _handle_update(
-        self, value: dict, source_username: str, source_uuid: str
+        self, value: dict, source_username: str
     ) -> None:
         """Update an existing local copy, or ingest if not found.
 
@@ -417,10 +423,9 @@ class KafkaMemoryConsumer:
 
         # Try to find the local copy:
         # 1. By original memory_id (if we ingested it with same id)
-        # 2. By any kafka tag matching the source
-        # 3. By title + source tag (best effort)
+        # 2. By kafka:<source_username> tag + title match
         original_id = memory.get("id", "")
-        local_id = self._find_local_memory(original_id, source_uuid, memory)
+        local_id = self._find_local_memory(original_id, source_username, memory)
 
         if local_id:
             # Update in place
@@ -453,21 +458,20 @@ class KafkaMemoryConsumer:
                 self._inc("errors")
         else:
             # Not found locally — ingest as new
-            self._ingest_memory(memory, source_username, source_uuid)
+            self._ingest_memory(memory, source_username)
 
     def _handle_delete(
-        self, value: dict, source_username: str, source_uuid: str
+        self, value: dict, source_username: str
     ) -> None:
         """Delete a memory from local store on instruction from a senior.
 
         The source must be in ALLOWED_KAFKA_USERS on this node.
         """
         # Validate the source is an allowed/trusted user
-        if not self._is_source_allowed(source_username, source_uuid):
+        if not self._is_source_allowed(source_username):
             logger.warning(
-                "[kafka-consumer] Refusing delete from untrusted source: %s (%s)",
+                "[kafka-consumer] Refusing delete from untrusted source: %s",
                 source_username,
-                source_uuid[:8] if source_uuid else "?",
             )
             self._inc("skipped_unauthorized_delete")
             return
@@ -517,7 +521,7 @@ class KafkaMemoryConsumer:
     # ── Ingest helper ────────────────────────────────────────────────────────
 
     def _ingest_memory(
-        self, memory: dict, source_username: str, source_uuid: str
+        self, memory: dict, source_username: str
     ) -> None:
         """Ingest a single memory from a Kafka peer."""
         title = (memory.get("title") or "").strip()
@@ -531,8 +535,8 @@ class KafkaMemoryConsumer:
         if _is_kafka_memory(existing_tags):
             return  # don't re-relay
 
-        # Add kafka source tag
-        kafka_tag = f"{_KAFKA_TAG_PREFIX}{source_uuid}"
+        # Add kafka source tag (username-based, e.g. "kafka:OhanSmit")
+        kafka_tag = f"{_KAFKA_TAG_PREFIX}{source_username}"
         tags = [t for t in existing_tags if t] + [kafka_tag]
 
         try:
@@ -583,13 +587,13 @@ class KafkaMemoryConsumer:
             return False
 
     def _find_local_memory(
-        self, original_id: str, source_uuid: str, memory: dict
+        self, original_id: str, source_username: str, memory: dict
     ) -> Optional[str]:
         """Try to find the local copy of a remote memory.
 
         Search order:
         1. By original memory_id (if this node ingested with the same id)
-        2. By kafka:<source_uuid> tag + title match
+        2. By kafka:<source_username> tag + title match
         """
         # 1. Direct id match
         if original_id:
@@ -604,7 +608,7 @@ class KafkaMemoryConsumer:
                 pass
 
         # 2. Tag + title match
-        kafka_tag = f"{_KAFKA_TAG_PREFIX}{source_uuid}"
+        kafka_tag = f"{_KAFKA_TAG_PREFIX}{source_username}"
         title = memory.get("title", "")
         if title:
             try:
@@ -654,19 +658,21 @@ class KafkaMemoryConsumer:
 
         return list(ids)
 
-    def _is_source_allowed(self, username: str, node_uuid: str) -> bool:
+    def _is_source_allowed(self, username: str) -> bool:
         """Check if the source of a delete event is a trusted user.
 
+        Matches by username against the ALLOWED_KAFKA_USERS list.
         Uses the kafka_producer's allowed-user list (same .env source).
         """
         if self._kafka_producer:
-            return self._kafka_producer.is_user_allowed(username, node_uuid)
+            # Check if any allowed user entry matches this username
+            return any(u == username for u, _ in self._kafka_producer.allowed_users)
 
         # Fallback: parse allowed users directly from config
         from .kafka_producer import _parse_allowed_users
 
         allowed = _parse_allowed_users(self._config.get("allowed_users", ""))
-        return any(u == username and n == node_uuid for u, n in allowed)
+        return any(u == username for u, _ in allowed)
 
     @staticmethod
     def _parse_tags(tags_raw) -> list[str]:

@@ -354,10 +354,7 @@ class KafkaMemoryProducer:
             "event": event,
             "memory": _serialize_memory(memory),
             "content_hash": computed_hash,
-            "source": {
-                "username": self._identity.username,
-                "node_uuid": self._identity.node_uuid,
-            },
+            "source": self._identity.username,
             "produced_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -400,10 +397,7 @@ class KafkaMemoryProducer:
             "content_hash": content_hash,
             "title": title,
             "reason": reason,
-            "source": {
-                "username": self._identity.username,
-                "node_uuid": self._identity.node_uuid,
-            },
+            "source": self._identity.username,
             "produced_at": datetime.now(timezone.utc).isoformat(),
         }
 

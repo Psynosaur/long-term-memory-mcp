@@ -107,6 +107,7 @@ class RobustMemorySystem:
         self._query_prefix: str = ""  # set by _init_embeddings (e.g. BGE needs prefix)
         self.tokenizer: Optional[object] = None
         self.kafka_producer: Optional[object] = None  # set externally by server.py
+        self.auto_kafka_produce: bool = True  # auto-publish to Kafka on remember/update
 
         # Setup logging
         self._setup_logging()
@@ -835,7 +836,7 @@ class RobustMemorySystem:
                 rec["similarity"] = contradiction_warning["similarity"]
 
             # ── Kafka produce (fire-and-forget) ─────────────────────────────
-            if self.kafka_producer and self.kafka_producer.is_ready:
+            if self.auto_kafka_produce and self.kafka_producer and self.kafka_producer.is_ready:
                 try:
                     self.kafka_producer.produce_memory(
                         rec, event="remember", content_hash=content_hash,
@@ -1335,7 +1336,7 @@ class RobustMemorySystem:
             self.logger.info("Memory updated successfully: %s", memory_id)
 
             # ── Kafka produce (fire-and-forget) ─────────────────────────────
-            if self.kafka_producer and self.kafka_producer.is_ready:
+            if self.auto_kafka_produce and self.kafka_producer and self.kafka_producer.is_ready:
                 try:
                     # Fetch the final state of the updated memory for the message
                     updated_cursor = self.db.execute(

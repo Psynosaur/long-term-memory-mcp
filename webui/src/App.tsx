@@ -13,10 +13,11 @@ import { CompareModal } from '@/components/CompareModal'
 import { PeerPicker } from '@/components/PeerPicker'
 import { KnowledgeGraphTab } from '@/components/KnowledgeGraphTab'
 import { ToolsTab } from '@/components/ToolsTab'
+import { SettingsTab } from '@/components/SettingsTab'
 import type { Memory } from '@/api/types'
 
 type ModalType = 'vectors' | 'migrate' | 'compare' | 'peers' | null
-type TabType = 'memories' | 'kg' | 'tools'
+type TabType = 'memories' | 'kg' | 'tools' | 'settings'
 
 function TabButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
   return (
@@ -140,6 +141,7 @@ export default function App() {
         <TabButton label="Memories" active={tab === 'memories'} onClick={() => setTab('memories')} />
         <TabButton label="Knowledge Graph" active={tab === 'kg'} onClick={() => setTab('kg')} />
         <TabButton label="Tools" active={tab === 'tools'} onClick={() => setTab('tools')} />
+        <TabButton label="Settings" active={tab === 'settings'} onClick={() => setTab('settings')} />
       </div>
 
       {/* Backup message banner */}
@@ -193,6 +195,13 @@ export default function App() {
         {tab === 'tools' && (
           <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
             <ToolsTab />
+          </div>
+        )}
+
+        {/* ── Settings tab ── */}
+        {tab === 'settings' && (
+          <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
+            <SettingsTab />
           </div>
         )}
       </div>

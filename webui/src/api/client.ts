@@ -28,6 +28,8 @@ import type {
   KafkaProduceResult,
   ToolCallRequest,
   ToolCallResult,
+  Settings,
+  SettingsUpdate,
 } from './types'
 
 const BASE = '/api/v1'
@@ -252,3 +254,13 @@ export const listTools = (): Promise<{ tools: string[] }> =>
 
 export const callTool = (body: ToolCallRequest): Promise<ToolCallResult> =>
   request('/tools/call', { method: 'POST', body: JSON.stringify(body) })
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+export const getSettings = (): Promise<Settings> =>
+  request('/settings')
+
+export const updateSettings = (
+  body: SettingsUpdate,
+): Promise<{ success: boolean; changed: Record<string, unknown> }> =>
+  request('/settings', { method: 'PATCH', body: JSON.stringify(body) })
